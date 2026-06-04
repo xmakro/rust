@@ -521,6 +521,7 @@ pub(crate) fn inline_asm_call<'ll>(
     // `srcloc` contains one 64-bit integer for each line of assembly code,
     // where the lower 32 bits hold the lo byte position and the upper 32 bits
     // hold the hi byte position.
+    let source_map = bx.tcx.sess.source_map();
     let mut srcloc = vec![];
     if dia == llvm::AsmDialect::Intel && line_spans.len() > 1 {
         // LLVM inserts an extra line to add the ".intel_syntax", so add
@@ -533,9 +534,21 @@ pub(crate) fn inline_asm_call<'ll>(
         srcloc.push(llvm::LLVMValueAsMetadata(bx.const_u64(0)));
     }
     srcloc.extend(line_spans.iter().map(|span| {
-        llvm::LLVMValueAsMetadata(
-            bx.const_u64(u64::from(span.lo().to_u32()) | (u64::from(span.hi().to_u32()) << 32)),
-        )
+        // A span pointing into an imported (foreign) source file carries a raw
+        // byte position whose value depends on the order in which that crate's
+        // source files were lazily added to this crate's source map. Under the
+        // parallel front-end (`-Zthreads`) that order is not stable, so
+        // encoding the raw position would make the emitted object file
+        // non-reproducible. These cross-crate positions are not generally
+        // usable anyway: `report_inline_asm` already discards inline-asm srcloc
+        // under LTO because it refers to a different source map. Emit a zero
+        // cookie, which that consumer treats as "no source location".
+        let cookie = if source_map.is_imported(*span) {
+            0
+        } else {
+            u64::from(span.lo().to_u32()) | (u64::from(span.hi().to_u32()) << 32)
+        };
+        llvm::LLVMValueAsMetadata(bx.const_u64(cookie))
     }));
     bx.cx.set_metadata_node(call, kind, &srcloc);
 
