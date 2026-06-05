@@ -35,6 +35,7 @@
 #![recursion_limit = "256"]
 // tidy-alphabetical-end
 
+use std::cell::Cell;
 use std::mem;
 use std::sync::Arc;
 
@@ -94,6 +95,13 @@ pub mod stability;
 struct LoweringContext<'a, 'hir> {
     tcx: TyCtxt<'hir>,
     resolver: &'a ResolverAstLowering<'hir>,
+    /// Cached `tcx.sess.opts.incremental.is_some()`; read once per lowered span.
+    is_incremental: bool,
+    /// One-entry memoization for `lower_span`. The same `(span, owner)` pair is
+    /// lowered repeatedly (e.g. an ident span reused across several HIR nodes), and
+    /// `with_parent` re-interns the span each time, so caching the last result avoids
+    /// the repeated interner work.
+    last_lowered_span: Cell<Option<(Span, LocalDefId, Span)>>,
     current_disambiguator: PerParentDisambiguatorState,
 
     /// Used to allocate HIR nodes.
@@ -173,6 +181,8 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         Self {
             tcx,
             resolver,
+            is_incremental: tcx.sess.opts.incremental.is_some(),
+            last_lowered_span: Cell::new(None),
             current_disambiguator: Default::default(),
             owner: &resolver.owners[&CRATE_NODE_ID],
             arena: tcx.hir_arena,
@@ -913,7 +923,7 @@ impl<'hir> LoweringContext<'_, 'hir> {
 
     fn span_lowerer(&self) -> SpanLowerer {
         SpanLowerer {
-            is_incremental: self.tcx.sess.opts.incremental.is_some(),
+            is_incremental: self.is_incremental,
             def_id: self.current_hir_id_owner.def_id,
         }
     }
@@ -921,7 +931,19 @@ impl<'hir> LoweringContext<'_, 'hir> {
     /// Intercept all spans entering HIR.
     /// Mark a span as relative to the current owning item.
     fn lower_span(&self, span: Span) -> Span {
-        self.span_lowerer().lower(span)
+        if !self.is_incremental {
+            return span;
+        }
+        let def_id = self.current_hir_id_owner.def_id;
+        if let Some((s, d, out)) = self.last_lowered_span.get()
+            && s == span
+            && d == def_id
+        {
+            return out;
+        }
+        let out = span.with_parent(Some(def_id));
+        self.last_lowered_span.set(Some((span, def_id, out)));
+        out
     }
 
     fn lower_ident(&self, ident: Ident) -> Ident {
