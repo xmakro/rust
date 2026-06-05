@@ -7,7 +7,7 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_session::Session;
 use rustc_session::cstore::Untracked;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{CachingSourceMapView, DUMMY_SP, Pos, Span};
+use rustc_span::{CachingSourceMapView, DUMMY_SP, Pos, Span, SpanData};
 
 // Very often, we are hashing something that does not need the `CachingSourceMapView`, so we
 // initialize it lazily.
@@ -27,6 +27,11 @@ pub struct StableHashState<'a> {
     incremental_ignore_spans: bool,
     caching_source_map: CachingSourceMap<'a>,
     stable_hash_controls: StableHashControls,
+    /// One-entry memoization of `def_span(parent).data_untracked()` used by
+    /// `stable_hash_span`. When hashing an owner's HIR every span shares the same
+    /// parent, so this hits ~always and avoids re-fetching and re-unpacking the
+    /// parent's def span for every span.
+    last_def_span: Option<(LocalDefId, SpanData)>,
 }
 
 impl<'a> StableHashState<'a> {
@@ -39,6 +44,7 @@ impl<'a> StableHashState<'a> {
             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
             caching_source_map: CachingSourceMap::Unused(sess.source_map()),
             stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
+            last_def_span: None,
         }
     }
 
@@ -104,7 +110,14 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
             return;
         }
 
-        let parent = span.parent.map(|parent| self.def_span(parent).data_untracked());
+        let parent = span.parent.map(|parent| match self.last_def_span {
+            Some((id, data)) if id == parent => data,
+            _ => {
+                let data = self.def_span(parent).data_untracked();
+                self.last_def_span = Some((parent, data));
+                data
+            }
+        });
         if let Some(parent) = parent
             && parent.contains(span)
         {
