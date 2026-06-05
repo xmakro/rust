@@ -597,7 +597,6 @@ impl NodeInfo {
     /// Encode a node that was promoted from the previous graph. It reads the edges directly from
     /// the previous dep graph and expects all edges to already have a new dep node index assigned.
     /// This avoids the overhead of constructing `EdgesVec`, which would be needed to call `encode`.
-    #[inline]
     fn encode_promoted(
         e: &mut MemEncoder,
         node: &DepNode,
@@ -606,13 +605,20 @@ impl NodeInfo {
         prev_index: SerializedDepNodeIndex,
         colors: &DepNodeColorMap,
         previous: &SerializedDepGraph,
+        scratch: &mut Vec<u32>,
     ) -> usize {
-        let edges = previous.edge_targets_from(prev_index);
-        let edge_count = edges.size_hint().0;
-
-        // Find the highest edge in the new dep node indices
-        let edge_max =
-            edges.clone().map(|i| colors.current(i).unwrap().as_u32()).max().unwrap_or(0);
+        // Remap each edge target to its current-session index once, into a reused
+        // scratch buffer, tracking the highest index so we can pick the edge byte width.
+        scratch.clear();
+        let edge_indices = previous.edge_targets_from(prev_index);
+        scratch.reserve(edge_indices.size_hint().0);
+        let mut edge_max = 0;
+        for i in edge_indices {
+            let i = colors.current(i).unwrap().as_u32();
+            edge_max = max(edge_max, i);
+            scratch.push(i);
+        }
+        let edge_count = scratch.len();
 
         let header =
             SerializedNodeHeader::new(node, index, value_fingerprint, edge_max, edge_count);
@@ -624,10 +630,9 @@ impl NodeInfo {
         }
 
         let bytes_per_index = header.bytes_per_index();
-        for node_index in edges {
-            let node_index = colors.current(node_index).unwrap();
+        for &node_index in scratch.iter() {
             e.write_with(|dest| {
-                *dest = node_index.as_u32().to_le_bytes();
+                *dest = node_index.to_le_bytes();
                 bytes_per_index
             });
         }
@@ -651,6 +656,10 @@ struct LocalEncoderState {
 
     /// Stores the number of times we've encoded each dep kind.
     kind_stats: Vec<u32>,
+
+    /// Reused buffer of remapped edge targets for promoted nodes. Kept here so the
+    /// allocation amortizes across all the nodes a thread encodes.
+    edge_scratch: Vec<u32>,
 }
 
 struct LocalEncoderResult {
@@ -685,6 +694,7 @@ impl EncoderState {
                     node_count: 0,
                     encoder: MemEncoder::new(),
                     kind_stats: iter::repeat_n(0, DepKind::MAX as usize + 1).collect(),
+                    edge_scratch: Vec::new(),
                 })
             }),
         }
@@ -812,6 +822,7 @@ impl EncoderState {
             prev_index,
             colors,
             &self.previous,
+            &mut local.edge_scratch,
         );
         self.flush_mem_encoder(&mut *local);
         self.record(
