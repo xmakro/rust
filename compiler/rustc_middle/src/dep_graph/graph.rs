@@ -17,6 +17,7 @@ use rustc_macros::{Decodable, Encodable};
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_session::Session;
 use rustc_span::Symbol;
+use smallvec::SmallVec;
 use tracing::instrument;
 #[cfg(debug_assertions)]
 use {super::debug::EdgeFilter, std::env};
@@ -790,8 +791,9 @@ impl DepGraphData {
     fn promote_node_and_deps_to_current(
         &self,
         prev_index: SerializedDepNodeIndex,
+        edges: &[DepNodeIndex],
     ) -> Option<DepNodeIndex> {
-        let dep_node_index = self.current.encoder.send_promoted(prev_index, &self.colors);
+        let dep_node_index = self.current.encoder.send_promoted(prev_index, &self.colors, edges);
 
         #[cfg(debug_assertions)]
         if let Some(dep_node_index) = dep_node_index {
@@ -897,11 +899,16 @@ impl DepGraphData {
         // We never try to mark eval_always nodes as green
         debug_assert!(!tcx.is_eval_always(self.previous.index_to_node(prev_dep_node_index).kind));
 
+        // Collect each dependency's current-session index as we confirm it is green.
+        let mut edges: SmallVec<[DepNodeIndex; 32]> = SmallVec::new();
         for parent_dep_node_index in self.previous.edge_targets_from(prev_dep_node_index) {
             match self.colors.get(parent_dep_node_index) {
                 // This dependency has been marked as green before, we are still ok and can
                 // continue checking the remaining dependencies.
-                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Green(parent_index) => {
+                    edges.push(parent_index);
+                    continue;
+                }
 
                 // This dependency's result is different to the previous compilation session. We
                 // cannot mark this dep_node as green, so stop checking.
@@ -915,8 +922,10 @@ impl DepGraphData {
 
             // If this dependency isn't eval_always, try to mark it green recursively.
             if !tcx.is_eval_always(parent_dep_node.kind)
-                && self.try_mark_previous_green(tcx, parent_dep_node_index, Some(&frame)).is_some()
+                && let Some(parent_index) =
+                    self.try_mark_previous_green(tcx, parent_dep_node_index, Some(&frame))
             {
+                edges.push(parent_index);
                 continue;
             }
 
@@ -926,7 +935,10 @@ impl DepGraphData {
             }
 
             match self.colors.get(parent_dep_node_index) {
-                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Green(parent_index) => {
+                    edges.push(parent_index);
+                    continue;
+                }
                 DepNodeColor::Red => return None,
                 DepNodeColor::Unknown => {}
             }
@@ -954,7 +966,7 @@ impl DepGraphData {
         // adding all the appropriate edges imported from the previous graph.
         //
         // `no_hash` nodes may fail this promotion due to already being conservatively colored red.
-        let dep_node_index = self.promote_node_and_deps_to_current(prev_dep_node_index)?;
+        let dep_node_index = self.promote_node_and_deps_to_current(prev_dep_node_index, &edges)?;
 
         // ... and finally storing a "Green" entry in the color map.
         // Multiple threads can all write the same color here.
