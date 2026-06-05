@@ -876,11 +876,19 @@ impl SyntaxContext {
 
     #[inline]
     pub fn normalize_to_macros_2_0(self) -> SyntaxContext {
+        // The root context normalizes to itself; skip taking the hygiene lock for it,
+        // which is by far the most common case in non-macro code.
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macros_2_0(self))
     }
 
     #[inline]
     pub fn normalize_to_macro_rules(self) -> SyntaxContext {
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macro_rules(self))
     }
 
