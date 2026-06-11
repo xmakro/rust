@@ -224,3 +224,17 @@ pub struct Untracked {
     /// The interned [StableCrateId]s.
     pub stable_crate_ids: FreezeLock<StableCrateIdMap>,
 }
+
+impl Untracked {
+    /// Freezes the cstore, and along with it the `StableCrateId` map. Past this point
+    /// no new crates can be loaded, so reads of both become lock-free. The map's only
+    /// other write, interning the local crate's id, happens at context creation, long
+    /// before any freeze.
+    pub fn freeze_cstore(&self) {
+        // Freeze the cstore first: this waits for any in-flight crate loading (which
+        // holds the cstore write guard) to finish before the `StableCrateId` map,
+        // which crate loading writes to, is frozen.
+        self.cstore.freeze();
+        self.stable_crate_ids.freeze();
+    }
+}

@@ -2086,8 +2086,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 .time("resolve_postprocess", || self.cstore_mut().postprocess(self.tcx, krate));
         });
 
-        // Make sure we don't mutate the cstore from here on.
-        self.tcx.untracked().cstore.freeze();
+        // Make sure we don't mutate the cstore or the stable crate id map from here on.
+        self.tcx.untracked().freeze_cstore();
     }
 
     fn traits_in_scope(
