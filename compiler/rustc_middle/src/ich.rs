@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::hash::Hash;
 
 use rustc_data_structures::stable_hash::{
@@ -18,8 +19,8 @@ enum CachingSourceMap<'a> {
 
 /// This is the context state available during incr. comp. hashing. It contains
 /// enough information to transform `DefId`s and `HirId`s into stable `DefPath`s (i.e.,
-/// a reference to the `TyCtxt`) and it holds a few caches for speeding up various
-/// things (e.g., each `DefId`/`DefPath` is only hashed once).
+/// a reference to the untracked session state) and it holds a few caches for speeding up
+/// various things (e.g., the `CachingSourceMapView` and the last `DefPathHash` lookup).
 pub struct StableHashState<'a> {
     untracked: &'a Untracked,
     // The value of `-Z incremental-ignore-spans`.
@@ -27,6 +28,11 @@ pub struct StableHashState<'a> {
     incremental_ignore_spans: bool,
     caching_source_map: CachingSourceMap<'a>,
     stable_hash_controls: StableHashControls,
+    // Memoizes the most recent `def_path_hash` lookup, so that hashing the `HirId`s and span
+    // parents of an owner (which mostly resolve the owner itself) does not take the definitions
+    // lock for every node. `DefId -> DefPathHash` is immutable within a session, so this entry
+    // can never go stale.
+    def_path_hash_memo: Cell<Option<(RawDefId, RawDefPathHash)>>,
 }
 
 impl<'a> StableHashState<'a> {
@@ -39,6 +45,7 @@ impl<'a> StableHashState<'a> {
             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
             caching_source_map: CachingSourceMap::Unused(sess.source_map()),
             stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
+            def_path_hash_memo: Cell::new(None),
         }
     }
 
@@ -160,13 +167,21 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
 
     #[inline]
     fn def_path_hash(&self, raw_def_id: RawDefId) -> RawDefPathHash {
+        if let Some((memo_def_id, memo_hash)) = self.def_path_hash_memo.get()
+            && memo_def_id == raw_def_id
+        {
+            return memo_hash;
+        }
+
         let def_id = DefId::from_raw_def_id(raw_def_id);
-        if let Some(def_id) = def_id.as_local() {
+        let def_path_hash = if let Some(def_id) = def_id.as_local() {
             self.untracked.definitions.read().def_path_hash(def_id)
         } else {
             self.untracked.cstore.read().def_path_hash(def_id)
         }
-        .to_raw_def_path_hash()
+        .to_raw_def_path_hash();
+        self.def_path_hash_memo.set(Some((raw_def_id, def_path_hash)));
+        def_path_hash
     }
 
     /// Assert that the provided `StableHashCtxt` is configured with the default

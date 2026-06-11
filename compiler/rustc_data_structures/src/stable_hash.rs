@@ -40,10 +40,12 @@ pub struct RawSpan(pub u32, pub u16, pub u16);
 
 // A type used to work around `DefId` not being visible in this crate. It is the same size as
 // `DefId`.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct RawDefId(pub u32, pub u32);
 
 // A type used to work around `DefPathHash` not being visible in this crate. It is the same size as
 // `DefPathHash`.
+#[derive(Clone, Copy)]
 pub struct RawDefPathHash(pub [u8; 16]);
 
 /// Something that implements `StableHash` can be hashed in a way that is
