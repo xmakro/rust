@@ -985,19 +985,32 @@ impl DepGraph {
         }
     }
 
-    /// This method loads all on-disk cacheable query results into memory, so
-    /// they can be written out to the new cache file again. Most query results
-    /// will already be in memory but in the case where we marked something as
-    /// green but then did not need the value, that value will never have been
-    /// loaded from disk.
+    /// This method loads all disk-cached query results for green nodes into
+    /// memory, so they can be written out to the new cache file again. Most
+    /// query results will already be in memory but in the case where we marked
+    /// something as green but then did not need the value, that value will
+    /// never have been loaded from disk.
     ///
-    /// This method will only load queries that will end up in the disk cache.
-    /// Other queries will not be executed.
+    /// Green nodes whose value is missing from the disk cache are skipped
+    /// here; their result is recomputed on demand in a later session.
     pub fn exec_cache_promotions<'tcx>(&self, tcx: TyCtxt<'tcx>) {
         let _prof_timer = tcx.prof.generic_activity("incr_comp_query_cache_promotion");
 
         let data = self.data.as_ref().unwrap();
-        for prev_index in data.colors.values.indices() {
+        // The on-disk cache struct is always present in incremental mode.
+        let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
+
+        // Only nodes that have a disk-cached value can be promoted, so iterate
+        // over those instead of scanning the whole previous graph. Sorting the
+        // indices preserves the promotion order of a full index scan, which
+        // keeps decoding (and e.g. hygiene data allocation) deterministic.
+        for prev_index in on_disk_cache.cached_query_value_indices() {
+            // The dep-graph file and the query-cache file are loaded
+            // independently, so guard against the cache referring to node
+            // indices that don't exist in the loaded graph.
+            if prev_index.as_usize() >= data.colors.values.len() {
+                continue;
+            }
             match data.colors.get(prev_index) {
                 DepNodeColor::Green(_) => {
                     let dep_node = data.previous.index_to_node(prev_index);

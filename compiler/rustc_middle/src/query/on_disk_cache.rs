@@ -342,6 +342,17 @@ impl OnDiskCache {
         // with_decoder is infallible, so we can stop here
     }
 
+    /// Returns the indices of all previous-session dep nodes that have a
+    /// disk-cached query return value. The indices are sorted, because
+    /// `query_values_index` is a hash map with nondeterministic ordering.
+    pub(crate) fn cached_query_value_indices(&self) -> Vec<SerializedDepNodeIndex> {
+        // The iteration order is made deterministic by the sort below.
+        #[allow(rustc::potential_query_instability)]
+        let mut indices: Vec<_> = self.query_values_index.keys().copied().collect();
+        indices.sort_unstable_by_key(|index| index.as_u32());
+        indices
+    }
+
     /// Returns the disk-cached query return value for the given node, if there is one.
     pub fn try_load_query_value<'tcx, T>(
         &self,
