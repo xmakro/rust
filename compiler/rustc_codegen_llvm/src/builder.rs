@@ -1881,10 +1881,9 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         instance: Option<Instance<'tcx>>,
         llfn: &'ll Value,
     ) {
-        let is_indirect_call = unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) };
         if self.tcx.sess.is_sanitizer_cfi_enabled()
             && let Some(fn_abi) = fn_abi
-            && is_indirect_call
+            && unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) }
         {
             if let Some(fn_attrs) = fn_attrs
                 && fn_attrs.sanitizers.disabled.contains(SanitizerSet::CFI)
@@ -1939,10 +1938,9 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         instance: Option<Instance<'tcx>>,
         llfn: &'ll Value,
     ) -> Option<llvm::OperandBundleBox<'ll>> {
-        let is_indirect_call = unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) };
         let kcfi_bundle = if self.tcx.sess.is_sanitizer_kcfi_enabled()
             && let Some(fn_abi) = fn_abi
-            && is_indirect_call
+            && unsafe { llvm::LLVMRustIsNonGVFunctionPointerTy(llfn) }
         {
             if let Some(fn_attrs) = fn_attrs
                 && fn_attrs.sanitizers.disabled.contains(SanitizerSet::KCFI)
