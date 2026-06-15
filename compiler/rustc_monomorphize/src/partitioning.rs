@@ -216,6 +216,11 @@ where
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
     let cgu_name_cache = &mut UnordMap::default();
 
+    // Caches, per mono item, whether its `instantiation_mode` is `LocalCopy`. Shared
+    // across all roots so the predicate is computed at most once per distinct item
+    // rather than once per reaching root.
+    let local_copy_memo = &mut UnordMap::default();
+
     for mono_item in mono_items {
         // Handle only root (GloballyShared) items directly here. Inlined (LocalCopy) items
         // are handled at the bottom of the loop based on reachability, with one exception.
@@ -264,7 +269,13 @@ where
         // external crates, and local functions the definition of which is
         // marked with `#[inline]`.
         let mut reachable_inlined_items = FxIndexSet::default();
-        get_reachable_inlined_items(cx.tcx, mono_item, cx.usage_map, &mut reachable_inlined_items);
+        get_reachable_inlined_items(
+            cx.tcx,
+            mono_item,
+            cx.usage_map,
+            local_copy_memo,
+            &mut reachable_inlined_items,
+        );
 
         // Add those inlined items. It's possible an inlined item is reachable
         // from multiple root items within a CGU, which is fine, it just means
@@ -301,14 +312,21 @@ where
         tcx: TyCtxt<'tcx>,
         item: MonoItem<'tcx>,
         usage_map: &UsageMap<'tcx>,
+        local_copy_memo: &mut UnordMap<MonoItem<'tcx>, bool>,
         visited: &mut FxIndexSet<MonoItem<'tcx>>,
     ) {
-        usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
-            let is_new = visited.insert(inlined_item);
-            if is_new {
-                get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
+        // Collect the newly-reached inlined items first so the `local_copy_memo`
+        // borrow held by `for_each_inlined_used_item` is released before we recurse
+        // (the recursion also needs `&mut local_copy_memo`).
+        let mut newly_reached = Vec::new();
+        usage_map.for_each_inlined_used_item(tcx, item, local_copy_memo, |inlined_item| {
+            if visited.insert(inlined_item) {
+                newly_reached.push(inlined_item);
             }
         });
+        for inlined_item in newly_reached {
+            get_reachable_inlined_items(tcx, inlined_item, usage_map, local_copy_memo, visited);
+        }
     }
 }
 

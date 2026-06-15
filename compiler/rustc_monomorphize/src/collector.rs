@@ -287,17 +287,25 @@ impl<'tcx> UsageMap<'tcx> {
     }
 
     /// Internally iterate over all inlined items used by `item`.
+    ///
+    /// `local_copy_memo` caches, per mono item, whether its `instantiation_mode` is
+    /// `LocalCopy`. The same inlined item can be reached from many roots during
+    /// partitioning, so this avoids recomputing the predicate (and its memoized
+    /// sub-query probes) once per reaching root.
     pub(crate) fn for_each_inlined_used_item<F>(
         &self,
         tcx: TyCtxt<'tcx>,
         item: MonoItem<'tcx>,
+        local_copy_memo: &mut UnordMap<MonoItem<'tcx>, bool>,
         mut f: F,
     ) where
         F: FnMut(MonoItem<'tcx>),
     {
         let used_items = self.used_map.get(&item).unwrap();
         for used_item in used_items.iter() {
-            let is_inlined = used_item.instantiation_mode(tcx) == InstantiationMode::LocalCopy;
+            let is_inlined = *local_copy_memo.entry(*used_item).or_insert_with(|| {
+                used_item.instantiation_mode(tcx) == InstantiationMode::LocalCopy
+            });
             if is_inlined {
                 f(*used_item);
             }
