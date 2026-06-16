@@ -143,6 +143,22 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
             ..
         } = *self;
 
+        // Fast path for the dominant region:region case. A lifetime-outlives
+        // predicate never enqueues follow-up predicates, so it would run the
+        // worklist loop below for exactly one iteration. Handle it directly to
+        // avoid the seed `Vec` allocation. The `higher_ranked_assumptions` skip
+        // is replicated here to keep behavior identical to the loop body.
+        if let GenericArgKind::Lifetime(r1) = predicate.0.kind() {
+            if !(self.infcx.tcx.sess.opts.unstable_opts.higher_ranked_assumptions
+                && higher_ranked_assumptions.contains(&predicate))
+            {
+                let r1_vid = self.to_region_vid(r1);
+                let r2_vid = self.to_region_vid(predicate.1);
+                self.add_outlives(r1_vid, r2_vid, constraint_category);
+            }
+            return;
+        }
+
         let mut outlives_predicates = vec![(predicate, constraint_category)];
         for iteration in 0.. {
             if outlives_predicates.is_empty() {
