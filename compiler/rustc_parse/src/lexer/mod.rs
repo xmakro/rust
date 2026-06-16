@@ -231,9 +231,14 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 }
                 rustc_lexer::TokenKind::Ident => self.ident(start),
                 rustc_lexer::TokenKind::RawIdent => {
-                    let sym = nfc_normalize(self.str_from(start + BytePos(2)));
+                    let raw = self.str_from(start + BytePos(2));
+                    let is_ascii = raw.is_ascii();
+                    let sym = nfc_normalize(raw);
                     let span = self.mk_sp(start, self.pos);
-                    self.psess.symbol_gallery.insert(sym, span);
+                    // See `ident`: the gallery is only read by ASCII-skipping lints.
+                    if !is_ascii {
+                        self.psess.symbol_gallery.insert(sym, span);
+                    }
                     if !sym.can_be_raw() {
                         self.dcx().emit_err(errors::CannotBeRawIdent { span, ident: sym });
                     }
@@ -486,9 +491,16 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
     }
 
     fn ident(&self, start: BytePos) -> TokenKind {
-        let sym = nfc_normalize(self.str_from(start));
-        let span = self.mk_sp(start, self.pos);
-        self.psess.symbol_gallery.insert(sym, span);
+        let s = self.str_from(start);
+        let is_ascii = s.is_ascii();
+        let sym = nfc_normalize(s);
+        // The symbol gallery is only ever read by lints that skip ASCII symbols
+        // (non-ascii idents, clippy disallowed scripts). nfc_normalize is the identity
+        // on ASCII and never maps non-ASCII to ASCII.
+        if !is_ascii {
+            let span = self.mk_sp(start, self.pos);
+            self.psess.symbol_gallery.insert(sym, span);
+        }
         token::Ident(sym, IdentIsRaw::No)
     }
 
