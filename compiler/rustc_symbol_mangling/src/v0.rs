@@ -332,15 +332,23 @@ impl<'tcx> Printer<'tcx> for V0SymbolMangler<'tcx> {
         // have anything to substitute the instance with.
         // NOTE: We don't support mangling partially substituted but still polymorphic
         // instances, like `impl<A> Tr<A> for ()` where `A` is substituted w/ `(T,)`.
+        // The equality below builds and interns the impl's identity args and folds them
+        // through region erasure. That is wasted work for a fully-monomorphized instance,
+        // which is the codegen default and where the comparison is always false. The args
+        // prefix can only equal the erased identity args when it carries the impl's identity
+        // type/const params (`has_non_region_param`) or when the impl has no type/const
+        // params at all (lifetime-only/empty generics), so only run the comparison then.
         let (typing_env, mut self_ty, mut impl_trait_ref) = if generics.count() > args.len()
-            || &args[..generics.count()]
-                == self
-                    .tcx
-                    .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
-                        self.tcx,
-                        impl_def_id,
-                    ))
-                    .as_slice()
+            || ((args[..generics.count()].iter().any(|arg| arg.has_non_region_param())
+                || !generics.requires_monomorphization(self.tcx))
+                && &args[..generics.count()]
+                    == self
+                        .tcx
+                        .erase_and_anonymize_regions(ty::GenericArgs::identity_for_item(
+                            self.tcx,
+                            impl_def_id,
+                        ))
+                        .as_slice())
         {
             (
                 ty::TypingEnv::post_analysis(self.tcx, impl_def_id),
