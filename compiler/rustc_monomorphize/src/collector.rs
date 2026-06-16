@@ -271,15 +271,15 @@ impl<'tcx> UsageMap<'tcx> {
         UsageMap { used_map: Default::default(), user_map: Default::default() }
     }
 
-    fn record_used<'a>(&mut self, user_item: MonoItem<'tcx>, used_items: &'a MonoItems<'tcx>)
+    fn record_used<I>(&mut self, user_item: MonoItem<'tcx>, used_items: I)
     where
-        'tcx: 'a,
+        I: Iterator<Item = MonoItem<'tcx>> + Clone,
     {
-        for used_item in used_items.items() {
+        for used_item in used_items.clone() {
             self.user_map.entry(used_item).or_default().push(user_item);
         }
 
-        assert!(self.used_map.insert(user_item, used_items.items().collect()).is_none());
+        assert!(self.used_map.insert(user_item, used_items.collect()).is_none());
     }
 
     pub(crate) fn get_user_items(&self, item: MonoItem<'tcx>) -> &[MonoItem<'tcx>] {
@@ -326,7 +326,7 @@ impl<'tcx> MonoItems<'tcx> {
         self.items.entry(item.node).or_insert(item.span);
     }
 
-    fn items(&self) -> impl Iterator<Item = MonoItem<'tcx>> {
+    fn items(&self) -> impl Iterator<Item = MonoItem<'tcx>> + Clone {
         self.items.keys().cloned()
     }
 }
@@ -463,7 +463,7 @@ fn collect_items_rec<'tcx>(
             debug_assert!(tcx.should_codegen_locally(instance));
 
             // Keep track of the monomorphization recursion depth
-            recursion_depth_reset = Some(check_recursion_limit(
+            let recursion_depth_reset = Some(check_recursion_limit(
                 tcx,
                 instance,
                 starting_item.span,
@@ -471,11 +471,16 @@ fn collect_items_rec<'tcx>(
                 recursion_limit,
             ));
 
-            rustc_data_structures::stack::ensure_sufficient_stack(|| {
+            // The `items_of_instance` query already returns deduplicated arena slices (it builds
+            // and deduplicates its own `MonoItems` before allocating them), so there is no need to
+            // rebuild local `FxIndexMap`-backed `MonoItems` here just to deduplicate them again.
+            // We can therefore operate on the slices directly and skip the per-instance map
+            // allocations and the associated hashing on this, the hottest node of the walk.
+            let (used, mentioned) = rustc_data_structures::stack::ensure_sufficient_stack(|| {
                 let Ok((used, mentioned)) = tcx.items_of_instance((instance, mode)) else {
                     // Normalization errors here are usually due to trait solving overflow.
-                    // FIXME: I assume that there are few type errors at post-analysis stage, but not
-                    // entirely sure.
+                    // FIXME: I assume that there are few type errors at post-analysis stage,
+                    // but not entirely sure.
                     // We have to emit the error outside of `items_of_instance` to access the
                     // span of the `starting_item`.
                     let def_id = instance.def_id();
@@ -488,9 +493,83 @@ fn collect_items_rec<'tcx>(
                         def_path_str,
                     });
                 };
-                used_items.extend(used.into_iter().copied());
-                mentioned_items.extend(mentioned.into_iter().copied());
+                (used, mentioned)
             });
+
+            // Check for PMEs and emit a diagnostic if one happened, to try to show relevant edges
+            // of the mono item graph. See the longer note on the shared path below.
+            if tcx.dcx().err_count_on_current_thread() > error_count
+                && starting_item.node.is_generic_fn()
+                && starting_item.node.is_user_defined()
+            {
+                tcx.dcx().emit_note(EncounteredErrorWhileInstantiating {
+                    span: starting_item.span,
+                    kind: "fn",
+                    instance,
+                });
+            }
+
+            // Only update `usage_map` for used items (see the note on the shared path below). The
+            // `used` slice is already deduplicated, so this records exactly the same set as before.
+            if mode == CollectionMode::UsedItems {
+                state
+                    .usage_map
+                    .lock()
+                    .record_used(starting_item.node, used.iter().map(|i| i.node));
+            } else {
+                assert!(
+                    used.is_empty(),
+                    "'mentioned' collection should never encounter used items"
+                );
+            }
+
+            // Filter the (already unique) slices against the global visited/mentioned sets, just
+            // as the shared path does via `retain`, buffering the survivors so the locks are
+            // dropped before we recurse.
+            let mut used_to_recurse = Vec::new();
+            let mut mentioned_to_recurse = Vec::new();
+            {
+                let mut visited = OnceCell::default();
+                if mode == CollectionMode::UsedItems {
+                    used_to_recurse.extend(used.iter().copied().filter(|i| {
+                        visited.get_mut_or_init(|| state.visited.lock()).insert(i.node)
+                    }));
+                }
+
+                let mut mentioned_set = OnceCell::default();
+                mentioned_to_recurse.extend(mentioned.iter().copied().filter(|i| {
+                    !visited.get_or_init(|| state.visited.lock()).contains(&i.node)
+                        && mentioned_set.get_mut_or_init(|| state.mentioned.lock()).insert(i.node)
+                }));
+            }
+
+            // Walk over mentioned items *after* used items, so that if an item is both mentioned
+            // and used then the loop above has fully collected it, so this loop will skip it.
+            for used_item in used_to_recurse {
+                collect_items_rec(
+                    tcx,
+                    used_item,
+                    state,
+                    recursion_depths,
+                    recursion_limit,
+                    CollectionMode::UsedItems,
+                );
+            }
+            for mentioned_item in mentioned_to_recurse {
+                collect_items_rec(
+                    tcx,
+                    mentioned_item,
+                    state,
+                    recursion_depths,
+                    recursion_limit,
+                    CollectionMode::MentionedItems,
+                );
+            }
+
+            if let Some((def_id, depth)) = recursion_depth_reset {
+                recursion_depths.insert(def_id, depth);
+            }
+            return;
         }
         MonoItem::GlobalAsm(item_id) => {
             assert!(
@@ -566,7 +645,7 @@ fn collect_items_rec<'tcx>(
     // This is part of the output of collection and hence only relevant for "used" items.
     // ("Mentioned" items are only considered internally during collection.)
     if mode == CollectionMode::UsedItems {
-        state.usage_map.lock().record_used(starting_item.node, &used_items);
+        state.usage_map.lock().record_used(starting_item.node, used_items.items());
     }
 
     {
