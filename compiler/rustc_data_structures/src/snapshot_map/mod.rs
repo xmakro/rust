@@ -1,4 +1,5 @@
 use std::borrow::{Borrow, BorrowMut};
+use std::collections::hash_map::Entry;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::ops;
@@ -65,6 +66,49 @@ where
             Some(old_value) => {
                 self.undo_log.push(UndoLog::Overwrite(key, old_value));
                 false
+            }
+        }
+    }
+
+    /// Inserts `value` for `key` only if `key` is currently absent. Returns `None`
+    /// if the value was inserted, or a clone of the existing value if `key` was
+    /// already present.
+    pub fn insert_if_absent(&mut self, key: K, value: V) -> Option<V>
+    where
+        V: Clone,
+    {
+        match self.map.borrow_mut().entry(key.clone()) {
+            Entry::Occupied(entry) => Some(entry.get().clone()),
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                self.undo_log.push(UndoLog::Inserted(key));
+                None
+            }
+        }
+    }
+
+    /// Overwrites the value for `key` with `value`, unless `key` already maps to a
+    /// value for which `keep` returns `true`. Returns `None` if the existing value
+    /// was kept, otherwise `Some(was_absent)` where `was_absent` is `true` iff
+    /// `key` had no previous value (and `value` was freshly inserted).
+    pub fn overwrite_unless<F>(&mut self, key: K, value: V, keep: F) -> Option<bool>
+    where
+        F: FnOnce(&V) -> bool,
+    {
+        match self.map.borrow_mut().entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                if keep(entry.get()) {
+                    None
+                } else {
+                    let old_value = entry.insert(value);
+                    self.undo_log.push(UndoLog::Overwrite(key, old_value));
+                    Some(false)
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                self.undo_log.push(UndoLog::Inserted(key));
+                Some(true)
             }
         }
     }

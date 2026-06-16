@@ -41,3 +41,31 @@ fn nested_commit_then_rollback() {
     map.rollback_to(snapshot1);
     assert_eq!(map[&22], "twenty-two");
 }
+
+#[test]
+fn insert_if_absent_inserts_and_rolls_back() {
+    let mut map = SnapshotMap::default();
+    let snapshot = map.snapshot();
+    assert_eq!(map.insert_if_absent(22, "twenty-two"), None);
+    assert_eq!(map[&22], "twenty-two");
+    assert_eq!(map.insert_if_absent(22, "thirty-three"), Some("twenty-two"));
+    assert_eq!(map[&22], "twenty-two");
+    map.rollback_to(snapshot);
+    assert_eq!(map.get(&22), None);
+}
+
+#[test]
+fn overwrite_unless_keeps_overwrites_and_inserts() {
+    let mut map = SnapshotMap::default();
+    map.insert(22, "twenty-two");
+    let snapshot = map.snapshot();
+    assert_eq!(map.overwrite_unless(22, "thirty-three", |v| *v == "twenty-two"), None);
+    assert_eq!(map[&22], "twenty-two");
+    assert_eq!(map.overwrite_unless(22, "thirty-three", |_| false), Some(false));
+    assert_eq!(map[&22], "thirty-three");
+    assert_eq!(map.overwrite_unless(44, "forty-four", |_| false), Some(true));
+    assert_eq!(map[&44], "forty-four");
+    map.rollback_to(snapshot);
+    assert_eq!(map[&22], "twenty-two");
+    assert_eq!(map.get(&44), None);
+}

@@ -156,13 +156,11 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
         &mut self,
         key: ProjectionCacheKey<'tcx>,
     ) -> Result<(), ProjectionCacheEntry<'tcx>> {
-        let mut map = self.map();
-        if let Some(entry) = map.get(&key) {
-            return Err(entry.clone());
+        if let Some(entry) = self.map().insert_if_absent(key, ProjectionCacheEntry::InProgress) {
+            Err(entry)
+        } else {
+            Ok(())
         }
-
-        map.insert(key, ProjectionCacheEntry::InProgress);
-        Ok(())
     }
 
     /// Indicates that `key` was normalized to `value`.
@@ -171,14 +169,14 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
             "ProjectionCacheEntry::insert_ty: adding cache entry: key={:?}, value={:?}",
             key, value
         );
-        let mut map = self.map();
-        if let Some(ProjectionCacheEntry::Recur) = map.get(&key) {
+        let entry = ProjectionCacheEntry::NormalizedTerm { ty: value, complete: None };
+        if let Some(fresh_key) = self.map().overwrite_unless(key, entry, |existing| {
+            matches!(existing, ProjectionCacheEntry::Recur)
+        }) {
+            assert!(!fresh_key, "never started projecting `{key:?}`");
+        } else {
             debug!("Not overwriting Recur");
-            return;
         }
-        let fresh_key =
-            map.insert(key, ProjectionCacheEntry::NormalizedTerm { ty: value, complete: None });
-        assert!(!fresh_key, "never started projecting `{key:?}`");
     }
 
     /// Mark the relevant projection cache key as having its derived obligations
