@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fmt::{self, Write};
 use std::ops::Deref;
 use std::range::RangeInclusive;
@@ -751,7 +750,7 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
         // values.
 
         // First we need to sort the possible discriminant values so that we can look for the largest gap:
-        let valid_discriminants: BTreeSet<i128> = discriminants
+        let mut valid_discriminants: Vec<i128> = discriminants
             .filter(|&(i, _)| repr.c() || variants[i].iter().all(|f| !f.is_uninhabited()))
             .map(|(_, val)| {
                 if discr_type.is_signed() {
@@ -763,6 +762,8 @@ impl<Cx: HasDataLayout> LayoutCalculator<Cx> {
                 }
             })
             .collect();
+        valid_discriminants.sort_unstable();
+        valid_discriminants.dedup();
         trace!(?valid_discriminants);
         let discriminants = valid_discriminants.iter().copied();
         //let next_discriminants = discriminants.clone().cycle().skip(1);
