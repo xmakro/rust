@@ -1034,8 +1034,16 @@ where
 
     #[instrument(level = "debug", skip(self))]
     pub(super) fn add_goal(&mut self, source: GoalSource, mut goal: Goal<I, I::Predicate>) {
-        goal.predicate =
-            goal.predicate.fold_with(&mut ReplaceAliasWithInfer::new(self, source, goal.param_env));
+        // `ReplaceAliasWithInfer` only rewrites `ty::Alias` and `ConstKind::Unevaluated`
+        // nodes (both of which set `TypeFlags::HAS_ALIAS`) and only emits normalization
+        // goals for those nodes, so for a predicate without aliases the fold is an
+        // identity that emits no goals. Skip it via a single bitflag check on the
+        // overwhelmingly common no-alias goal.
+        if goal.predicate.has_aliases() {
+            goal.predicate = goal
+                .predicate
+                .fold_with(&mut ReplaceAliasWithInfer::new(self, source, goal.param_env));
+        }
         self.inspect.add_goal(self.delegate, self.max_input_universe, source, goal);
         self.nested_goals.push((source, goal, None));
     }
