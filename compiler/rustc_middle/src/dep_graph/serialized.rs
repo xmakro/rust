@@ -167,8 +167,8 @@ struct LazyKindIndex {
 }
 
 impl LazyKindIndex {
-    /// Returns this kind's `key_fingerprint -> node index` map.
-    fn fingerprint_map(
+    /// Builds and returns this kind's `key_fingerprint -> node index` map.
+    fn build_fingerprint_map(
         &self,
         kind: DepKind,
         nodes: &IndexSlice<SerializedDepNodeIndex, DepNode>,
@@ -235,12 +235,17 @@ impl SerializedDepGraph {
     #[inline]
     pub fn node_to_index_opt(&self, dep_node: &DepNode) -> Option<SerializedDepNodeIndex> {
         let kind = self.reverse_index.kinds.get(dep_node.kind.as_usize())?;
-        let map = kind.fingerprint_map(
-            dep_node.kind,
-            &self.nodes,
-            &self.reverse_index.nodes_by_kind,
-            &self.profiler,
-        );
+        // perf: `get()` before `get_or_init()` keeps the build closure and its call
+        // off the hot path; the `Some` arm is then just an inlined `OnceLock` load.
+        let map = match kind.map.get() {
+            Some(map) => map,
+            None => kind.build_fingerprint_map(
+                dep_node.kind,
+                &self.nodes,
+                &self.reverse_index.nodes_by_kind,
+                &self.profiler,
+            ),
+        };
         map.get(&dep_node.key_fingerprint).copied()
     }
 
