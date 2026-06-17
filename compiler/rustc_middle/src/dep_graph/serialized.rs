@@ -51,7 +51,7 @@ use rustc_data_structures::outline;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_data_structures::sync::{AtomicU64, Lock, WorkerLocal, broadcast};
 use rustc_data_structures::unhash::UnhashMap;
-use rustc_index::{IndexSlice, IndexVec};
+use rustc_index::IndexVec;
 use rustc_serialize::opaque::mem_encoder::MemEncoder;
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder, IntEncodedWithFixedSize, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
@@ -145,13 +145,13 @@ impl std::fmt::Debug for SerializedDepGraph {
 /// `DepKind`s. Building a map for every kind up front would be wasted work.
 #[derive(Debug, Default)]
 struct LazyNodeIndex {
-    /// All (non-`Null`) node indices, grouped into contiguous per-`DepKind`
-    /// ranges described by `kinds`. For any non-`Null` `DepKind` `k`, all values in
-    /// `nodes_by_kind[kinds[k].start..][..kinds[k].len]`
-    /// must be `Some` and have kind `k`.
-    nodes_by_kind: Vec<Option<SerializedDepNodeIndex>>,
-    /// For each `DepKind`, the range of `nodes_by_kind` holding its node indices
-    /// and the lazily-built fingerprint map over that range.
+    /// Every (non-`Null`) node's `(key_fingerprint, index)` pair, grouped into
+    /// contiguous per-`DepKind` ranges described by `kinds`. Carrying the
+    /// fingerprint here lets a kind's map be built by a linear scan of its range,
+    /// rather than gathering scattered entries out of `nodes`.
+    nodes_by_kind: Vec<(PackedFingerprint, SerializedDepNodeIndex)>,
+    /// For each `DepKind`, the range of `nodes_by_kind` holding its nodes and the
+    /// lazily-built fingerprint map over that range.
     kinds: Vec<LazyKindIndex>,
 }
 
@@ -171,8 +171,7 @@ impl LazyKindIndex {
     fn fingerprint_map(
         &self,
         kind: DepKind,
-        nodes: &IndexSlice<SerializedDepNodeIndex, DepNode>,
-        nodes_by_kind: &[Option<SerializedDepNodeIndex>],
+        nodes_by_kind: &[(PackedFingerprint, SerializedDepNodeIndex)],
         profiler: &Option<SelfProfilerRef>,
     ) -> &UnhashMap<PackedFingerprint, SerializedDepNodeIndex> {
         self.map.get_or_init(|| {
@@ -182,14 +181,11 @@ impl LazyKindIndex {
             let range = (self.start as usize)..(self.start as usize + self.len as usize);
             let mut map =
                 UnhashMap::with_capacity_and_hasher(self.len as usize, Default::default());
-            for &idx in &nodes_by_kind[range] {
-                let idx = idx.expect("counting sort fills every slot of a kind's range");
-                let node = nodes[idx];
-                debug_assert_eq!(node.kind, kind);
-                if map.insert(node.key_fingerprint, idx).is_some()
-                    // Side effect nodes can legitimately share a fingerprint.
-                    && node.kind != DepKind::SideEffect
-                {
+            // Side effect nodes can legitimately share a fingerprint.
+            let allow_duplicates = kind == DepKind::SideEffect;
+            for &(key_fingerprint, idx) in &nodes_by_kind[range] {
+                if map.insert(key_fingerprint, idx).is_some() && !allow_duplicates {
+                    let node = DepNode { kind, key_fingerprint };
                     panic!(
                         "Error: A dep graph node ({kind:?}) does not have an unique index. \
                          Running a clean build on a nightly compiler with \
@@ -237,7 +233,6 @@ impl SerializedDepGraph {
         let kind = self.reverse_index.kinds.get(dep_node.kind.as_usize())?;
         let map = kind.fingerprint_map(
             dep_node.kind,
-            &self.nodes,
             &self.reverse_index.nodes_by_kind,
             &self.profiler,
         );
@@ -389,11 +384,14 @@ impl SerializedDepGraph {
 
         let session_count = d.read_u64();
 
-        // Counting sort: place each node index into its kind's range. `fill[k]`
-        // points at the next free slot in kind `k`'s range, so a kind's nodes end
-        // up contiguous. Slots start as `None` and are each filled exactly once
-        // (the counts sum to the number of non-`Null` nodes).
-        let mut nodes_by_kind = vec![None; node_count];
+        // Counting sort: place each node's `(key_fingerprint, index)` into its
+        // kind's range. `fill[k]` points at the next free slot in kind `k`'s range,
+        // so a kind's nodes end up contiguous. Every slot is filled exactly once
+        // (the counts sum to the number of non-`Null` nodes), so the placeholder is
+        // always overwritten before it can be read.
+        let placeholder =
+            (PackedFingerprint::from(Fingerprint::ZERO), SerializedDepNodeIndex::from_u32(0));
+        let mut nodes_by_kind = vec![placeholder; node_count];
         let mut fill: Vec<u32> = kinds.iter().map(|k| k.start).collect();
         for (idx, node) in nodes.iter_enumerated() {
             // Unused indices from batch allocation stay `Null`; they carry no
@@ -402,7 +400,7 @@ impl SerializedDepGraph {
                 continue;
             }
             let k = node.kind.as_usize();
-            nodes_by_kind[fill[k] as usize] = Some(idx);
+            nodes_by_kind[fill[k] as usize] = (node.key_fingerprint, idx);
             fill[k] += 1;
         }
         // Each kind's range was filled exactly to its end.
