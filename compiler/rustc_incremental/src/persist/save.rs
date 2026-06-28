@@ -70,7 +70,6 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                     //
                     // FIXME(Zalathar): This step is intended to be cheap, but still does
                     // quite a lot of work, especially in builds with few or no changes.
-                    // Can we be smarter about how we identify values that need promotion?
                     // Can we promote values without decoding them into the memory cache?
                     tcx.dep_graph.exec_cache_promotions(tcx);
 

@@ -342,6 +342,18 @@ impl OnDiskCache {
         // with_decoder is infallible, so we can stop here
     }
 
+    /// Returns an iterator over the indices of all previous-session dep nodes
+    /// that have a disk-cached query return value.
+    pub(crate) fn cached_query_value_indices(
+        &self,
+    ) -> impl Iterator<Item = SerializedDepNodeIndex> + '_ {
+        // The iteration order only determines the order in which already-computed
+        // query values are loaded into the in-memory cache at save time, which has
+        // no effect on compiler output, so the unspecified hash-map order is fine.
+        #[allow(rustc::potential_query_instability)]
+        self.query_values_index.keys().copied()
+    }
+
     /// Returns the disk-cached query return value for the given node, if there is one.
     pub fn try_load_query_value<'tcx, T>(
         &self,
