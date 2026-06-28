@@ -1049,26 +1049,36 @@ impl DepGraph {
         }
     }
 
-    /// This method loads all on-disk cacheable query results into memory, so
-    /// they can be written out to the new cache file again. Most query results
-    /// will already be in memory but in the case where we marked something as
-    /// green but then did not need the value, that value will never have been
-    /// loaded from disk.
+    /// This method loads all disk-cached query results for green nodes into
+    /// memory, so they can be written out to the new cache file again. Most
+    /// query results will already be in memory but in the case where we marked
+    /// something as green but then did not need the value, that value will
+    /// never have been loaded from disk.
     ///
-    /// This method will only load queries that will end up in the disk cache.
-    /// Other queries will not be executed.
+    /// Green nodes whose value is missing from the disk cache are skipped here;
+    /// their result is recomputed on demand in a later session.
     pub fn exec_cache_promotions<'tcx>(&self, tcx: TyCtxt<'tcx>) {
         let _prof_timer = tcx.prof.generic_activity("incr_comp_query_cache_promotion");
 
         let data = self.data.as_ref().unwrap();
-        for prev_index in data.colors.values.indices() {
+        // The on-disk cache is always present in incremental mode.
+        let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
+
+        // Only nodes with a disk-cached value can be promoted, so iterate those
+        // instead of scanning the whole previous graph.
+        for prev_index in on_disk_cache.cached_query_value_indices() {
+            // The dep-graph and query-cache files are loaded independently, so
+            // skip indices that are not present in the loaded dep graph.
+            if prev_index.as_usize() >= data.colors.values.len() {
+                continue;
+            }
             match data.colors.get(prev_index) {
-                DepNodeColor::Green(_) => {
+                DepNodeColor::Green(dep_node_index) => {
                     let dep_node = data.previous.index_to_node(prev_index);
                     if let Some(promote_fn) =
                         tcx.dep_kind_vtable(dep_node.kind).promote_from_disk_fn
                     {
-                        promote_fn(tcx, *dep_node)
+                        promote_fn(tcx, *dep_node, prev_index, dep_node_index)
                     };
                 }
                 DepNodeColor::Unknown | DepNodeColor::Red => {
