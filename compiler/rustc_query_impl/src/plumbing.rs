@@ -1,22 +1,24 @@
 use std::num::NonZero;
 
+use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::limit::Limit;
 use rustc_middle::bug;
 #[expect(unused_imports, reason = "used by doc comments")]
 use rustc_middle::dep_graph::DepKindVTable;
-use rustc_middle::dep_graph::{DepNode, DepNodeKey, SerializedDepNodeIndex};
+use rustc_middle::dep_graph::{DepNode, DepNodeIndex, DepNodeKey, SerializedDepNodeIndex};
 use rustc_middle::query::erase::{Erasable, Erased};
 use rustc_middle::query::on_disk_cache::{CacheDecoder, CacheEncoder};
 use rustc_middle::query::{QueryCache, QueryJobId, QueryMode, QueryVTable, erase};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::tls::{self, ImplicitCtxt};
+use rustc_middle::verify_ich::incremental_verify_ich;
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::DUMMY_SP;
 use rustc_span::def_id::LOCAL_CRATE;
 
 use crate::error::{QueryOverflow, QueryOverflowNote};
-use crate::execution::all_inactive;
+use crate::execution::{all_inactive, should_verify_loaded_value};
 use crate::job::find_dep_kind_root;
 use crate::query_impl::for_each_query_vtable;
 use crate::{CollectActiveJobsKind, collect_active_query_jobs};
@@ -140,6 +142,8 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
     tcx: TyCtxt<'tcx>,
     query: &'tcx QueryVTable<'tcx, C>,
     dep_node: DepNode,
+    prev_index: SerializedDepNodeIndex,
+    dep_node_index: DepNodeIndex,
 ) {
     debug_assert!(tcx.dep_graph.is_green(&dep_node));
 
@@ -156,17 +160,41 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
         return;
     }
 
-    match query.cache.lookup(&key) {
-        // If the value is already in memory, then promotion isn't needed.
-        Some(_) => {}
+    // If the value is already in memory, then promotion isn't needed.
+    if query.cache.lookup(&key).is_some() {
+        return;
+    }
 
-        // "Execute" the query to load its disk-cached value into memory.
-        //
-        // We know that the key is cache-on-disk and its node is green,
-        // so there _must_ be a value on disk to load.
-        //
-        // FIXME(Zalathar): Is there a reasonable way to skip more of the
-        // query bookkeeping when doing this?
+    // Load the disk-cached value into memory.
+    let dep_graph_data =
+        tcx.dep_graph.data().expect("should always be present in incremental mode");
+
+    let prof_timer = tcx.prof.incr_cache_loading();
+    let value = ensure_sufficient_stack(|| (query.try_load_from_disk_fn)(tcx, prev_index));
+    prof_timer.finish_with_query_invocation_id(dep_node_index.into());
+
+    match value {
+        Some(value) => {
+            // Verify the fingerprints of the same subset of loaded values as
+            // `load_from_disk_or_invoke_provider_green` does.
+            let prev_fingerprint = dep_graph_data.prev_value_fingerprint_of(prev_index);
+            if should_verify_loaded_value(tcx, prev_fingerprint) {
+                incremental_verify_ich(
+                    tcx,
+                    dep_graph_data,
+                    &value,
+                    prev_index,
+                    query.hash_value_fn,
+                    query.format_value,
+                );
+            }
+
+            query.cache.complete(key, value, dep_node_index);
+        }
+
+        // There was no value on disk, despite the key being cache-on-disk and
+        // its node being green. "Execute" the query through the normal
+        // machinery, which will recompute the value and put it in memory.
         None => {
             (query.execute_query_fn)(tcx, DUMMY_SP, key, QueryMode::Get);
         }
