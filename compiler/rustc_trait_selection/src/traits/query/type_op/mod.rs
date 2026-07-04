@@ -110,12 +110,6 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 't
         ),
         NoSolution,
     > {
-        if !infcx.disable_trait_solver_fast_paths()
-            && let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &query_key)
-        {
-            return Ok((result, None, PredicateObligations::new(), Certainty::Proven));
-        }
-
         let mut canonical_var_values = OriginalQueryValues::default();
         let old_param_env = query_key.param_env;
         let canonical_self = infcx.canonicalize_query(query_key, &mut canonical_var_values);
@@ -147,6 +141,18 @@ where
         root_def_id: LocalDefId,
         span: Span,
     ) -> Result<TypeOpOutput<'tcx, Self>, ErrorGuaranteed> {
+        // Fast-path results are final: they never register obligations or
+        // produce region constraints, so we can skip opening a snapshot,
+        // building a fulfillment context, and scraping region constraints.
+        // The overwhelming majority of type ops performed during MIR type
+        // check take this path.
+        if !infcx.disable_trait_solver_fast_paths()
+            && let Some(output) = QueryTypeOp::try_fast_path(infcx.tcx, &self)
+        {
+            let output = infcx.resolve_vars_if_possible(output);
+            return Ok(TypeOpOutput { output, constraints: None, error_info: None });
+        }
+
         // In the new trait solver, query type ops are performed locally. This
         // is because query type ops currently use the old canonicalizer, and
         // that doesn't preserve things like opaques which have been registered
@@ -160,14 +166,7 @@ where
                 root_def_id,
                 "query type op",
                 span,
-                |ocx| {
-                    if !infcx.disable_trait_solver_fast_paths()
-                        && let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &self)
-                    {
-                        return Ok(result);
-                    }
-                    QueryTypeOp::perform_locally_with_next_solver(ocx, self, span)
-                },
+                |ocx| QueryTypeOp::perform_locally_with_next_solver(ocx, self, span),
             )?
             .0);
         }
