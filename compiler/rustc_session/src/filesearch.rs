@@ -64,13 +64,79 @@ fn current_dll_path() -> Result<PathBuf, String> {
     // This is somewhat expensive relative to other work when compiling `fn main() {}` as `dladdr`
     // needs to iterate over the symbol table of librustc_driver.so until it finds a match.
     // As such cache this to avoid recomputing if we try to get the sysroot in multiple places.
+    // On Linux `dl_iterate_phdr` is used instead, which only walks the program headers of the
+    // loaded objects and never touches a symbol table.
     static CURRENT_DLL_PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     CURRENT_DLL_PATH
         .get_or_init(|| {
             use std::ffi::{CStr, OsStr};
             use std::os::unix::prelude::*;
 
-            #[cfg(not(target_os = "aix"))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            unsafe {
+                struct State {
+                    addr: usize,
+                    path: Option<Result<PathBuf, String>>,
+                }
+
+                unsafe extern "C" fn callback(
+                    info: *mut libc::dl_phdr_info,
+                    _size: libc::size_t,
+                    data: *mut libc::c_void,
+                ) -> libc::c_int {
+                    unsafe {
+                        let state = &mut *(data as *mut State);
+                        let info = &*info;
+                        for i in 0..info.dlpi_phnum {
+                            let phdr = &*info.dlpi_phdr.add(i as usize);
+                            if phdr.p_type == libc::PT_LOAD {
+                                let start = (info.dlpi_addr as usize)
+                                    .wrapping_add(phdr.p_vaddr as usize);
+                                let end = start.wrapping_add(phdr.p_memsz as usize);
+                                if (start..end).contains(&state.addr) {
+                                    if info.dlpi_name.is_null() {
+                                        return 0;
+                                    }
+                                    let name = CStr::from_ptr(info.dlpi_name);
+                                    if name.is_empty() {
+                                        // The current function lives in the main
+                                        // executable, e.g. when rustc_driver is
+                                        // linked statically.
+                                        state.path = Some(
+                                            std::env::current_exe()
+                                                .map_err(|e| e.to_string())
+                                                .and_then(|p| {
+                                                    try_canonicalize(p)
+                                                        .map_err(|e| e.to_string())
+                                                }),
+                                        );
+                                    } else {
+                                        let os = OsStr::from_bytes(name.to_bytes());
+                                        state.path = Some(
+                                            try_canonicalize(Path::new(os))
+                                                .map_err(|e| e.to_string()),
+                                        );
+                                    }
+                                    return 1;
+                                }
+                            }
+                        }
+                        0
+                    }
+                }
+
+                let mut state = State {
+                    addr: current_dll_path as fn() -> Result<PathBuf, String> as usize,
+                    path: None,
+                };
+                libc::dl_iterate_phdr(Some(callback), (&raw mut state) as *mut libc::c_void);
+                if let Some(path) = state.path {
+                    return path;
+                }
+                return Err("dl_iterate_phdr did not find the current object".into());
+            }
+
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "aix")))]
             unsafe {
                 let addr = current_dll_path as fn() -> Result<PathBuf, String> as *mut _;
                 let mut info = std::mem::zeroed();
