@@ -21,14 +21,16 @@
 //!  - Add the feature gating in `compiler/rustc_feature/src/builtin_attrs.rs`
 
 use std::hash::Hash;
-use std::iter;
 
 use rustc_abi::Align;
 use rustc_ast::ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
 use rustc_lint_defs::builtin::EXPLICIT_BUILTIN_CFGS_IN_FLAGS;
 use rustc_span::{Symbol, sym};
-use rustc_target::spec::{PanicStrategy, RelocModel, SanitizerSet, Target};
+use rustc_target::spec::{
+    Arch, BUILTIN_TARGET_FAMILIES, BUILTIN_TARGET_VENDORS, BinaryFormat, CfgAbi, Env, Os,
+    PanicStrategy, RelocModel, SanitizerSet, Target,
+};
 
 use crate::config::{CrateType, FmtDebug};
 use crate::{Session, errors};
@@ -438,8 +440,6 @@ impl CheckCfg {
             }
 
             if self.exhaustive_values {
-                // Get all values map at once otherwise it would be costly.
-                // (8 values * 220 targets ~= 1760 times, at the time of writing this comment).
                 let [
                     Some(values_target_abi),
                     Some(values_target_arch),
@@ -455,19 +455,39 @@ impl CheckCfg {
                     panic!("unable to get all the check-cfg values buckets");
                 };
 
-                for target in Target::builtins().chain(iter::once(current_target.clone())) {
-                    values_target_abi.insert(target.options.cfg_abi.desc_symbol());
-                    values_target_arch.insert(target.arch.desc_symbol());
-                    values_target_endian.insert(target.options.endian.desc_symbol());
-                    values_target_env.insert(target.options.env.desc_symbol());
-                    values_target_family.extend(
-                        target.options.families.iter().map(|family| Symbol::intern(family)),
-                    );
-                    values_target_object_format.insert(target.options.binary_format.desc_symbol());
-                    values_target_os.insert(target.options.os.desc_symbol());
-                    values_target_pointer_width.insert(sym::integer(target.pointer_width));
-                    values_target_vendor.insert(target.vendor_symbol());
-                }
+                // Seed the sets with the values known to the compiler: every
+                // variant of the target spec enums, plus the families and
+                // vendors used by the builtin targets. This intentionally
+                // avoids constructing every builtin target spec just to read
+                // these few fields back out of them, which used to dominate
+                // the cost of check-cfg setup on small crates.
+                let interned = |values: &'static [&'static str]| {
+                    values.iter().copied().map(Symbol::intern)
+                };
+                values_target_abi.extend(interned(CfgAbi::KNOWN_DESCS));
+                values_target_arch.extend(interned(Arch::KNOWN_DESCS));
+                values_target_endian.extend([sym::big, sym::little]);
+                values_target_env.extend(interned(Env::KNOWN_DESCS));
+                values_target_family.extend(interned(BUILTIN_TARGET_FAMILIES));
+                values_target_object_format.extend(interned(BinaryFormat::KNOWN_DESCS));
+                values_target_os.extend(interned(Os::KNOWN_DESCS));
+                values_target_pointer_width
+                    .extend([16u32, 32, 64].map(|width| sym::integer(width)));
+                values_target_vendor.extend(interned(BUILTIN_TARGET_VENDORS));
+
+                // The current target can be a custom JSON target with values
+                // outside the tables above.
+                let target = &current_target;
+                values_target_abi.insert(target.options.cfg_abi.desc_symbol());
+                values_target_arch.insert(target.arch.desc_symbol());
+                values_target_endian.insert(target.options.endian.desc_symbol());
+                values_target_env.insert(target.options.env.desc_symbol());
+                values_target_family
+                    .extend(target.options.families.iter().map(|family| Symbol::intern(family)));
+                values_target_object_format.insert(target.options.binary_format.desc_symbol());
+                values_target_os.insert(target.options.os.desc_symbol());
+                values_target_pointer_width.insert(sym::integer(target.pointer_width));
+                values_target_vendor.insert(target.vendor_symbol());
             }
         }
 

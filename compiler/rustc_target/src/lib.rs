@@ -110,6 +110,8 @@ macro_rules! target_spec_enum {
 
         impl $Name {
             pub const ALL: &'static [$Name] = &[ $( $Name::$Variant, )* ];
+            /// The canonical string values of all variants.
+            pub const KNOWN_DESCS: &'static [&'static str] = &[ $( $string, )* ];
             pub fn desc(&self) -> &'static str {
                 match self {
                     $( Self::$Variant => $string, )*
@@ -178,6 +180,11 @@ macro_rules! target_spec_enum {
         }
 
         impl $Name {
+            /// The canonical string values of all variants known to the
+            /// compiler. Arbitrary values from custom target JSON files (the
+            /// escape hatch variant) are not included.
+            pub const KNOWN_DESCS: &'static [&'static str] = &[ $( $string, )* ];
+
             pub fn desc(&self) -> &str {
                 match self {
                     $( Self::$Variant => $string, )*
