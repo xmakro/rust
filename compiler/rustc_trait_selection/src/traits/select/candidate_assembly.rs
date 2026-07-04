@@ -213,6 +213,11 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // normalization, so try to deduplicate when possible to avoid
             // unnecessary ambiguity.
             let mut distinct_normalized_bounds = FxHashSet::default();
+            // Sizedness candidates are only lazily elaborated for `MetaSized`
+            // obligations, so check the obligation once instead of per bound.
+            let obligation_is_metasized = self
+                .tcx()
+                .is_lang_item(obligation.predicate.def_id(), LangItem::MetaSized);
             let _ = self.for_each_item_bound::<!>(
                 placeholder_trait_predicate.self_ty(),
                 |selcx, bound, idx, alias_bound_kind| {
@@ -224,11 +229,15 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                     }
 
                     selcx.infcx.probe(|_| {
-                        let bound = util::lazily_elaborate_sizedness_candidate(
-                            selcx.infcx,
-                            obligation,
-                            bound,
-                        );
+                        let bound = if obligation_is_metasized {
+                            util::lazily_elaborate_sizedness_candidate(
+                                selcx.infcx,
+                                obligation,
+                                bound,
+                            )
+                        } else {
+                            bound
+                        };
 
                         // We checked the polarity already
                         match selcx.match_normalize_trait_ref(
@@ -283,10 +292,18 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
 
         let drcx = DeepRejectCtxt::relate_rigid_rigid(self.tcx());
         let obligation_args = stack.obligation.predicate.skip_binder().trait_ref.args;
+        // Sizedness candidates are only lazily elaborated for `MetaSized`
+        // obligations, so check the obligation once instead of per bound.
+        let obligation_is_metasized = self
+            .tcx()
+            .is_lang_item(stack.obligation.predicate.def_id(), LangItem::MetaSized);
         // Keep only those bounds which may apply, and propagate overflow if it occurs.
         for bound in bounds {
-            let bound =
-                util::lazily_elaborate_sizedness_candidate(self.infcx, stack.obligation, bound);
+            let bound = if obligation_is_metasized {
+                util::lazily_elaborate_sizedness_candidate(self.infcx, stack.obligation, bound)
+            } else {
+                bound
+            };
 
             // Micro-optimization: filter out predicates relating to different traits.
             if bound.def_id() != stack.obligation.predicate.def_id() {
