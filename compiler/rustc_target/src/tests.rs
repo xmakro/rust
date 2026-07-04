@@ -40,3 +40,34 @@ fn custom_arch_propagates_from_json() {
         assert_eq!(serialized["arch"], "customarch");
     });
 }
+
+#[test]
+fn builtin_cfg_value_tables_are_complete() {
+    use std::collections::BTreeSet;
+
+    rustc_span::create_default_session_globals_then(|| {
+        let mut families = BTreeSet::new();
+        let mut vendors = BTreeSet::new();
+        let mut pointer_widths = BTreeSet::new();
+        for target in Target::builtins() {
+            families.extend(target.options.families.iter().map(|f| f.to_string()));
+            vendors.insert(target.vendor_symbol().to_string());
+            pointer_widths.insert(target.pointer_width);
+        }
+        assert_eq!(
+            pointer_widths.into_iter().collect::<Vec<_>>(),
+            vec![16, 32, 64],
+            "update the pointer widths used by CheckCfg::fill_well_known"
+        );
+        assert_eq!(
+            families.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            crate::spec::BUILTIN_TARGET_FAMILIES,
+            "update BUILTIN_TARGET_FAMILIES in spec/mod.rs (sorted)"
+        );
+        assert_eq!(
+            vendors.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            crate::spec::BUILTIN_TARGET_VENDORS,
+            "update BUILTIN_TARGET_VENDORS in spec/mod.rs (sorted)"
+        );
+    });
+}

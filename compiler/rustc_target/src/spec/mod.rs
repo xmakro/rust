@@ -1849,6 +1849,19 @@ macro_rules! cvs {
 
 pub(crate) use cvs;
 
+/// The `target_family` values used across all builtin targets, so that
+/// `--check-cfg` can seed the well known cfg values without constructing
+/// every builtin target spec. Kept complete by the
+/// `builtin_cfg_value_tables_are_complete` test.
+pub const BUILTIN_TARGET_FAMILIES: &[&str] = &["unix", "wasm", "windows"];
+
+/// The `target_vendor` values used across all builtin targets. See
+/// [`BUILTIN_TARGET_FAMILIES`].
+pub const BUILTIN_TARGET_VENDORS: &[&str] = &[
+    "amd", "apple", "espressif", "fortanix", "ibm", "kmc", "mti", "nintendo", "nvidia", "openwrt",
+    "pc", "risc0", "sony", "sun", "unikraft", "unknown", "uwp", "vex", "win7", "wrs",
+];
+
 /// Warnings encountered when parsing the target `json`.
 ///
 /// Includes fields that weren't recognized and fields that don't have the expected type.
