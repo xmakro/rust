@@ -18,6 +18,7 @@ use rustc_macros::{Decodable, Encodable};
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_session::Session;
 use rustc_span::Symbol;
+use smallvec::SmallVec;
 use tracing::instrument;
 #[cfg(debug_assertions)]
 use {super::debug::EdgeFilter, std::env};
@@ -25,7 +26,6 @@ use {super::debug::EdgeFilter, std::env};
 use super::retained::RetainedDepGraph;
 use super::serialized::{GraphEncoder, SerializedDepGraph, SerializedDepNodeIndex};
 use super::{DepKind, DepNode, WorkProductId, read_deps, with_deps};
-use crate::dep_graph::edges::EdgesVec;
 use crate::ich::StableHashState;
 use crate::ty::TyCtxt;
 use crate::verify_ich::incremental_verify_ich;
@@ -155,6 +155,10 @@ pub struct DepGraphData {
 
     /// Per-worker edge buffer amortized across `try_mark_green` calls.
     green_edge_buf: WorkerLocal<Cell<Vec<DepNodeIndex>>>,
+
+    /// Pool of read recorders, amortized across tasks. Global rather than per worker so the
+    /// retained memory is bounded by the total number of concurrently recording tasks.
+    read_recorder_pool: Lock<Vec<ReadsRecorder>>,
 }
 
 pub fn hash_result<R>(hcx: &mut StableHashState<'_>, result: &R) -> Fingerprint
@@ -183,7 +187,8 @@ impl DepGraph {
         // Instantiate a node with zero dependencies only once for anonymous queries.
         let _green_node_index = current.alloc_new_node(
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
-            EdgesVec::new(),
+            &[],
+            0,
             Fingerprint::ZERO,
         );
         assert_eq!(_green_node_index, DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE);
@@ -193,7 +198,8 @@ impl DepGraph {
         // ensure that their dependency list will never be all-green.
         let red_node_index = current.alloc_new_node(
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
-            EdgesVec::new(),
+            &[],
+            0,
             Fingerprint::ZERO,
         );
         assert_eq!(red_node_index, DepNodeIndex::FOREVER_RED_NODE);
@@ -212,6 +218,7 @@ impl DepGraph {
                 colors,
                 debug_loaded_from_disk: Default::default(),
                 green_edge_buf: WorkerLocal::default(),
+                read_recorder_pool: Lock::new(Vec::new()),
             })),
             virtual_dep_node_index: Arc::new(AtomicU32::new(0)),
         }
@@ -378,19 +385,23 @@ impl DepGraphData {
             format!("forcing query with already existing `DepNode`: {dep_node:?}")
         });
 
-        let (result, edges) = if tcx.is_eval_always(dep_node.kind) {
-            (with_deps(TaskDepsRef::EvalAlways, op), EdgesVec::new())
+        let (result, task_deps) = if tcx.is_eval_always(dep_node.kind) {
+            (with_deps(TaskDepsRef::EvalAlways, op), None)
         } else {
             let task_deps = Lock::new(TaskDeps::new(
                 #[cfg(debug_assertions)]
                 Some(dep_node),
-                0,
             ));
-            (with_deps(TaskDepsRef::Allow(&task_deps), op), task_deps.into_inner().reads)
+            (with_deps(TaskDepsRef::Allow(&task_deps), op), Some(task_deps.into_inner()))
         };
 
+        let (edges, edge_max): (&[DepNodeIndex], u32) =
+            task_deps.as_ref().map_or((&[], 0), |deps| deps.edges());
         let dep_node_index =
-            self.hash_result_and_alloc_node(tcx, dep_node, edges, &result, hash_result);
+            self.hash_result_and_alloc_node(tcx, dep_node, edges, edge_max, &result, hash_result);
+        if let Some(TaskDeps { reads: TaskReads::Recorded(recorder), .. }) = task_deps {
+            self.release_read_recorder(recorder);
+        }
 
         (result, dep_node_index)
     }
@@ -416,16 +427,13 @@ impl DepGraphData {
     {
         debug_assert!(!tcx.is_eval_always(dep_kind));
 
-        // Large numbers of reads are common enough here that pre-sizing `read_set`
-        // to 128 actually helps perf on some benchmarks.
         let task_deps = Lock::new(TaskDeps::new(
             #[cfg(debug_assertions)]
             None,
-            128,
         ));
         let result = with_deps(TaskDepsRef::Allow(&task_deps), op);
         let task_deps = task_deps.into_inner();
-        let reads = task_deps.reads;
+        let (reads, edge_max) = task_deps.edges();
 
         let dep_node_index = match reads.len() {
             0 => {
@@ -465,10 +473,14 @@ impl DepGraphData {
                 // memory impact of this `anon_node_to_index` map remains tolerable, and helps
                 // us avoid useless growth of the graph with almost-equivalent nodes.
                 self.current.anon_node_to_index.get_or_insert_with(target_dep_node, || {
-                    self.current.alloc_new_node(target_dep_node, reads, Fingerprint::ZERO)
+                    self.current.alloc_new_node(target_dep_node, reads, edge_max, Fingerprint::ZERO)
                 })
             }
         };
+
+        if let TaskReads::Recorded(recorder) = task_deps.reads {
+            self.release_read_recorder(recorder);
+        }
 
         (result, dep_node_index)
     }
@@ -478,7 +490,8 @@ impl DepGraphData {
         &self,
         tcx: TyCtxt<'tcx>,
         node: DepNode,
-        edges: EdgesVec,
+        edges: &[DepNodeIndex],
+        edge_max: u32,
         result: &R,
         hash_result: Option<fn(&mut StableHashState<'_>, &R) -> Fingerprint>,
     ) -> DepNodeIndex {
@@ -486,7 +499,7 @@ impl DepGraphData {
         let current_fingerprint = hash_result.map(|hash_result| {
             tcx.with_stable_hashing_context(|mut hcx| hash_result(&mut hcx, result))
         });
-        let dep_node_index = self.alloc_and_color_node(node, edges, current_fingerprint);
+        let dep_node_index = self.alloc_and_color_node(node, edges, edge_max, current_fingerprint);
         hashing_timer.finish_with_query_invocation_id(dep_node_index.into());
         dep_node_index
     }
@@ -516,20 +529,9 @@ impl DepGraph {
                     data.current.total_read_count.fetch_add(1, Ordering::Relaxed);
                 }
 
-                // Has `dep_node_index` been seen before? Use either a linear scan or a hashset
-                // lookup to determine this. See `TaskDeps::read_set` for details.
-                let new_read = if task_deps.reads.len() <= TaskDeps::LINEAR_SCAN_MAX {
-                    !task_deps.reads.contains(&dep_node_index)
-                } else {
-                    task_deps.read_set.insert(dep_node_index)
-                };
+                let new_read =
+                    task_deps.reads.insert(dep_node_index, || data.acquire_read_recorder());
                 if new_read {
-                    task_deps.reads.push(dep_node_index);
-                    if task_deps.reads.len() == TaskDeps::LINEAR_SCAN_MAX + 1 {
-                        // Fill `read_set` with what we have so far. Future lookups will use it.
-                        task_deps.read_set.extend(task_deps.reads.iter().copied());
-                    }
-
                     #[cfg(debug_assertions)]
                     {
                         if let Some(target) = task_deps.node
@@ -640,11 +642,19 @@ impl DepGraph {
                 }
             }
 
-            let mut edges = EdgesVec::new();
+            // `read_deps` calls the closure exactly once, with the current task's deps.
+            let mut edges = SmallVec::<[DepNodeIndex; SMALL_READS_MAX]>::new();
+            let mut edge_max = 0;
             read_deps(|task_deps| match task_deps {
-                TaskDepsRef::Allow(deps) => edges.extend(deps.lock().reads.iter().copied()),
+                TaskDepsRef::Allow(deps) => {
+                    let deps = deps.lock();
+                    let (reads, max) = deps.edges();
+                    edges = SmallVec::from_slice(reads);
+                    edge_max = max;
+                }
                 TaskDepsRef::EvalAlways => {
                     edges.push(DepNodeIndex::FOREVER_RED_NODE);
+                    edge_max = DepNodeIndex::FOREVER_RED_NODE.as_u32();
                 }
                 TaskDepsRef::Ignore => {}
                 TaskDepsRef::Forbid => {
@@ -652,7 +662,7 @@ impl DepGraph {
                 }
             });
 
-            data.hash_result_and_alloc_node(tcx, node, edges, result, hash_result)
+            data.hash_result_and_alloc_node(tcx, node, &edges, edge_max, result, hash_result)
         } else {
             // Incremental compilation is turned off. We just execute the task
             // without tracking. We still provide a dep-node index that uniquely
@@ -730,7 +740,8 @@ impl DepGraphData {
             Fingerprint::ZERO,
             // We want the side effect node to always be red so it will be forced and run the
             // side effect.
-            std::iter::once(DepNodeIndex::FOREVER_RED_NODE).collect(),
+            &[DepNodeIndex::FOREVER_RED_NODE],
+            DepNodeIndex::FOREVER_RED_NODE.as_u32(),
         );
         tcx.query_system.side_effects.borrow_mut().insert(dep_node_index, side_effect);
         dep_node_index
@@ -760,7 +771,8 @@ impl DepGraphData {
                     key_fingerprint: PackedFingerprint::from(Fingerprint::ZERO),
                 },
                 Fingerprint::ZERO,
-                std::iter::once(DepNodeIndex::FOREVER_RED_NODE).collect(),
+                &[DepNodeIndex::FOREVER_RED_NODE],
+                DepNodeIndex::FOREVER_RED_NODE.as_u32(),
                 true,
             );
 
@@ -781,7 +793,8 @@ impl DepGraphData {
     fn alloc_and_color_node(
         &self,
         key: DepNode,
-        edges: EdgesVec,
+        edges: &[DepNodeIndex],
+        edge_max: u32,
         value_fingerprint: Option<Fingerprint>,
     ) -> DepNodeIndex {
         if let Some(prev_index) = self.previous.node_to_index_opt(&key) {
@@ -812,6 +825,7 @@ impl DepGraphData {
                 key,
                 value_fingerprint,
                 edges,
+                edge_max,
                 is_green,
             );
 
@@ -820,7 +834,31 @@ impl DepGraphData {
 
             dep_node_index
         } else {
-            self.current.alloc_new_node(key, edges, value_fingerprint.unwrap_or(Fingerprint::ZERO))
+            self.current.alloc_new_node(
+                key,
+                edges,
+                edge_max,
+                value_fingerprint.unwrap_or(Fingerprint::ZERO),
+            )
+        }
+    }
+
+    /// Takes a reads recorder from the pool, ready for a new task.
+    #[inline]
+    fn acquire_read_recorder(&self) -> ReadsRecorder {
+        let mut recorder = self.read_recorder_pool.lock().pop().unwrap_or_default();
+        recorder.advance();
+        recorder
+    }
+
+    /// Returns a finished task's recorder to the pool. The cap keeps deeply nested tasks
+    /// from growing the pool without bound.
+    #[inline]
+    fn release_read_recorder(&self, recorder: ReadsRecorder) {
+        const MAX_POOLED_RECORDERS: usize = 4;
+        let mut pool = self.read_recorder_pool.lock();
+        if pool.len() < MAX_POOLED_RECORDERS {
+            pool.push(recorder);
         }
     }
 
@@ -1256,10 +1294,11 @@ impl CurrentDepGraph {
     fn alloc_new_node(
         &self,
         key: DepNode,
-        edges: EdgesVec,
+        edges: &[DepNodeIndex],
+        edge_max: u32,
         value_fingerprint: Fingerprint,
     ) -> DepNodeIndex {
-        let dep_node_index = self.encoder.send_new(key, value_fingerprint, edges);
+        let dep_node_index = self.encoder.send_new(key, value_fingerprint, edges, edge_max);
 
         #[cfg(debug_assertions)]
         self.record_edge(dep_node_index, key, value_fingerprint);
@@ -1294,28 +1333,157 @@ pub struct TaskDeps {
     #[cfg(debug_assertions)]
     node: Option<DepNode>,
 
-    /// A vector of `DepNodeIndex`, basically. Contains no duplicates.
-    reads: EdgesVec,
-
-    /// When adding a new edge to `reads` in `DepGraph::read_index` we must determine if the edge
-    /// has been seen before. We just do a linear scan of `reads` if its length is less than or
-    /// equal to `LINEAR_SCAN_MAX`. Otherwise, we use this hashset for better performance. Note:
-    /// `reads` is always the canonical edges representation; this field is just to speed up the
-    /// seen-before test.
-    read_set: FxHashSet<DepNodeIndex>,
+    reads: TaskReads,
 }
 
 impl TaskDeps {
-    /// See `TaskDeps::read_set` above.
-    const LINEAR_SCAN_MAX: usize = 16;
-
     #[inline]
-    fn new(#[cfg(debug_assertions)] node: Option<DepNode>, read_set_capacity: usize) -> Self {
+    fn new(#[cfg(debug_assertions)] node: Option<DepNode>) -> Self {
         TaskDeps {
             #[cfg(debug_assertions)]
             node,
-            reads: EdgesVec::new(),
-            read_set: FxHashSet::with_capacity_and_hasher(read_set_capacity, Default::default()),
+            reads: TaskReads::Small { len: 0, buf: [DepNodeIndex::ZERO; SMALL_READS_MAX] },
+        }
+    }
+
+    /// The task's deduplicated reads in first-read order, and the largest index among them.
+    #[inline]
+    fn edges(&self) -> (&[DepNodeIndex], u32) {
+        self.reads.edges()
+    }
+}
+
+/// How many reads fit in [`TaskReads::Small`]'s inline buffer.
+const SMALL_READS_MAX: usize = 16;
+
+/// The reads recorded by one task so far, deduplicated and in first-read order.
+#[derive(Debug)]
+enum TaskReads {
+    /// The first few reads, deduplicated by a linear scan. Most tasks never outgrow this.
+    Small { len: u8, buf: [DepNodeIndex; SMALL_READS_MAX] },
+
+    /// The reads of a task that outgrew the inline buffer.
+    Recorded(ReadsRecorder),
+}
+
+impl TaskReads {
+    /// Records a read and returns whether it was new for the task. `acquire` is called to get
+    /// a pooled recorder when the task outgrows the inline buffer.
+    #[inline]
+    fn insert(&mut self, index: DepNodeIndex, acquire: impl FnOnce() -> ReadsRecorder) -> bool {
+        match self {
+            TaskReads::Recorded(recorder) => recorder.insert(index),
+            TaskReads::Small { len, buf } => {
+                let n = usize::from(*len);
+                if buf[..n].contains(&index) {
+                    false
+                } else if n < SMALL_READS_MAX {
+                    buf[n] = index;
+                    *len += 1;
+                    true
+                } else {
+                    // The inline buffer is full: move the reads into a pooled recorder.
+                    let seed = *buf;
+                    let mut recorder = acquire();
+                    recorder.seed(&seed);
+                    recorder.insert(index);
+                    *self = TaskReads::Recorded(recorder);
+                    true
+                }
+            }
+        }
+    }
+
+    /// The deduplicated reads in first-read order, and the largest index among them.
+    #[inline]
+    fn edges(&self) -> (&[DepNodeIndex], u32) {
+        match self {
+            TaskReads::Small { len, buf } => {
+                let reads = &buf[..usize::from(*len)];
+                (reads, reads.iter().map(|e| e.as_u32()).max().unwrap_or(0))
+            }
+            TaskReads::Recorded(recorder) => (recorder.edges(), recorder.max_index()),
+        }
+    }
+}
+
+/// Records the reads of a task with many reads.
+///
+/// An index counts as seen if its slot holds the current epoch. When we reuse this buffer,
+/// we just bump the epoch, invalidating all slots at once. Recorders are pooled globally.
+#[derive(Debug, Default)]
+struct ReadsRecorder {
+    /// The deduplicated reads, in first-read order.
+    reads: Vec<DepNodeIndex>,
+    /// The largest index in `reads`, used to pick the edge encoding width.
+    max: u32,
+    epochs: IndexVec<DepNodeIndex, u32>,
+    epoch: u32,
+}
+
+impl ReadsRecorder {
+    /// Seeds a fresh recorder with reads that are already known to be distinct.
+    fn seed(&mut self, reads: &[DepNodeIndex]) {
+        debug_assert!(self.reads.is_empty());
+        for &index in reads {
+            *self.slot(index) = self.epoch;
+            self.max = self.max.max(index.as_u32());
+        }
+        self.reads.extend_from_slice(reads);
+    }
+
+    /// Records a read of `index` and returns whether it was new for the current task.
+    #[inline]
+    fn insert(&mut self, index: DepNodeIndex) -> bool {
+        let epoch = self.epoch;
+        let slot = self.slot(index);
+        if *slot == epoch {
+            false
+        } else {
+            *slot = epoch;
+            self.max = self.max.max(index.as_u32());
+            self.reads.push(index);
+            true
+        }
+    }
+
+    /// The epoch slot of `index`, growing the filter on demand.
+    #[inline]
+    fn slot(&mut self, index: DepNodeIndex) -> &mut u32 {
+        let index = index.as_usize();
+        if index >= self.epochs.len() {
+            self.grow(index);
+        }
+        &mut self.epochs.raw[index]
+    }
+
+    /// Grows the filter to cover `index`, with slack so that rising indices do not grow it
+    /// again immediately.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, index: usize) {
+        self.epochs.raw.resize((index + 1).next_power_of_two().max(64), 0);
+    }
+
+    #[inline]
+    fn edges(&self) -> &[DepNodeIndex] {
+        &self.reads
+    }
+
+    #[inline]
+    fn max_index(&self) -> u32 {
+        self.max
+    }
+
+    /// Prepares the recorder for a new task, keeping the backing allocations.
+    fn advance(&mut self) {
+        self.reads.clear();
+        self.max = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // The epoch wrapped around: clear all slots so no stale slot can appear current.
+            self.epochs.raw.fill(0);
+            self.epoch = 1;
         }
     }
 }

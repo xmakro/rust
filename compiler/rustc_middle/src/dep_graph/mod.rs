@@ -20,7 +20,6 @@ use crate::ty::{self, TyCtxt};
 mod debug;
 pub(crate) mod dep_node;
 mod dep_node_key;
-mod edges;
 mod graph;
 mod retained;
 mod serialized;
