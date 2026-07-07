@@ -61,25 +61,24 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                     // even if there was no previous session.
                     let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
 
-                    // For every green dep node that has a disk-cached value from the
-                    // previous session, make sure the value is loaded into the memory
-                    // cache, so that it will be serialized as part of this session.
-                    //
-                    // This reads data from the previous session, so it needs to happen
-                    // before dropping the mmap.
-                    //
-                    // FIXME(Zalathar): This step is intended to be cheap, but still does
-                    // quite a lot of work, especially in builds with few or no changes.
-                    // Can we be smarter about how we identify values that need promotion?
-                    // Can we promote values without decoding them into the memory cache?
-                    tcx.dep_graph.exec_cache_promotions(tcx);
-
-                    // Drop the memory map so that we can remove the file and write to it.
-                    on_disk_cache.close_serialized_data_mmap();
+                    // The values of green nodes are carried forward from the previous
+                    // cache file byte for byte, so its contents must stay readable
+                    // while the new file is written. On unix, removing the old file
+                    // does not invalidate the mapping, so it is kept alive until
+                    // serialization is done. On Windows the file cannot be removed
+                    // while mapped, so the mapping is dropped and the values of green
+                    // nodes are lost to the next session, like they already were for
+                    // nodes that were never loaded during this one.
+                    let carried_data = if cfg!(windows) {
+                        on_disk_cache.close_serialized_data_mmap();
+                        None
+                    } else {
+                        on_disk_cache.take_serialized_data_mmap()
+                    };
 
                     file_format::save_in(sess, query_cache_path, "query cache", |encoder| {
                         tcx.sess.time("incr_comp_serialize_result_cache", || {
-                            on_disk_cache::OnDiskCache::serialize(tcx, encoder)
+                            on_disk_cache::OnDiskCache::serialize(tcx, encoder, carried_data)
                         })
                     });
                 });

@@ -4,7 +4,6 @@ use rustc_middle::dep_graph::{DepKindVTable, DepNodeKey, KeyFingerprintStyle};
 use rustc_middle::query::QueryCache;
 
 use crate::GetQueryVTable;
-use crate::plumbing::promote_from_disk_inner;
 
 /// [`DepKindVTable`] constructors for special dep kinds that aren't queries.
 #[expect(non_snake_case, reason = "use non-snake case to avoid collision with query names")]
@@ -19,7 +18,6 @@ mod non_query {
             force_from_dep_node_fn: Some(|_, dep_node, _| {
                 bug!("force_from_dep_node: encountered {dep_node:?}")
             }),
-            promote_from_disk_fn: None,
         }
     }
 
@@ -31,7 +29,6 @@ mod non_query {
             force_from_dep_node_fn: Some(|_, dep_node, _| {
                 bug!("force_from_dep_node: encountered {dep_node:?}")
             }),
-            promote_from_disk_fn: None,
         }
     }
 
@@ -43,7 +40,6 @@ mod non_query {
                 tcx.dep_graph.force_side_effect(tcx, prev_index);
                 true
             }),
-            promote_from_disk_fn: None,
         }
     }
 
@@ -52,7 +48,6 @@ mod non_query {
             is_eval_always: false,
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: Some(|_, _, _| bug!("cannot force an anon node")),
-            promote_from_disk_fn: None,
         }
     }
 
@@ -61,7 +56,6 @@ mod non_query {
             is_eval_always: false,
             key_fingerprint_style: KeyFingerprintStyle::Unit,
             force_from_dep_node_fn: None,
-            promote_from_disk_fn: None,
         }
     }
 
@@ -70,7 +64,6 @@ mod non_query {
             is_eval_always: false,
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: None,
-            promote_from_disk_fn: None,
         }
     }
 
@@ -79,7 +72,6 @@ mod non_query {
             is_eval_always: false,
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: None,
-            promote_from_disk_fn: None,
         }
     }
 
@@ -88,7 +80,6 @@ mod non_query {
             is_eval_always: false,
             key_fingerprint_style: KeyFingerprintStyle::Unit,
             force_from_dep_node_fn: None,
-            promote_from_disk_fn: None,
         }
     }
 }
@@ -96,7 +87,7 @@ mod non_query {
 /// Shared implementation of the [`DepKindVTable`] constructor for queries.
 /// Called from macro-generated code for each query.
 pub(crate) fn make_dep_kind_vtable_for_query<'tcx, Q>(
-    is_cache_on_disk: bool,
+    _is_cache_on_disk: bool,
     is_eval_always: bool,
     is_no_force: bool,
 ) -> DepKindVTable<'tcx>
@@ -115,12 +106,6 @@ where
             |tcx, dep_node, _prev_index| {
                 let query = Q::query_vtable(tcx);
                 crate::execution::force_query_dep_node(tcx, query, dep_node)
-            },
-        ),
-        promote_from_disk_fn: (can_recover && is_cache_on_disk).then_some(
-            |tcx, dep_node, prev_index, dep_node_index| {
-                let query = Q::query_vtable(tcx);
-                promote_from_disk_inner(tcx, query, dep_node, prev_index, dep_node_index)
             },
         ),
     }

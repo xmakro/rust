@@ -1,23 +1,21 @@
 use std::num::NonZero;
 
-use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::limit::Limit;
 use rustc_middle::bug;
 #[expect(unused_imports, reason = "used by doc comments")]
 use rustc_middle::dep_graph::DepKindVTable;
-use rustc_middle::dep_graph::{DepNode, DepNodeIndex, DepNodeKey, SerializedDepNodeIndex};
+use rustc_middle::dep_graph::{DepNode, SerializedDepNodeIndex};
 use rustc_middle::query::erase::{Erasable, Erased};
 use rustc_middle::query::on_disk_cache::{CacheDecoder, CacheEncoder};
 use rustc_middle::query::{QueryCache, QueryJobId, QueryVTable, erase};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::tls::{self, ImplicitCtxt};
-use rustc_middle::verify_ich::incremental_verify_ich;
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::def_id::LOCAL_CRATE;
 
 use crate::error::{QueryOverflow, QueryOverflowNote};
-use crate::execution::{all_inactive, should_verify_loaded_value};
+use crate::execution::all_inactive;
 use crate::job::find_dep_kind_root;
 use crate::query_impl::for_each_query_vtable;
 use crate::{CollectActiveJobsKind, collect_active_query_jobs};
@@ -95,7 +93,12 @@ fn encode_query_values_inner<'a, 'tcx, C, V>(
     assert!(all_inactive(&query.state));
     query.cache.for_each(&mut |key, value, dep_node| {
         if query.will_cache_on_disk_for_key(*key) {
-            encoder.encode_query_value::<V>(dep_node, &erase::restore_val::<V>(*value));
+            let key_fingerprint = DepNode::construct(tcx, query.dep_kind, key).key_fingerprint;
+            encoder.encode_query_value::<V>(
+                dep_node,
+                key_fingerprint,
+                &erase::restore_val::<V>(*value),
+            );
         }
     });
 }
@@ -134,64 +137,6 @@ fn verify_query_key_hashes_inner<'tcx, C: QueryCache>(
             );
         }
     });
-}
-
-/// Inner implementation of [`DepKindVTable::promote_from_disk_fn`] for queries.
-pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
-    tcx: TyCtxt<'tcx>,
-    query: &'tcx QueryVTable<'tcx, C>,
-    dep_node: DepNode,
-    prev_index: SerializedDepNodeIndex,
-    dep_node_index: DepNodeIndex,
-) {
-    debug_assert!(tcx.dep_graph.is_green(&dep_node));
-
-    let key = C::Key::try_recover_key(tcx, &dep_node).unwrap_or_else(|| {
-        panic!(
-            "Failed to recover key for {dep_node:?} with key fingerprint {}",
-            dep_node.key_fingerprint
-        )
-    });
-
-    // If the recovered key isn't eligible for cache-on-disk, then there's no
-    // value on disk to promote.
-    if !query.will_cache_on_disk_for_key(key) {
-        return;
-    }
-
-    // If the value is already in memory, then promotion isn't needed.
-    if query.cache.lookup(&key).is_some() {
-        return;
-    }
-
-    // Load the disk-cached value into memory.
-    let dep_graph_data =
-        tcx.dep_graph.data().expect("should always be present in incremental mode");
-
-    let prof_timer = tcx.prof.incr_cache_loading();
-    let value = ensure_sufficient_stack(|| (query.try_load_from_disk_fn)(tcx, prev_index));
-    prof_timer.finish_with_query_invocation_id(dep_node_index.into());
-
-    let Some(value) = value else {
-        // The key is cache-on-disk and its node is green, so a value must be on disk.
-        bug!("failed to load disk-cached value for green node {dep_node:?}");
-    };
-
-    // Verify the fingerprints of the same subset of loaded values as
-    // `load_from_disk_or_invoke_provider_green` does.
-    let prev_fingerprint = dep_graph_data.prev_value_fingerprint_of(prev_index);
-    if should_verify_loaded_value(tcx, prev_fingerprint) {
-        incremental_verify_ich(
-            tcx,
-            dep_graph_data,
-            &value,
-            prev_index,
-            query.hash_value_fn,
-            query.format_value,
-        );
-    }
-
-    query.cache.complete(key, value, dep_node_index);
 }
 
 pub(crate) fn try_load_from_disk<'tcx, V>(

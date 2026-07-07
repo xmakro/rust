@@ -700,6 +700,13 @@ impl DepGraphData {
     }
 
     #[inline]
+    /// The key fingerprint of a node of the previous session. Used as a
+    /// session-stable tag when loading cached query values, since the node's
+    /// index changes from session to session while its key does not.
+    pub fn prev_key_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> PackedFingerprint {
+        self.previous.index_to_node(prev_index).key_fingerprint
+    }
+
     pub fn prev_value_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> Fingerprint {
         self.previous.value_fingerprint_for_index(prev_index)
     }
@@ -1057,25 +1064,18 @@ impl DepGraph {
     ///
     /// This method will only load queries that will end up in the disk cache.
     /// Other queries will not be executed.
-    pub fn exec_cache_promotions<'tcx>(&self, tcx: TyCtxt<'tcx>) {
-        let _prof_timer = tcx.prof.generic_activity("incr_comp_query_cache_promotion");
-
+    /// Invokes `f` for every node of the previous session that was marked
+    /// green during this session, together with its current-session index.
+    /// Used when saving the query cache, to reference the still-valid values
+    /// of green nodes at their positions in the previous cache file.
+    pub fn for_each_green_prev_index(
+        &self,
+        f: &mut dyn FnMut(SerializedDepNodeIndex, DepNodeIndex),
+    ) {
         let data = self.data.as_ref().unwrap();
         for prev_index in data.colors.values.indices() {
-            match data.colors.get(prev_index) {
-                DepNodeColor::Green(dep_node_index) => {
-                    let dep_node = data.previous.index_to_node(prev_index);
-                    if let Some(promote_fn) =
-                        tcx.dep_kind_vtable(dep_node.kind).promote_from_disk_fn
-                    {
-                        promote_fn(tcx, *dep_node, prev_index, dep_node_index)
-                    };
-                }
-                DepNodeColor::Unknown | DepNodeColor::Red => {
-                    // We can skip red nodes because a node can only be marked
-                    // as red if the query result was recomputed and thus is
-                    // already in memory.
-                }
+            if let DepNodeColor::Green(dep_node_index) = data.colors.get(prev_index) {
+                f(prev_index, dep_node_index);
             }
         }
     }
