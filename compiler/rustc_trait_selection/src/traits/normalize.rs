@@ -129,6 +129,29 @@ where
     result
 }
 
+/// Like [`normalize_with_depth_to`], for values the caller has already brought
+/// to their inference resolution fixpoint: the initial full resolving fold is
+/// skipped, since it could not change the value.
+pub(crate) fn normalize_with_depth_to_preresolved<'a, 'b, 'tcx, T>(
+    selcx: &'a mut SelectionContext<'b, 'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    cause: ObligationCause<'tcx>,
+    depth: usize,
+    value: T,
+    obligations: &mut PredicateObligations<'tcx>,
+) -> T
+where
+    T: TypeFoldable<TyCtxt<'tcx>>,
+{
+    debug!(obligations.len = obligations.len());
+    let mut normalizer = AssocTypeNormalizer::new(selcx, param_env, cause, depth, obligations);
+    let result =
+        ensure_sufficient_stack(|| AssocTypeNormalizer::fold_preresolved(&mut normalizer, value));
+    debug!(?result, obligations.len = normalizer.obligations.len());
+    debug!(?normalizer.obligations,);
+    result
+}
+
 pub(super) fn needs_normalization<'tcx, T: TypeVisitable<TyCtxt<'tcx>>>(
     infcx: &InferCtxt<'tcx>,
     value: &T,
@@ -172,6 +195,12 @@ impl<'a, 'b, 'tcx> AssocTypeNormalizer<'a, 'b, 'tcx> {
 
     fn fold<T: TypeFoldable<TyCtxt<'tcx>>>(&mut self, value: T) -> T {
         let value = self.selcx.infcx.resolve_vars_if_possible(value);
+        self.fold_preresolved(value)
+    }
+
+    /// [`Self::fold`] for values already at their inference resolution
+    /// fixpoint, where the resolving fold would be the identity.
+    fn fold_preresolved<T: TypeFoldable<TyCtxt<'tcx>>>(&mut self, value: T) -> T {
         debug!(?value);
 
         assert!(
