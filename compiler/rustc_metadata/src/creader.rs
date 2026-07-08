@@ -656,7 +656,6 @@ impl CStore {
         };
 
         let crate_metadata = CrateMetadata::new(
-            tcx,
             metadata,
             crate_root,
             raw_proc_macros,
