@@ -29,7 +29,7 @@ use super::{
 };
 use crate::error_reporting::InferCtxtErrorExt;
 use crate::infer::{InferCtxt, TyOrConstInferVar};
-use crate::traits::normalize::normalize_with_depth_to;
+use crate::traits::normalize::normalize_with_depth_to_preresolved;
 use crate::traits::project::{PolyProjectionObligation, ProjectionCacheKeyExt as _};
 use crate::traits::query::evaluate_obligation::InferCtxtExt;
 use crate::traits::{EvaluateConstErr, sizedness_fast_path};
@@ -401,7 +401,9 @@ impl<'a, 'tcx> ObligationProcessor for FulfillProcessor<'a, 'tcx> {
 
         if obligation.predicate.has_aliases() {
             let mut obligations = PredicateObligations::new();
-            let predicate = normalize_with_depth_to(
+            // The predicate was already brought to its resolution fixpoint
+            // above, so normalization does not need to resolve it again.
+            let predicate = normalize_with_depth_to_preresolved(
                 &mut self.selcx,
                 obligation.param_env,
                 obligation.cause.clone(),
