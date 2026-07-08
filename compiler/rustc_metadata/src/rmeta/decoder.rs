@@ -95,15 +95,14 @@ pub(crate) struct CrateMetadata {
     // --- Some data pre-decoded from the metadata blob, usually for performance ---
     /// Data about the top-level items in a crate, as well as various crate-level metadata.
     root: CrateRoot,
-    /// Trait impl data.
-    /// FIXME: Used only from queries and can use query cache,
-    /// so pre-decoding can probably be avoided.
-    trait_impls: FxIndexMap<(u32, DefIndex), LazyArray<(DefIndex, Option<SimplifiedType>)>>,
+    /// Trait impl data, built lazily on first use: many loaded crates are
+    /// never asked for their impls at all.
+    trait_impls: OnceLock<FxIndexMap<(u32, DefIndex), LazyArray<(DefIndex, Option<SimplifiedType>)>>>,
     /// Inherent impls which do not follow the normal coherence rules.
     ///
     /// These can be introduced using either `#![rustc_coherence_is_core]`
     /// or `#[rustc_allow_incoherent_impl]`.
-    incoherent_impls: FxIndexMap<SimplifiedType, LazyArray<DefIndex>>,
+    incoherent_impls: OnceLock<FxIndexMap<SimplifiedType, LazyArray<DefIndex>>>,
     /// Proc macro function pointers for this crate, if it's a proc macro crate.
     raw_proc_macros: Option<&'static [ProcMacroClient]>,
     /// Source maps for code from the crate.
@@ -1433,14 +1432,37 @@ impl CrateMetadata {
     }
 
     /// Decodes all trait impls in the crate (for rustdoc).
+    /// The map from trait ids to their impls in this crate, built on first use.
+    fn trait_impls(
+        &self,
+    ) -> &FxIndexMap<(u32, DefIndex), LazyArray<(DefIndex, Option<SimplifiedType>)>> {
+        self.trait_impls.get_or_init(|| {
+            self.root
+                .impls
+                .decode(&self.blob)
+                .map(|trait_impls| (trait_impls.trait_id, trait_impls.impls))
+                .collect()
+        })
+    }
+
+    /// Decodes all trait impls in the crate (for rustdoc).
     fn get_trait_impls(&self, tcx: TyCtxt<'_>) -> impl Iterator<Item = DefId> {
-        self.trait_impls.values().flat_map(move |impls| {
+        self.trait_impls().values().flat_map(move |impls| {
             impls.decode((self, tcx)).map(move |(impl_index, _)| self.local_def_id(impl_index))
         })
     }
 
     fn get_incoherent_impls<'tcx>(&self, tcx: TyCtxt<'tcx>, simp: SimplifiedType) -> &'tcx [DefId] {
-        if let Some(impls) = self.incoherent_impls.get(&simp) {
+        let incoherent_impls = self.incoherent_impls.get_or_init(|| {
+            self.root
+                .incoherent_impls
+                .decode((self, tcx))
+                .map(|incoherent_impls| {
+                    (incoherent_impls.self_ty.decode((self, tcx)), incoherent_impls.impls)
+                })
+                .collect()
+        });
+        if let Some(impls) = incoherent_impls.get(&simp) {
             tcx.arena.alloc_from_iter(impls.decode((self, tcx)).map(|idx| self.local_def_id(idx)))
         } else {
             &[]
@@ -1452,7 +1474,8 @@ impl CrateMetadata {
         tcx: TyCtxt<'tcx>,
         trait_def_id: DefId,
     ) -> &'tcx [(DefId, Option<SimplifiedType>)] {
-        if self.trait_impls.is_empty() {
+        let trait_impls = self.trait_impls();
+        if trait_impls.is_empty() {
             return &[];
         }
 
@@ -1463,7 +1486,7 @@ impl CrateMetadata {
             None => return &[],
         };
 
-        if let Some(impls) = self.trait_impls.get(&key) {
+        if let Some(impls) = trait_impls.get(&key) {
             tcx.arena.alloc_from_iter(
                 impls
                     .decode((self, tcx))
@@ -1886,7 +1909,6 @@ impl CrateMetadata {
 
 impl CrateMetadata {
     pub(crate) fn new(
-        tcx: TyCtxt<'_>,
         blob: MetadataBlob,
         root: CrateRoot,
         raw_proc_macros: Option<&'static [ProcMacroClient]>,
@@ -1897,11 +1919,6 @@ impl CrateMetadata {
         private_dep: bool,
         host_hash: Option<Svh>,
     ) -> CrateMetadata {
-        let trait_impls = root
-            .impls
-            .decode(&blob)
-            .map(|trait_impls| (trait_impls.trait_id, trait_impls.impls))
-            .collect();
         let alloc_decoding_state =
             AllocDecodingState::new(root.interpret_alloc_index.decode(&blob).collect());
 
@@ -1909,10 +1926,10 @@ impl CrateMetadata {
         // that does not copy any data. It just does some data verification.
         let def_path_hash_map = root.def_path_hash_map.decode(&blob);
 
-        let mut cdata = CrateMetadata {
+        let cdata = CrateMetadata {
             blob,
             root,
-            trait_impls,
+            trait_impls: Default::default(),
             incoherent_impls: Default::default(),
             raw_proc_macros,
             source_map_import_info: Lock::new(Vec::new()),
@@ -1930,15 +1947,6 @@ impl CrateMetadata {
             hygiene_context: Default::default(),
             def_key_cache: Default::default(),
         };
-
-        cdata.incoherent_impls = cdata
-            .root
-            .incoherent_impls
-            .decode((&cdata, tcx))
-            .map(|incoherent_impls| {
-                (incoherent_impls.self_ty.decode((&cdata, tcx)), incoherent_impls.impls)
-            })
-            .collect();
 
         cdata
     }
