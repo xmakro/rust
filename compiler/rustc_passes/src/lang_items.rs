@@ -40,6 +40,10 @@ struct LanguageItemCollector<'ast, 'tcx> {
     // so we can avoid constructing this map for local def-ids.
     item_spans: FxHashMap<DefId, Span>,
     parent_item: Option<&'ast ast::Item>,
+    /// Weak lang items declared by foreign items, in visit order. Whether
+    /// they end up missing is decided only once collection has finished,
+    /// which used to require a second full crate walk.
+    weak_foreign_candidates: Vec<LangItem>,
 }
 
 impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
@@ -51,6 +55,7 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
             tcx,
             resolver,
             items: LanguageItems::new(),
+            weak_foreign_candidates: Vec::new(),
             item_spans: FxHashMap::default(),
             parent_item: None,
         }
@@ -269,7 +274,8 @@ fn get_lang_items(tcx: TyCtxt<'_>, (): ()) -> LanguageItems {
     visit::Visitor::visit_crate(&mut collector, krate);
 
     // Find all required but not-yet-defined lang items.
-    weak_lang_items::check_crate(tcx, &mut collector.items, krate);
+    let weak_foreign_candidates = std::mem::take(&mut collector.weak_foreign_candidates);
+    weak_lang_items::check_crate(tcx, &mut collector.items, &weak_foreign_candidates);
 
     // Return all the lang items that were found.
     collector.items
@@ -314,6 +320,12 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
     }
 
     fn visit_foreign_item(&mut self, i: &'ast ast::ForeignItem) {
+        if let Some((lang_item, _)) = extract_ast(&i.attrs)
+            && let Some(item) = LangItem::from_name(lang_item)
+            && item.is_weak()
+        {
+            self.weak_foreign_candidates.push(item);
+        }
         self.check_for_lang(
             Target::Fn,
             self.resolver.owners[&i.id].def_id,
