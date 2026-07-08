@@ -95,10 +95,11 @@
 use std::cmp;
 use std::collections::hash_map::Entry;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHasher, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::LangItem;
@@ -118,7 +119,7 @@ use rustc_middle::ty::print::{characteristic_def_id_of_type, with_no_trimmed_pat
 use rustc_middle::ty::{self, InstanceKind, ShimKind, TyCtxt};
 use rustc_middle::util::Providers;
 use rustc_session::CodegenUnits;
-use rustc_session::config::{DumpMonoStatsFormat, SwitchWithOptPath};
+use rustc_session::config::{DumpMonoStatsFormat, OptLevel, SwitchWithOptPath};
 use rustc_span::Symbol;
 use rustc_target::spec::SymbolVisibility;
 use tracing::debug;
@@ -162,6 +163,14 @@ where
 
         placed
     };
+
+    // In incremental mode, split very large CGUs so that a small change
+    // does not force re-optimizing an entire large module.
+    {
+        let _prof_timer = tcx.prof.generic_activity("cgu_partitioning_split_large_cgus");
+        split_large_cgus(cx, &mut codegen_units);
+        debug_dump(tcx, "SPLIT", &codegen_units);
+    }
 
     // Merge until we don't exceed the max CGU count.
     // `merge_codegen_units` is responsible for updating the CGU size
@@ -295,21 +304,200 @@ where
         cgu.compute_size_estimate();
     }
 
-    return PlacedMonoItems { codegen_units, internalization_candidates };
+    PlacedMonoItems { codegen_units, internalization_candidates }
+}
 
-    fn get_reachable_inlined_items<'tcx>(
-        tcx: TyCtxt<'tcx>,
-        item: MonoItem<'tcx>,
-        usage_map: &UsageMap<'tcx>,
-        visited: &mut FxIndexSet<MonoItem<'tcx>>,
-    ) {
-        usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
-            let is_new = visited.insert(inlined_item);
-            if is_new {
-                get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
-            }
-        });
+fn get_reachable_inlined_items<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: MonoItem<'tcx>,
+    usage_map: &UsageMap<'tcx>,
+    visited: &mut FxIndexSet<MonoItem<'tcx>>,
+) {
+    usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
+        let is_new = visited.insert(inlined_item);
+        if is_new {
+            get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
+        }
+    });
+}
+
+/// In incremental mode, the CGU of a source-level module is the unit of reuse: changing one
+/// item makes the whole CGU red and re-runs LLVM over every other item in it. For large
+/// modules that drags a lot of unchanged code through codegen on every rebuild, and profiles
+/// of one-line-patch rebuilds in optimized incremental mode are dominated by exactly this.
+///
+/// Split CGUs above a size threshold into several pieces. Root items are assigned to pieces
+/// by a hash of their symbol name, which is stable from session to session, so items do not
+/// move between pieces when unrelated parts of the module change. The piece count is derived
+/// from the CGU size estimate but rounded to a power of two, so it only changes when the
+/// module's size estimate roughly doubles or halves, and a piece rename (which invalidates
+/// the piece) stays rare. Each piece receives private copies of the inlined items reachable
+/// from its roots, exactly like placement does for whole modules.
+fn split_large_cgus<'tcx>(
+    cx: &PartitioningCx<'_, 'tcx>,
+    codegen_units: &mut Vec<CodegenUnit<'tcx>>,
+) {
+    if cx.tcx.sess.opts.incremental.is_none() {
+        return;
     }
+
+    // In unoptimized builds re-codegenning a whole module is cheap, so splitting has
+    // nothing to save and only adds per-unit overhead. All the repeated work that
+    // splitting avoids lives in optimized incremental builds.
+    if cx.tcx.sess.opts.optimize == OptLevel::No {
+        return;
+    }
+
+    /// CGUs at least twice this size get split into pieces aiming for this size. With the
+    /// factor of two of slack, a split produces at least two meaningful pieces and CGUs
+    /// hovering around the threshold do not flip between split and unsplit.
+    ///
+    /// The value is deliberately small: module CGUs of real crates mostly estimate in the
+    /// hundreds to low thousands, and the point of splitting is that re-optimizing a piece
+    /// after an edit costs a fraction of re-optimizing the module.
+    const PIECE_TARGET_SIZE: usize = 2_000;
+    /// Upper bound on pieces per CGU, to keep the number of object files sane for
+    /// pathologically large modules.
+    const MAX_PIECES: usize = 32;
+
+    // Splitting must never push the unit count over the limit that the merging below
+    // enforces: the merge pairs units by size and inlined-item overlap, both of which
+    // shift under small source changes, so merged units get unstable contents and names
+    // across sessions and lose all reuse. Split the largest units first within this
+    // budget; crates whose module count already exceeds the limit are left unchanged.
+    let max_codegen_units = cx.tcx.sess.codegen_units().as_usize();
+    let mut budget = max_codegen_units.saturating_sub(codegen_units.len());
+
+    // Split the biggest units first: they profit most from finer reuse. The order is
+    // recomputed from sizes each session, but only decides which units get split when
+    // the budget runs out, and the budget only binds close to the unit limit.
+    let mut order: Vec<usize> = (0..codegen_units.len()).collect();
+    order.sort_by_key(|&i| (cmp::Reverse(codegen_units[i].size_estimate()), i));
+    let mut split_pieces: Vec<Option<usize>> = vec![None; codegen_units.len()];
+    for i in order {
+        if budget == 0 {
+            break;
+        }
+        let size = codegen_units[i].size_estimate();
+        if size < 2 * PIECE_TARGET_SIZE {
+            // `order` is sorted by size, so nothing further will want splitting.
+            break;
+        }
+        let pieces = [
+            (size / PIECE_TARGET_SIZE).next_power_of_two(),
+            MAX_PIECES,
+            budget + 1,
+        ]
+        .into_iter()
+        .min()
+        .unwrap();
+        if pieces >= 2 {
+            split_pieces[i] = Some(pieces);
+            budget -= pieces - 1;
+        }
+    }
+
+    let mut result = Vec::with_capacity(codegen_units.len());
+    for (index, cgu) in codegen_units.drain(..).enumerate() {
+        let Some(pieces) = split_pieces[index] else {
+            result.push(cgu);
+            continue;
+        };
+        let mut sub_cgus: Vec<CodegenUnit<'tcx>> = (0..pieces)
+            .map(|i| {
+                CodegenUnit::new(Symbol::intern(&format!("{}-part{:02}", cgu.name(), i)))
+            })
+            .collect();
+
+        // With (thin) local LTO, calls between the module's own root items become
+        // cross-unit imports if the callers and callees land in different pieces, and
+        // pieces with imports lose their post-LTO reuse whenever the imported unit
+        // changes. So pieces must follow the call graph: cluster the roots by the
+        // usage edges between them and assign whole clusters to pieces. A module of
+        // independent functions splits freely, while a tightly connected module
+        // keeps its coupled items together, since re-optimizing those together is
+        // exactly what correctness of reuse requires anyway.
+        let roots: Vec<MonoItem<'tcx>> = cgu
+            .items()
+            .iter()
+            .filter(|(_, data)| !data.inlined)
+            .map(|(&item, _)| item)
+            .collect();
+        let root_index: FxIndexMap<MonoItem<'tcx>, usize> =
+            roots.iter().enumerate().map(|(i, &item)| (item, i)).collect();
+
+        // Plain union-find over root-to-root usage edges within this CGU.
+        let mut parent: Vec<usize> = (0..roots.len()).collect();
+        fn find(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        for (i, &root) in roots.iter().enumerate() {
+            for used in cx.usage_map.used_map.get(&root).map_or(&[][..], |v| v.as_slice()) {
+                if let Some(&j) = root_index.get(used) {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+
+        // The piece of a cluster only depends on the symbol name of one of its items,
+        // which is stable across compilation sessions. Using the lexicographically
+        // smallest name makes the choice independent of traversal order.
+        let mut cluster_piece: FxIndexMap<usize, usize> = FxIndexMap::default();
+        for (i, &root) in roots.iter().enumerate() {
+            let r = find(&mut parent, i);
+            if cluster_piece.contains_key(&r) {
+                continue;
+            }
+            let mut min_name: Option<&str> = None;
+            for (j, &other) in roots.iter().enumerate() {
+                if find(&mut parent, j) == r {
+                    let name = other.symbol_name(cx.tcx).name;
+                    if min_name.is_none_or(|m| name < m) {
+                        min_name = Some(name);
+                    }
+                }
+            }
+            let _ = root;
+            let mut hasher = FxHasher::default();
+            min_name.unwrap().hash(&mut hasher);
+            cluster_piece.insert(r, (hasher.finish() % pieces as u64) as usize);
+        }
+
+        for (i, &item) in roots.iter().enumerate() {
+            let r = find(&mut parent, i);
+            let sub_cgu = &mut sub_cgus[cluster_piece[&r]];
+
+            sub_cgu.items_mut().insert(item, cgu.items()[&item]);
+
+            // Give the piece private copies of the inlined items reachable from this
+            // root, with the linkage and visibility they had in the unsplit CGU.
+            let mut reachable_inlined_items = FxIndexSet::default();
+            get_reachable_inlined_items(cx.tcx, item, cx.usage_map, &mut reachable_inlined_items);
+            for inlined_item in reachable_inlined_items {
+                let inlined_data = cgu.items()[&inlined_item];
+                sub_cgu.items_mut().entry(inlined_item).or_insert(inlined_data);
+            }
+        }
+
+        for mut sub_cgu in sub_cgus {
+            // Hash assignment can leave pieces empty; don't emit CGUs for those.
+            if !sub_cgu.items().is_empty() {
+                sub_cgu.compute_size_estimate();
+                result.push(sub_cgu);
+            }
+        }
+    }
+
+    // Restore the name ordering the merging below relies on.
+    result.sort_by(|a, b| a.name().as_str().cmp(b.name().as_str()));
+    *codegen_units = result;
 }
 
 // This function requires the CGUs to be sorted by name on input, and ensures
