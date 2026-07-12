@@ -1,7 +1,7 @@
 //! How a task's reads are recorded and deduplicated into the edge list of its node.
 
-use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::sync::Lock;
+use rustc_index::bit_set::GrowableBitSet;
 
 use super::DepNodeIndex;
 
@@ -64,20 +64,22 @@ impl TaskReads {
 
 /// Records the reads of a task with many reads.
 ///
-/// Recorders are pooled globally, reusing the read list and hash set allocations
+/// Recorders are pooled globally, reusing the read list and bit set allocations
 /// across tasks.
 #[derive(Debug, Default)]
 pub(crate) struct ReadsRecorder {
     /// The deduplicated reads, in first-read order.
     reads: Vec<DepNodeIndex>,
-    seen: FxHashSet<DepNodeIndex>,
+    seen: GrowableBitSet<DepNodeIndex>,
 }
 
 impl ReadsRecorder {
     /// Seeds a fresh recorder with reads that are already known to be distinct.
     fn seed(&mut self, reads: &[DepNodeIndex]) {
         debug_assert!(self.reads.is_empty());
-        self.seen.extend(reads);
+        for &index in reads {
+            self.seen.insert(index);
+        }
         self.reads.extend_from_slice(reads);
     }
 
@@ -93,8 +95,11 @@ impl ReadsRecorder {
 
     /// Prepares the recorder for a new task, keeping the backing allocations.
     fn clear(&mut self) {
+        for &index in &self.reads {
+            self.seen.remove(index);
+        }
         self.reads.clear();
-        self.seen.clear();
+        debug_assert!(self.seen.is_empty());
     }
 
     /// Returns a finished task's recorder to the pool. The cap keeps deeply nested tasks
