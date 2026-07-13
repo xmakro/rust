@@ -12,7 +12,7 @@ use rustc_middle::bug;
 use rustc_middle::thir::visit::Visitor;
 use rustc_middle::thir::*;
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt};
+use rustc_middle::ty::{self, AdtDef, Ty, TyCtxt, TypeVisitableExt};
 use rustc_pattern_analysis::diagnostics::Uncovered;
 use rustc_pattern_analysis::rustc::{
     Constructor, DeconstructedPat, MatchArm, RedundancyExplanation, RevealedTy,
@@ -674,7 +674,18 @@ impl<'p, 'tcx> MatchVisitor<'p, 'tcx> {
     ) {
         let pattern_ty = pat.ty;
 
-        let Ok((cx, report)) = self.analyze_binding(pat, Irrefutable, scrut) else { return };
+        let cx = self.new_cx(Irrefutable, None, scrut, pat.span);
+        let Ok(lowered) = self.lower_pattern(&cx, pat) else { return };
+        // A pattern that lowered to a wildcard (a bare binding, `_`, or bindings wrapping one)
+        // matches any value of any type. Error types still go through the analysis, which
+        // rejects them and taints this body's result.
+        if matches!(lowered.ctor(), Constructor::Wildcard)
+            && !lowered.ty().inner().references_error()
+        {
+            return;
+        }
+        let arms = [MatchArm { pat: lowered, arm_data: self.hir_source, has_guard: false }];
+        let Ok(report) = self.analyze_patterns(&cx, &arms, lowered.ty().inner()) else { return };
         let witnesses = report.non_exhaustiveness_witnesses;
         if witnesses.is_empty() {
             // The pattern is irrefutable.
