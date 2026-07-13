@@ -181,7 +181,10 @@ impl DepGraph {
         let colors = DepNodeColorMap::new(prev_graph_node_count);
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
-        let _green_node_index = current.alloc_new_node(
+        // The two singletons always live at fixed indices 0 and 1, which are reserved below
+        // the range handed out to new nodes so they never collide with a carried green node.
+        let _green_node_index = current.alloc_singleton_node(
+            DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
             EdgesVec::new(),
             Fingerprint::ZERO,
@@ -191,7 +194,8 @@ impl DepGraph {
         // Create a single always-red node, with no dependencies of its own.
         // Other nodes can use the always-red node as a fake dependency, to
         // ensure that their dependency list will never be all-green.
-        let red_node_index = current.alloc_new_node(
+        let red_node_index = current.alloc_singleton_node(
+            DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
             EdgesVec::new(),
             Fingerprint::ZERO,
@@ -201,6 +205,23 @@ impl DepGraph {
             let prev_index =
                 const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
             let result = colors.try_set_color(prev_index, DesiredColor::Red);
+            assert_matches!(result, TrySetColorResult::Success);
+
+            // The previous graph's anon-zero-deps singleton also lives at a fixed index (0), the
+            // same one this session's singleton was just allocated at. It is deterministically
+            // green (an anonymous query with no dependencies never changes), and this session's
+            // singleton is its equivalent. Color it green pointing at that fresh node now, so it
+            // is never separately promoted, which would carry a second record into index 0 and
+            // corrupt the file. This mirrors how the always-red singleton is pinned above.
+            let anon_prev_index = const {
+                SerializedDepNodeIndex::from_u32(
+                    DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE.as_u32(),
+                )
+            };
+            let result = colors.try_set_color(
+                anon_prev_index,
+                DesiredColor::Green { index: DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE },
+            );
             assert_matches!(result, TrySetColorResult::Success);
         }
 
@@ -1260,6 +1281,24 @@ impl CurrentDepGraph {
         value_fingerprint: Fingerprint,
     ) -> DepNodeIndex {
         let dep_node_index = self.encoder.send_new(key, value_fingerprint, edges);
+
+        #[cfg(debug_assertions)]
+        self.record_edge(dep_node_index, key, value_fingerprint);
+
+        dep_node_index
+    }
+
+    /// Allocates a node at a fixed index. Used only for the two singleton nodes, which must
+    /// live at indices 0 and 1 across every session.
+    #[inline(always)]
+    fn alloc_singleton_node(
+        &self,
+        index: DepNodeIndex,
+        key: DepNode,
+        edges: EdgesVec,
+        value_fingerprint: Fingerprint,
+    ) -> DepNodeIndex {
+        let dep_node_index = self.encoder.send_new_at(index, key, value_fingerprint, edges);
 
         #[cfg(debug_assertions)]
         self.record_edge(dep_node_index, key, value_fingerprint);
