@@ -45,28 +45,115 @@ where
     }
 }
 
+/// The fulfillment engine of an [`ObligationCtxt`], stored inline. Boxing the
+/// engine as a `dyn TraitEngine` was one of the hottest allocation sites in
+/// the whole compiler, and the solver choice is a per-session constant, so
+/// static dispatch is also a better fit.
+enum FulfillmentEngine<'tcx, E> {
+    Old(FulfillmentContext<'tcx, E>),
+    Next(NextFulfillmentCtxt<'tcx, E>),
+}
+
+impl<'tcx, E> FulfillmentEngine<'tcx, E>
+where
+    E: FromSolverError<'tcx, NextSolverError<'tcx>> + FromSolverError<'tcx, OldSolverError<'tcx>>,
+{
+    fn new(infcx: &InferCtxt<'tcx>) -> Self {
+        if infcx.next_trait_solver() {
+            FulfillmentEngine::Next(NextFulfillmentCtxt::new(infcx))
+        } else {
+            assert!(
+                !infcx.tcx.next_trait_solver_globally(),
+                "using old solver even though new solver is enabled globally"
+            );
+            FulfillmentEngine::Old(FulfillmentContext::new(infcx))
+        }
+    }
+}
+
+macro_rules! delegate_engine {
+    ($self:expr, $method:ident($($arg:expr),*)) => {
+        match $self {
+            FulfillmentEngine::Old(engine) => engine.$method($($arg),*),
+            FulfillmentEngine::Next(engine) => engine.$method($($arg),*),
+        }
+    };
+}
+
+impl<'tcx, E> TraitEngine<'tcx, E> for FulfillmentEngine<'tcx, E>
+where
+    E: FromSolverError<'tcx, NextSolverError<'tcx>> + FromSolverError<'tcx, OldSolverError<'tcx>>,
+{
+    fn register_predicate_obligation(
+        &mut self,
+        infcx: &InferCtxt<'tcx>,
+        obligation: PredicateObligation<'tcx>,
+    ) {
+        delegate_engine!(self, register_predicate_obligation(infcx, obligation))
+    }
+
+    fn register_predicate_obligations(
+        &mut self,
+        infcx: &InferCtxt<'tcx>,
+        obligations: PredicateObligations<'tcx>,
+    ) {
+        delegate_engine!(self, register_predicate_obligations(infcx, obligations))
+    }
+
+    fn try_evaluate_obligations(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E> {
+        delegate_engine!(self, try_evaluate_obligations(infcx))
+    }
+
+    fn collect_remaining_errors(&mut self, infcx: &InferCtxt<'tcx>) -> Vec<E> {
+        delegate_engine!(self, collect_remaining_errors(infcx))
+    }
+
+    fn has_pending_obligations(&self) -> bool {
+        delegate_engine!(self, has_pending_obligations())
+    }
+
+    fn pending_obligations(&self) -> PredicateObligations<'tcx> {
+        delegate_engine!(self, pending_obligations())
+    }
+
+    fn pending_obligations_potentially_referencing_sub_root(
+        &self,
+        infcx: &InferCtxt<'tcx>,
+        sub_root: rustc_middle::ty::TyVid,
+    ) -> PredicateObligations<'tcx> {
+        delegate_engine!(self, pending_obligations_potentially_referencing_sub_root(infcx, sub_root))
+    }
+
+    fn drain_stalled_obligations_for_coroutines(
+        &mut self,
+        infcx: &InferCtxt<'tcx>,
+    ) -> PredicateObligations<'tcx> {
+        delegate_engine!(self, drain_stalled_obligations_for_coroutines(infcx))
+    }
+}
+
 /// Used if you want to have pleasant experience when dealing
 /// with obligations outside of hir or mir typeck.
 pub struct ObligationCtxt<'a, 'tcx, E = ScrubbedTraitError<'tcx>> {
     pub infcx: &'a InferCtxt<'tcx>,
-    engine: RefCell<Box<dyn TraitEngine<'tcx, E>>>,
+    engine: RefCell<FulfillmentEngine<'tcx, E>>,
 }
 
 impl<'a, 'tcx> ObligationCtxt<'a, 'tcx, FulfillmentError<'tcx>> {
     pub fn new_with_diagnostics(infcx: &'a InferCtxt<'tcx>) -> Self {
-        Self { infcx, engine: RefCell::new(<dyn TraitEngine<'tcx, _>>::new(infcx)) }
+        Self { infcx, engine: RefCell::new(FulfillmentEngine::new(infcx)) }
     }
 }
 
 impl<'a, 'tcx> ObligationCtxt<'a, 'tcx, ScrubbedTraitError<'tcx>> {
     pub fn new(infcx: &'a InferCtxt<'tcx>) -> Self {
-        Self { infcx, engine: RefCell::new(<dyn TraitEngine<'tcx, _>>::new(infcx)) }
+        Self { infcx, engine: RefCell::new(FulfillmentEngine::new(infcx)) }
     }
 }
 
 impl<'a, 'tcx, E> ObligationCtxt<'a, 'tcx, E>
 where
-    E: 'tcx,
+    E: FromSolverError<'tcx, NextSolverError<'tcx>> + FromSolverError<'tcx, OldSolverError<'tcx>>,
 {
     pub fn register_obligation(&self, obligation: PredicateObligation<'tcx>) {
         self.engine.borrow_mut().register_predicate_obligation(self.infcx, obligation);
@@ -297,14 +384,14 @@ impl<'tcx> ObligationCtxt<'_, 'tcx, ScrubbedTraitError<'tcx>> {
         self.infcx.make_canonicalized_query_response(
             inference_vars,
             answer,
-            &mut **self.engine.borrow_mut(),
+            &mut *self.engine.borrow_mut(),
         )
     }
 }
 
 impl<'tcx, E> ObligationCtxt<'_, 'tcx, E>
 where
-    E: FromSolverError<'tcx, NextSolverError<'tcx>>,
+    E: FromSolverError<'tcx, NextSolverError<'tcx>> + FromSolverError<'tcx, OldSolverError<'tcx>>,
 {
     pub fn assumed_wf_types(
         &self,
@@ -331,7 +418,7 @@ where
             match self
                 .infcx
                 .at(&cause, param_env)
-                .deeply_normalize(Unnormalized::new_wip(ty), &mut **self.engine.borrow_mut())
+                .deeply_normalize(Unnormalized::new_wip(ty), &mut *self.engine.borrow_mut())
             {
                 // Insert well-formed types, ignoring duplicates.
                 Ok(normalized) => drop(implied_bounds.insert(normalized)),
@@ -348,7 +435,7 @@ where
         param_env: ty::ParamEnv<'tcx>,
         value: Unnormalized<'tcx, T>,
     ) -> Result<T, Vec<E>> {
-        self.infcx.at(cause, param_env).deeply_normalize(value, &mut **self.engine.borrow_mut())
+        self.infcx.at(cause, param_env).deeply_normalize(value, &mut *self.engine.borrow_mut())
     }
 
     pub fn structurally_normalize_ty(
@@ -359,7 +446,7 @@ where
     ) -> Result<Ty<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
-            .structurally_normalize_ty(value, &mut **self.engine.borrow_mut())
+            .structurally_normalize_ty(value, &mut *self.engine.borrow_mut())
     }
 
     pub fn structurally_normalize_const(
@@ -370,7 +457,7 @@ where
     ) -> Result<ty::Const<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
-            .structurally_normalize_const(value, &mut **self.engine.borrow_mut())
+            .structurally_normalize_const(value, &mut *self.engine.borrow_mut())
     }
 
     pub fn structurally_normalize_term(
@@ -381,6 +468,6 @@ where
     ) -> Result<ty::Term<'tcx>, Vec<E>> {
         self.infcx
             .at(cause, param_env)
-            .structurally_normalize_term(value, &mut **self.engine.borrow_mut())
+            .structurally_normalize_term(value, &mut *self.engine.borrow_mut())
     }
 }
