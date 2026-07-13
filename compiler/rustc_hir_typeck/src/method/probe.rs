@@ -15,7 +15,7 @@ use rustc_infer::traits::{ObligationCauseCode, PredicateObligation, query};
 use rustc_macros::Diagnostic;
 use rustc_middle::middle::stability;
 use rustc_middle::ty::elaborate::supertrait_def_ids;
-use rustc_middle::ty::fast_reject::{DeepRejectCtxt, TreatParams, simplify_type};
+use rustc_middle::ty::fast_reject::{DeepRejectCtxt, SimplifiedType, TreatParams, simplify_type};
 use rustc_middle::ty::{
     self, AssocContainer, AssocItem, GenericArgs, GenericArgsRef, GenericParamDefKind, ParamEnvAnd,
     Ty, TyCtxt, TypeVisitableExt, Unnormalized, Upcast,
@@ -1709,6 +1709,34 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         None
     }
 
+    /// Whether the receiver can unify with the self parameter of `candidate`, judged from
+    /// the simplified type heads alone.
+    ///
+    /// `consider_probe` relates the receiver against the declared self type once that has
+    /// been instantiated and normalized. Neither step can change a head that
+    /// `simplify_type` reports, since parameters and aliases simplify to `None`, so two
+    /// different heads mean the relation would fail.
+    fn candidate_self_head_may_unify(
+        &self,
+        self_ty_head: Option<SimplifiedType>,
+        candidate: &Candidate<'tcx>,
+    ) -> bool {
+        // Path probes relate the receiver against the impl self type, not the self parameter.
+        if self.mode != Mode::MethodCall {
+            return true;
+        }
+        let Some(self_ty_head) = self_ty_head else { return true };
+        if !candidate.item.is_method() {
+            return true;
+        }
+        let declared_self =
+            self.tcx.fn_sig(candidate.item.def_id).skip_binder().skip_binder().inputs()[0];
+        match simplify_type(self.tcx, declared_self, TreatParams::InstantiateWithInfer) {
+            Some(declared_head) => declared_head == self_ty_head,
+            None => true,
+        }
+    }
+
     fn consider_candidates(
         &self,
         self_ty: Ty<'tcx>,
@@ -1717,6 +1745,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
         pick_diag_hints: &mut PickDiagHints<'_, 'tcx>,
         pick_constraints: Option<&PickConstraintsForShadowed>,
     ) -> Option<PickResult<'tcx>> {
+        let self_ty_head = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer);
         let mut applicable_candidates: Vec<_> = candidates
             .iter()
             .filter(|candidate| {
@@ -1724,6 +1753,7 @@ impl<'a, 'tcx> ProbeContext<'a, 'tcx> {
                     .map(|pick_constraints| pick_constraints.candidate_may_shadow(&candidate))
                     .unwrap_or(true)
             })
+            .filter(|candidate| self.candidate_self_head_may_unify(self_ty_head, candidate))
             .map(|probe| {
                 (
                     probe,
