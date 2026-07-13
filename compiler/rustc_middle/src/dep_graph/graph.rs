@@ -1102,7 +1102,11 @@ impl DepGraph {
     }
 
     pub(crate) fn finish_encoding(&self) -> FileEncodeResult {
-        if let Some(data) = &self.data { data.current.encoder.finish(&data.current) } else { Ok(0) }
+        if let Some(data) = &self.data {
+            data.current.encoder.finish(&data.current, &data.colors)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn next_virtual_depnode_index(&self) -> DepNodeIndex {
@@ -1420,6 +1424,13 @@ impl DepNodeColorMap {
             debug_assert_eq!(value, COMPRESSED_UNKNOWN);
             DepNodeColor::Unknown
         }
+    }
+
+    /// Whether the node was marked green this session. Used by the encoder when it
+    /// computes which carried records are dead.
+    #[inline]
+    pub(super) fn is_green(&self, index: SerializedDepNodeIndex) -> bool {
+        self.values[index].load(Ordering::Acquire) < COMPRESSED_RED
     }
 }
 
