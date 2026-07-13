@@ -1208,45 +1208,55 @@ impl<'tcx> InferCtxt<'tcx> {
         }
     }
 
+    #[inline]
     pub fn shallow_resolve(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        // The vast majority of the time `ty` is not an inference variable, so
+        // keep that path tiny and inlinable at the (many, cross-crate) call
+        // sites, and push the actual variable resolution into a separate,
+        // never-inlined function.
         if let ty::Infer(v) = *ty.kind() {
-            match v {
-                ty::TyVar(v) => {
-                    // Not entirely obvious: if `typ` is a type variable,
-                    // it can be resolved to an int/float variable, which
-                    // can then be recursively resolved, hence the
-                    // recursion. Note though that we prevent type
-                    // variables from unifying to other type variables
-                    // directly (though they may be embedded
-                    // structurally), and we prevent cycles in any case,
-                    // so this recursion should always be of very limited
-                    // depth.
-                    //
-                    // Note: if these two lines are combined into one we get
-                    // dynamic borrow errors on `self.inner`.
-                    let known = self.inner.borrow_mut().type_variables().probe(v).known();
-                    known.map_or(ty, |t| self.shallow_resolve(t))
-                }
-
-                ty::IntVar(v) => {
-                    match self.inner.borrow_mut().int_unification_table().probe_value(v) {
-                        ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
-                        ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
-                        ty::IntVarValue::Unknown => ty,
-                    }
-                }
-
-                ty::FloatVar(v) => {
-                    match self.inner.borrow_mut().float_unification_table().probe_value(v) {
-                        ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
-                        ty::FloatVarValue::Unknown => ty,
-                    }
-                }
-
-                ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => ty,
-            }
+            self.shallow_resolve_infer(ty, v)
         } else {
             ty
+        }
+    }
+
+    #[inline(never)]
+    fn shallow_resolve_infer(&self, ty: Ty<'tcx>, v: ty::InferTy) -> Ty<'tcx> {
+        match v {
+            ty::TyVar(v) => {
+                // Not entirely obvious: if `typ` is a type variable,
+                // it can be resolved to an int/float variable, which
+                // can then be recursively resolved, hence the
+                // recursion. Note though that we prevent type
+                // variables from unifying to other type variables
+                // directly (though they may be embedded
+                // structurally), and we prevent cycles in any case,
+                // so this recursion should always be of very limited
+                // depth.
+                //
+                // Note: if these two lines are combined into one we get
+                // dynamic borrow errors on `self.inner`.
+                let known = self.inner.borrow_mut().type_variables().probe(v).known();
+                known.map_or(ty, |t| self.shallow_resolve(t))
+            }
+
+            ty::IntVar(v) => {
+                match self.inner.borrow_mut().int_unification_table().probe_value(v) {
+                    ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
+                    ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
+                    ty::IntVarValue::Unknown => ty,
+                }
+            }
+
+            ty::FloatVar(v) => {
+                match self.inner.borrow_mut().float_unification_table().probe_value(v) {
+                    ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
+                    ty::FloatVarValue::Unknown => ty,
+                }
+            }
+
+            ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => ty,
         }
     }
 
