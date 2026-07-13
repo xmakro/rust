@@ -532,9 +532,11 @@ impl<'a> TraitDef<'a> {
                     _ => unreachable!(),
                 };
                 // Keep the lint attributes of the previous item to control how the
-                // generated implementations are linted
-                let mut attrs = newitem.attrs.clone();
-                attrs.extend(
+                // generated implementations are linted. `newitem` is already
+                // owned, so extend its attributes in place rather than deep-
+                // cloning the whole generated impl.
+                let mut newitem = newitem;
+                newitem.attrs.extend(
                     item.attrs
                         .iter()
                         .filter(|a| {
@@ -549,7 +551,7 @@ impl<'a> TraitDef<'a> {
                         })
                         .cloned(),
                 );
-                push(Annotatable::Item(Box::new(ast::Item { attrs, ..(*newitem).clone() })))
+                push(Annotatable::Item(newitem))
             }
             _ => unreachable!(),
         }

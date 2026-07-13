@@ -2186,6 +2186,12 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
             }
         }
 
+        // The overwhelming majority of nodes have no cfg or macro attribute
+        // to strip; skip the mutable attribute pass entirely for them.
+        if cfg_pos.is_none() && attr_pos.is_none() {
+            return None;
+        }
+
         item.visit_attrs(|attrs| {
             attr = Some(match (cfg_pos, attr_pos) {
                 (Some(pos), _) => (attrs.remove(pos), pos, Vec::new()),
