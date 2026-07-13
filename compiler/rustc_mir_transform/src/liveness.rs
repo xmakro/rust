@@ -135,6 +135,13 @@ pub(crate) fn check_liveness<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Den
     // Get the remaining variables' names from debuginfo.
     checked_places.record_debuginfo(&body.var_debug_info);
 
+    // If there is nothing to check — no user-declared variables and no captures —
+    // the dataflow below can never produce a lint, so skip it entirely. This is
+    // the common case for compiler-generated and trivial bodies.
+    if checked_places.len() == 0 {
+        return DenseBitSet::new_empty(num_captures);
+    }
+
     let self_assignment = find_self_assignments(&checked_places, body);
 
     let mut live =
