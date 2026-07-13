@@ -290,9 +290,13 @@ impl<T: HasAttrs> HasAttrs for Option<T> {
 }
 
 impl HasAttrs for StmtKind {
-    // This might be a `StmtKind::Item`, which contains
-    // an item that supports inner attrs.
-    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = true;
+    // A `StmtKind::Item` can contain an item that supports inner attrs, but
+    // such items collect their own tokens at the item level
+    // (`parse_item_common` runs its own `collect_tokens`), so statement-level
+    // collection never needs to force a capture on their behalf. Keeping this
+    // `false` lets the very common attribute-less statement skip the parser
+    // position snapshot entirely.
+    const SUPPORTS_CUSTOM_INNER_ATTRS: bool = false;
 
     fn attrs(&self) -> &[Attribute] {
         match self {
