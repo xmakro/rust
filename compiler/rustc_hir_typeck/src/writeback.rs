@@ -663,8 +663,12 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
             self.typeck_results.type_dependent_defs_mut().insert(hir_id, def);
         }
 
-        // Export splatted function call resolutions.
-        if let Some(def) = self.fcx.typeck_results.borrow_mut().splatted_defs_mut().remove(hir_id) {
+        // Export splatted function call resolutions. Splats are rare, so check
+        // for the (almost always) empty map before probing it per node.
+        if !self.fcx.typeck_results.borrow().splatted_defs().is_empty()
+            && let Some(def) =
+                self.fcx.typeck_results.borrow_mut().splatted_defs_mut().remove(hir_id)
+        {
             self.typeck_results.splatted_defs_mut().insert(hir_id, def);
         }
 

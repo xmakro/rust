@@ -123,6 +123,15 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         item: Option<ItemLike<'_>>,
     ) {
         let attrs = self.tcx.hir_attrs(hir_id);
+        // This check inspects the *parent's* attributes when visiting an
+        // attribute-less closure, so it cannot live behind the early-out
+        // below.
+        self.check_rustc_force_inline(hir_id, attrs, target);
+        // The vast majority of HIR nodes carry no attributes, and everything
+        // else below is a no-op for them.
+        if attrs.is_empty() {
+            return;
+        }
         for attr in attrs {
             match attr {
                 Attribute::Parsed(attr_kind) => {
@@ -162,7 +171,6 @@ impl<'tcx> CheckAttrVisitor<'tcx> {
         }
 
         self.check_repr(attrs, span, target, item, hir_id);
-        self.check_rustc_force_inline(hir_id, attrs, target);
         self.check_mix_no_mangle_export(hir_id, attrs);
         self.check_optimize_and_inline(attrs);
     }

@@ -95,6 +95,7 @@ use rustc_middle::{bug, span_bug};
 use rustc_pattern_analysis::rustc::RustcPatCtxt;
 use rustc_session::lint::Level;
 use rustc_span::{DUMMY_SP, Span, Spanned};
+use smallvec::SmallVec;
 use tracing::{debug, instrument};
 
 use super::matches::BuiltMatchTree;
@@ -135,9 +136,10 @@ struct Scope {
     /// out empty but grows as variables are declared during the
     /// building process. This is a stack, so we always drop from the
     /// end of the vector (top of the stack) first.
-    drops: Vec<DropData>,
+    // Most scopes schedule at most a couple of drops, so keep them inline.
+    drops: SmallVec<[DropData; 2]>,
 
-    moved_locals: Vec<Local>,
+    moved_locals: SmallVec<[Local; 2]>,
 
     /// The drop index that will drop everything in and below this scope on an
     /// unwind path.
@@ -493,8 +495,8 @@ impl<'tcx> Scopes<'tcx> {
         self.scopes.push(Scope {
             source_scope: vis_scope,
             region_scope,
-            drops: vec![],
-            moved_locals: vec![],
+            drops: SmallVec::new(),
+            moved_locals: SmallVec::new(),
             cached_unwind_block: None,
             cached_coroutine_drop_block: None,
         });
