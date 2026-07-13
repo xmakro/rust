@@ -82,9 +82,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         // While we don't allow *arbitrary* coercions here, we *do* allow
         // coercions from ! to `expected`.
-        if self.resolve_vars_with_obligations(ty).is_never()
-            && self.tcx.expr_guaranteed_to_constitute_read_for_never(expr)
-        {
+        //
+        // `ty` comes out of `check_expr_with_expectation` already resolved, so as
+        // in `check_expr_with_expectation_and_args` above, only a bare type
+        // variable justifies the expensive fulfillment round-trip.
+        let ty_is_never = match ty.kind() {
+            ty::Never => true,
+            ty::Infer(ty::TyVar(_)) => self.resolve_vars_with_obligations(ty).is_never(),
+            _ => false,
+        };
+        if ty_is_never && self.tcx.expr_guaranteed_to_constitute_read_for_never(expr) {
             if let Some(adjustments) = self.typeck_results.borrow().adjustments().get(expr.hir_id) {
                 let reported = self.dcx().span_delayed_bug(
                     expr.span,
@@ -300,9 +307,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // unless it's a place expression that isn't being read from, in which case
         // diverging would be unsound since we may never actually read the `!`.
         // e.g. `let _ = *never_ptr;` with `never_ptr: *const !`.
-        if self.resolve_vars_with_obligations(ty).is_never()
-            && self.tcx.expr_guaranteed_to_constitute_read_for_never(expr)
-        {
+        //
+        // `ty` was resolved above, so the only way it can still become `!` with
+        // further inference progress is if it is a bare, unresolved type variable.
+        // Only in that case is the expensive fulfillment round-trip inside
+        // `resolve_vars_with_obligations` warranted; anything else can be
+        // answered by looking at the type itself.
+        let ty_is_never = match ty.kind() {
+            ty::Never => true,
+            ty::Infer(ty::TyVar(_)) => self.resolve_vars_with_obligations(ty).is_never(),
+            _ => false,
+        };
+        if ty_is_never && self.tcx.expr_guaranteed_to_constitute_read_for_never(expr) {
             self.diverges.set(self.diverges.get() | Diverges::always(expr.span));
         }
 
