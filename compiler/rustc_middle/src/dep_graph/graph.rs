@@ -181,7 +181,10 @@ impl DepGraph {
         let colors = DepNodeColorMap::new(prev_graph_node_count);
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
-        let _green_node_index = current.alloc_new_node(
+        // The two singletons always live at fixed indices 0 and 1, which are reserved below
+        // the range handed out to new nodes so they never collide with a carried green node.
+        let _green_node_index = current.alloc_singleton_node(
+            DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
             EdgesVec::new(),
             Fingerprint::ZERO,
@@ -191,7 +194,8 @@ impl DepGraph {
         // Create a single always-red node, with no dependencies of its own.
         // Other nodes can use the always-red node as a fake dependency, to
         // ensure that their dependency list will never be all-green.
-        let red_node_index = current.alloc_new_node(
+        let red_node_index = current.alloc_singleton_node(
+            DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
             EdgesVec::new(),
             Fingerprint::ZERO,
@@ -201,6 +205,23 @@ impl DepGraph {
             let prev_index =
                 const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
             let result = colors.try_set_color(prev_index, DesiredColor::Red);
+            assert_matches!(result, TrySetColorResult::Success);
+
+            // The previous graph's anon-zero-deps singleton also lives at a fixed index (0), the
+            // same one this session's singleton was just allocated at. It is deterministically
+            // green (an anonymous query with no dependencies never changes), and this session's
+            // singleton is its equivalent. Color it green pointing at that fresh node now, so it
+            // is never separately promoted, which would carry a second record into index 0 and
+            // corrupt the file. This mirrors how the always-red singleton is pinned above.
+            let anon_prev_index = const {
+                SerializedDepNodeIndex::from_u32(
+                    DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE.as_u32(),
+                )
+            };
+            let result = colors.try_set_color(
+                anon_prev_index,
+                DesiredColor::Green { index: DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE },
+            );
             assert_matches!(result, TrySetColorResult::Success);
         }
 
@@ -916,16 +937,96 @@ impl DepGraphData {
                 // in the previous compilation session too, so we can try to
                 // mark it as green by recursively marking all of its
                 // dependencies green.
-
-                // Reuse a per-worker buffer for the edges instead of allocating one per call.
-                // The recursion gives it back empty: each `EdgeFrame` pops its edges on drop.
-                let mut edge_buf = self.green_edge_buf.take();
-                let result = self.try_mark_previous_green(tcx, prev_index, None, &mut edge_buf);
-                debug_assert!(edge_buf.is_empty());
-                self.green_edge_buf.set(edge_buf);
+                let result = if self.current.encoder.is_carrying() {
+                    // The carried record region already contains this node's record, so
+                    // promoting it needs no edge list: verify the dependencies without
+                    // collecting their indices.
+                    self.try_mark_previous_green_carried(tcx, prev_index, None)
+                } else {
+                    // Reuse a per-worker buffer for the edges instead of allocating one per
+                    // call. The recursion gives it back empty: each `EdgeFrame` pops its
+                    // edges on drop.
+                    let mut edge_buf = self.green_edge_buf.take();
+                    let result = self.try_mark_previous_green(tcx, prev_index, None, &mut edge_buf);
+                    debug_assert!(edge_buf.is_empty());
+                    self.green_edge_buf.set(edge_buf);
+                    result
+                };
                 result.map(|dep_node_index| (prev_index, dep_node_index))
             }
         }
+    }
+
+    /// Try to mark a dep-node which existed in the previous compilation session as green,
+    /// without collecting its edges. Used when the record region is carried forward: the
+    /// node's record is already in the new file, so all promotion needs is the color-map
+    /// insert, and the edge indices (which equal the previous ones) are never materialized.
+    #[instrument(skip(self, tcx, prev_dep_node_index, frame), level = "debug")]
+    fn try_mark_previous_green_carried<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        prev_dep_node_index: SerializedDepNodeIndex,
+        frame: Option<&MarkFrame<'_>>,
+    ) -> Option<DepNodeIndex> {
+        let frame = MarkFrame { index: prev_dep_node_index, parent: frame };
+
+        // We never try to mark eval_always nodes as green
+        debug_assert!(!tcx.is_eval_always(self.previous.index_to_node(prev_dep_node_index).kind));
+
+        for parent_dep_node_index in self.previous.edge_targets_from(prev_dep_node_index) {
+            match self.colors.get(parent_dep_node_index) {
+                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Red => return None,
+                DepNodeColor::Unknown => {}
+            }
+
+            let parent_dep_node = self.previous.index_to_node(parent_dep_node_index);
+
+            // If this dependency isn't eval_always, try to mark it green recursively.
+            if !tcx.is_eval_always(parent_dep_node.kind)
+                && self
+                    .try_mark_previous_green_carried(tcx, parent_dep_node_index, Some(&frame))
+                    .is_some()
+            {
+                continue;
+            }
+
+            // We failed to mark it green, so we try to force the query.
+            if !tcx.try_force_from_dep_node(*parent_dep_node, parent_dep_node_index, &frame) {
+                return None;
+            }
+
+            match self.colors.get(parent_dep_node_index) {
+                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Red => return None,
+                DepNodeColor::Unknown => {}
+            }
+
+            if tcx.dcx().has_errors_or_delayed_bugs().is_none() {
+                panic!("try_mark_previous_green_carried() - forcing failed to set a color");
+            }
+
+            // A forced query that errored leaves the color unset; give up like the
+            // collecting walk does and rely on the cache not being persisted.
+            return None;
+        }
+
+        // All dependencies are green: promote this node with just the color-map insert.
+        // `no_hash` nodes may fail this promotion due to already being conservatively
+        // colored red.
+        let dep_node_index = self.current.encoder.send_promoted_carried(
+            prev_dep_node_index,
+            &self.colors,
+        )?;
+
+        #[cfg(debug_assertions)]
+        self.current.record_edge(
+            dep_node_index,
+            *self.previous.index_to_node(prev_dep_node_index),
+            self.previous.value_fingerprint_for_index(prev_dep_node_index),
+        );
+
+        Some(dep_node_index)
     }
 
     /// Try to mark a dep-node which existed in the previous compilation session as green.
@@ -1081,7 +1182,11 @@ impl DepGraph {
     }
 
     pub(crate) fn finish_encoding(&self) -> FileEncodeResult {
-        if let Some(data) = &self.data { data.current.encoder.finish(&data.current) } else { Ok(0) }
+        if let Some(data) = &self.data {
+            data.current.encoder.finish(&data.current, &data.colors)
+        } else {
+            Ok(0)
+        }
     }
 
     pub fn next_virtual_depnode_index(&self) -> DepNodeIndex {
@@ -1266,6 +1371,24 @@ impl CurrentDepGraph {
 
         dep_node_index
     }
+
+    /// Allocates a node at a fixed index. Used only for the two singleton nodes, which must
+    /// live at indices 0 and 1 across every session.
+    #[inline(always)]
+    fn alloc_singleton_node(
+        &self,
+        index: DepNodeIndex,
+        key: DepNode,
+        edges: EdgesVec,
+        value_fingerprint: Fingerprint,
+    ) -> DepNodeIndex {
+        let dep_node_index = self.encoder.send_new_at(index, key, value_fingerprint, edges);
+
+        #[cfg(debug_assertions)]
+        self.record_edge(dep_node_index, key, value_fingerprint);
+
+        dep_node_index
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1381,6 +1504,13 @@ impl DepNodeColorMap {
             debug_assert_eq!(value, COMPRESSED_UNKNOWN);
             DepNodeColor::Unknown
         }
+    }
+
+    /// Whether the node was marked green this session. Used by the encoder when it
+    /// computes which carried records are dead.
+    #[inline]
+    pub(super) fn is_green(&self, index: SerializedDepNodeIndex) -> bool {
+        self.values[index].load(Ordering::Acquire) < COMPRESSED_RED
     }
 }
 
