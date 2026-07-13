@@ -106,7 +106,8 @@ pub fn compute_dropck_outlives_with_errors<'tcx, E>(
     span: Span,
 ) -> Result<DropckOutlivesResult<'tcx>, Vec<E>>
 where
-    E: FromSolverError<'tcx, NextSolverError<'tcx>>,
+    E: FromSolverError<'tcx, NextSolverError<'tcx>>
+        + FromSolverError<'tcx, crate::traits::fulfill::OldSolverError<'tcx>>,
 {
     let tcx = ocx.infcx.tcx;
     let ParamEnvAnd { param_env, value: DropckOutlives { dropped_ty } } = goal;
