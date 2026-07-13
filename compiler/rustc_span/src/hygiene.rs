@@ -310,6 +310,12 @@ impl ExpnId {
     /// `expn_id.is_descendant_of(ctxt.outer_expn())`.
     #[inline]
     pub fn outer_expn_is_descendant_of(self, ctxt: SyntaxContext) -> bool {
+        // Fast path to avoid locking: the root context's outer expansion is
+        // `ExpnId::root()`, of which everything is a descendant. Non-macro
+        // code hits this case for essentially every identifier.
+        if ctxt.is_root() {
+            return true;
+        }
         HygieneData::with(|data| data.is_descendant_of(self, data.outer_expn(ctxt)))
     }
 
@@ -876,11 +882,19 @@ impl SyntaxContext {
 
     #[inline]
     pub fn normalize_to_macros_2_0(self) -> SyntaxContext {
+        // Fast path to avoid locking: the root context normalizes to itself.
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macros_2_0(self))
     }
 
     #[inline]
     pub fn normalize_to_macro_rules(self) -> SyntaxContext {
+        // Fast path to avoid locking: the root context normalizes to itself.
+        if self.is_root() {
+            return self;
+        }
         HygieneData::with(|data| data.normalize_to_macro_rules(self))
     }
 
