@@ -158,6 +158,9 @@ bitflags::bitflags! {
         /// We have a separate flag from `HAS_ALIAS` because `HAS_ALIAS` doesn't care
         /// about rigidness while we rely on rigidness to skip renormalization.
         const HAS_NON_RIGID_ALIAS         = 1 << 28;
+
+        /// Does this have any `dyn Trait` in it?
+        const HAS_TY_DYN                  = 1 << 29;
     }
 }
 
@@ -319,6 +322,7 @@ impl<I: Interner> FlagComputation<I> {
             }
 
             ty::Dynamic(obj, r) => {
+                self.add_flags(TypeFlags::HAS_TY_DYN);
                 for predicate in obj.iter() {
                     self.bound_computation(predicate, |computation, predicate| match predicate {
                         ty::ExistentialPredicate::Trait(tr) => {
