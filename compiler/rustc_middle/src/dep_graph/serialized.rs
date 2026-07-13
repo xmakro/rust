@@ -97,9 +97,6 @@ impl SerializedDepNodeIndex {
 }
 
 const DEP_NODE_SIZE: usize = size_of::<SerializedDepNodeIndex>();
-/// Amount of padding we need to add to the edge list data so that we can retrieve every
-/// SerializedDepNodeIndex with a fixed-size read then mask.
-const DEP_NODE_PAD: usize = DEP_NODE_SIZE - 1;
 /// Number of bits we need to store the number of used bytes in a SerializedDepNodeIndex.
 /// Note that wherever we encode byte widths like this we actually store the number of bytes used
 /// minus 1; for a 4-byte value we technically would have 5 widths to store, but using one byte to
@@ -121,13 +118,11 @@ pub struct SerializedDepGraph {
     /// Some nodes don't have a meaningful value hash (e.g. queries with `no_hash`),
     /// so they store a dummy value here instead (e.g. [`Fingerprint::ZERO`]).
     value_fingerprints: IndexVec<SerializedDepNodeIndex, Fingerprint>,
-    /// For each DepNode, stores the list of edges originating from that
-    /// DepNode. Encoded as a [start, end) pair indexing into edge_list_data,
-    /// which holds the actual DepNodeIndices of the target nodes.
+    /// For each DepNode, stores the position and byte width of its edge list within
+    /// the retained file bytes ([`Self::backing`]), which serve as the edge data
+    /// directly: the on-disk varint encoding is also the in-memory representation,
+    /// so decoding copies no edge bytes at all.
     edge_list_indices: IndexVec<SerializedDepNodeIndex, EdgeHeader>,
-    /// A flattened list of all edge targets in the graph, stored in the same
-    /// varint encoding that we use on disk. Edge sources are implicit in edge_list_indices.
-    edge_list_data: Vec<u8>,
     /// The lazily-built inverse of `nodes`: maps a [`DepNode`] back to its
     /// [`SerializedDepNodeIndex`] via the node's key fingerprint. See
     /// [`LazyNodeIndex`].
@@ -139,12 +134,13 @@ pub struct SerializedDepGraph {
     /// a compacting rewrite. Dead records and superseded duplicates accumulate with
     /// each carried generation, so the writer compacts once this grows too large.
     generation: u64,
-    /// The memory-mapped bytes of the file this graph was decoded from, retained so
-    /// that the record region can be copied into the next session's file wholesale
-    /// (see [`Self::region_bytes`]). `None` for the empty default graph, which
-    /// disables the carry.
-    mmap: Option<Mmap>,
-    /// The byte range of the record region within [`Self::mmap`]: every node record,
+    /// The bytes of the file this graph was decoded from, retained both to serve the
+    /// edge lists in place (see [`Self::edge_list_indices`]) and so that the record
+    /// region can be copied into the next session's file wholesale (see
+    /// [`Self::region_bytes`]). `None` only for the empty default graph, which has no
+    /// nodes and never carries.
+    backing: Option<Backing>,
+    /// The byte range of the record region within [`Self::backing`]: every node record,
     /// including dead and superseded ones, and nothing else.
     records_range: std::ops::Range<usize>,
     /// Indices whose record in the region is dead: the node was dropped by an earlier
@@ -159,9 +155,35 @@ pub struct SerializedDepGraph {
     live_node_count: u64,
     /// The number of edges of live nodes, from the file footer.
     live_edge_count: u64,
+    /// The number of record-region bytes belonging to live records, from the file
+    /// footer. Compared against the region size to decide when accumulated dead and
+    /// superseded records warrant a compacting rewrite.
+    live_record_bytes: u64,
     /// Used to time the lazy per-`DepKind` reverse-index build. `None` only for
     /// the empty default graph, which is never looked up.
     profiler: Option<SelfProfilerRef>,
+}
+
+/// The retained bytes of the previous dep-graph file.
+///
+/// On most platforms this is the memory mapping the file was decoded from. On Windows
+/// the mapping cannot stay alive while the file is later replaced by the save's rename,
+/// so the bytes are copied out once and the mapping is released.
+enum Backing {
+    Mapped(Mmap),
+    #[allow(dead_code)]
+    Owned(Vec<u8>),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::Mapped(mmap) => mmap,
+            Backing::Owned(bytes) => bytes,
+        }
+    }
 }
 
 // `SelfProfilerRef` is not `Debug`, so we can't derive this.
@@ -171,7 +193,6 @@ impl std::fmt::Debug for SerializedDepGraph {
             .field("nodes", &self.nodes)
             .field("value_fingerprints", &self.value_fingerprints)
             .field("edge_list_indices", &self.edge_list_indices)
-            .field("edge_list_data", &self.edge_list_data)
             .field("reverse_index", &self.reverse_index)
             .field("session_count", &self.session_count)
             .finish_non_exhaustive()
@@ -250,7 +271,12 @@ impl SerializedDepGraph {
         source: SerializedDepNodeIndex,
     ) -> impl Iterator<Item = SerializedDepNodeIndex> + Clone {
         let header = self.edge_list_indices[source];
-        let mut raw = &self.edge_list_data[header.start()..];
+        // The edge bytes are read in place from the retained file. A node with edges
+        // always comes from a real file, so the backing is present. The fixed-size
+        // read below may extend a few bytes past the edge list; that is always still
+        // within the file, since the records are followed by the footer, which is at
+        // least a dead-list length and the fixed-size tail.
+        let mut raw = &self.backing.as_ref().unwrap()[header.start()..];
 
         let bytes_per_index = header.bytes_per_index();
 
@@ -305,7 +331,7 @@ impl SerializedDepGraph {
     /// wholesale. False for the empty default graph (no retained bytes).
     #[inline]
     fn can_carry(&self) -> bool {
-        self.mmap.is_some()
+        self.backing.is_some()
     }
 
     /// The raw bytes of the record region, exactly as they appeared in this graph's
@@ -316,15 +342,37 @@ impl SerializedDepGraph {
     /// nodes are byte-for-byte what a fresh encode would produce, records superseded by
     /// a re-executed node are overridden by the appended record at the same index, and
     /// records of dropped nodes are tombstoned via the dead list in the footer.
+    /// The size in bytes of the record region, dead and superseded records included.
+    #[inline]
+    fn region_size(&self) -> u64 {
+        self.records_range.len() as u64
+    }
+
     #[inline]
     fn region_bytes(&self) -> &[u8] {
-        &self.mmap.as_ref().unwrap()[self.records_range.clone()]
+        &self.backing.as_ref().unwrap()[self.records_range.clone()]
     }
 
     /// The number of edges of the node at `index`, used for O(changed) footer accounting.
     #[inline]
     fn edge_count_for_index(&self, index: SerializedDepNodeIndex) -> usize {
         self.edge_list_indices[index].num_edges as usize
+    }
+
+    /// The size in bytes of the encoded record of the node at `index`: the fixed
+    /// header, the spilled edge count if the header could not hold it, and the edge
+    /// bytes. Used for O(changed) accounting of the live record bytes.
+    fn record_size_for_index(&self, index: SerializedDepNodeIndex) -> u64 {
+        let header = self.edge_list_indices[index];
+        let num_edges = header.num_edges;
+        let spill = if num_edges as usize > SerializedNodeHeader::MAX_INLINE_LEN {
+            leb128_u32_len(num_edges)
+        } else {
+            0
+        };
+        size_of::<SerializedNodeHeader>() as u64
+            + spill
+            + num_edges as u64 * header.bytes_per_index() as u64
     }
 
     /// Whether the node at `index` has a (live or superseded) record in the region.
@@ -335,11 +383,25 @@ impl SerializedDepGraph {
         self.nodes[index].kind != DepKind::Null
     }
 
-    /// Attaches the retained file bytes decoded by [`Self::decode`], enabling the
-    /// carry of this graph's record region into the next session's file.
+    /// Attaches the file bytes decoded by [`Self::decode`], serving the edge lists in
+    /// place and enabling the carry of the record region into the next session's file.
+    ///
+    /// On Windows the mapping must not outlive the load, since the save later replaces
+    /// the mapped file by renaming over it, so the bytes are copied out instead.
     pub fn attach_mmap(&mut self, mmap: Mmap) {
-        self.mmap = Some(mmap);
+        if cfg!(windows) {
+            self.backing = Some(Backing::Owned(mmap.to_vec()));
+        } else {
+            self.backing = Some(Backing::Mapped(mmap));
+        }
     }
+}
+
+/// The encoded length of `value` as unsigned leb128, matching what
+/// [`rustc_serialize::leb128`] writes for a `u32`.
+#[inline]
+fn leb128_u32_len(value: u32) -> u64 {
+    (31 - (value | 1).leading_zeros() as u64) / 7 + 1
 }
 
 /// A packed representation of an edge's start index and byte width.
@@ -402,7 +464,7 @@ impl SerializedDepGraph {
         // The footer between the records and the fixed-size tail: the dead list, the
         // per-kind live counts, the session count and the carried generation count.
         // Read it up front, as decoding the records requires the dead set.
-        let (dead, dead_set, kind_stats, session_count, generation) =
+        let (dead, dead_set, kind_stats, session_count, generation, live_record_bytes) =
             d.with_position(dead_pos, |d| {
                 let dead_len = d.read_u64() as usize;
                 let mut dead = Vec::with_capacity(dead_len);
@@ -416,13 +478,9 @@ impl SerializedDepGraph {
                     (0..(DepKind::MAX + 1)).map(|_| d.read_u32()).collect();
                 let session_count = d.read_u64();
                 let generation = d.read_u64();
-                (dead, dead_set, kind_stats, session_count, generation)
+                let live_record_bytes = d.read_u64();
+                (dead, dead_set, kind_stats, session_count, generation, live_record_bytes)
             });
-
-        // The record region may contain more than `node_count` records: dead records
-        // and superseded ones (a later record at the same index overrides an earlier
-        // one). This makes the capacity estimate below overshoot slightly more.
-        let graph_bytes = dead_pos - records_start;
 
         let mut nodes = IndexVec::from_elem_n(
             DepNode {
@@ -434,18 +492,6 @@ impl SerializedDepGraph {
         let mut value_fingerprints = IndexVec::from_elem_n(Fingerprint::ZERO, node_max);
         let mut edge_list_indices =
             IndexVec::from_elem_n(EdgeHeader { repr: 0, num_edges: 0 }, node_max);
-
-        // This estimation assumes that all of the encoded bytes are for the edge lists or for the
-        // fixed-size node headers. But that's not necessarily true; if any edge list has a length
-        // that spills out of the size we can bit-pack into SerializedNodeHeader then some of the
-        // total serialized size is also used by leb128-encoded edge list lengths. Neglecting that
-        // contribution to graph_bytes means our estimation of the bytes needed for edge_list_data
-        // slightly overshoots. But it cannot overshoot by much; consider that the worse case is
-        // for a node with length 64, which means the spilled 1-byte leb128 length is 1 byte of at
-        // least (34 byte header + 1 byte len + 64 bytes edge data), which is ~1%. A 2-byte leb128
-        // length is about the same fractional overhead and it amortizes for yet greater lengths.
-        let mut edge_list_data =
-            Vec::with_capacity(graph_bytes - node_count * size_of::<SerializedNodeHeader>());
 
         while d.position() < dead_pos {
             // Decode the header for this edge; the header packs together as many of the fixed-size
@@ -459,14 +505,16 @@ impl SerializedDepGraph {
             let num_edges = node_header.len().unwrap_or_else(|| d.read_u32());
 
             // The edges index list uses the same varint strategy as rmeta tables; we select the
-            // number of byte elements per-array not per-element. This lets us read the whole edge
-            // list for a node with one decoder call and also use the on-disk format in memory.
+            // number of byte elements per-array not per-element. The edge bytes are not copied
+            // anywhere: they are later read in place from the retained file bytes, so decoding
+            // only records where they start and skips over them.
+            let edges_start = d.position();
             let edges_len_bytes = node_header.bytes_per_index() * (num_edges as usize);
+            d.read_raw_bytes(edges_len_bytes);
 
             // A dead record: the node was dropped by an earlier session but its bytes were
             // carried along in the region. Skip it; its slot stays `Null`.
             if dead_set.contains(index) {
-                d.read_raw_bytes(edges_len_bytes);
                 continue;
             }
 
@@ -484,20 +532,8 @@ impl SerializedDepGraph {
 
             value_fingerprints[index] = node_header.value_fingerprint();
 
-            // The in-memory structure for the edges list stores the byte width of the edges on
-            // this node with the offset into the global edge data array. On an override the
-            // earlier record's edge bytes are simply orphaned in `edge_list_data`.
-            let edges_header = node_header.edges_header(&edge_list_data, num_edges);
-
-            edge_list_data.extend(d.read_raw_bytes(edges_len_bytes));
-
-            edge_list_indices[index] = edges_header;
+            edge_list_indices[index] = node_header.edges_header(edges_start, num_edges);
         }
-
-        // When we access the edge list data, we do a fixed-size read from the edge list data then
-        // mask off the bytes that aren't for that edge index, so the last read may dangle off the
-        // end of the array. This padding ensure it doesn't.
-        edge_list_data.extend(&[0u8; DEP_NODE_PAD]);
 
         // Lay out the per-kind live counts (read from the footer above) as contiguous
         // ranges for the counting sort of `LazyNodeIndex`.
@@ -533,17 +569,17 @@ impl SerializedDepGraph {
             nodes,
             value_fingerprints,
             edge_list_indices,
-            edge_list_data,
             reverse_index,
             session_count,
             generation,
             // The retained file bytes are attached by the caller via `attach_mmap`.
-            mmap: None,
+            backing: None,
             records_range: records_start..dead_pos,
             dead,
             kind_stats,
             live_node_count: node_count as u64,
             live_edge_count: edge_count as u64,
+            live_record_bytes,
             profiler: Some(profiler.clone()),
         })
     }
@@ -681,9 +717,9 @@ impl SerializedNodeHeader {
     }
 
     #[inline]
-    fn edges_header(&self, edge_list_data: &[u8], num_edges: u32) -> EdgeHeader {
+    fn edges_header(&self, edges_start: usize, num_edges: u32) -> EdgeHeader {
         EdgeHeader {
-            repr: (edge_list_data.len() << DEP_NODE_WIDTH_BITS) | (self.bytes_per_index() - 1),
+            repr: (edges_start << DEP_NODE_WIDTH_BITS) | (self.bytes_per_index() - 1),
             num_edges,
         }
     }
@@ -777,6 +813,9 @@ struct LocalEncoderState {
     /// Net change to the live edge count from this worker's appends. An override
     /// contributes the difference between its new and old edge counts.
     edge_count: i64,
+    /// Net change to the live record bytes from this worker's appends. An override
+    /// contributes the difference between its new and old record sizes.
+    record_bytes: i64,
     /// Indices below `first_new_index` this worker appended records for. Those appends
     /// override the carried record at the same index; anything occupied, not overridden
     /// and not marked green by the end of the session is dead.
@@ -791,6 +830,7 @@ struct LocalEncoderResult {
     node_max: u32,
     node_count: i64,
     edge_count: i64,
+    record_bytes: i64,
     overridden: Vec<SerializedDepNodeIndex>,
 
     /// Stores the net change to the number of live nodes of each dep kind.
@@ -847,6 +887,7 @@ impl EncoderState {
                     remaining_node_index: 0,
                     edge_count: 0,
                     node_count: 0,
+                    record_bytes: 0,
                     overridden: Vec::new(),
                     encoder: MemEncoder::new(),
                     kind_stats: iter::repeat_n(0, DepKind::MAX as usize + 1).collect(),
@@ -946,7 +987,9 @@ impl EncoderState {
         retained_graph: &Option<Lock<RetainedDepGraph>>,
         local: &mut LocalEncoderState,
     ) {
+        let before = local.encoder.position();
         node.encode(&mut local.encoder, index);
+        local.record_bytes += (local.encoder.position() - before) as i64;
         self.flush_mem_encoder(&mut *local);
         self.count_node(&mut *local);
         self.record(&node.node, index, node.edges.len(), &node.edges, retained_graph, &mut *local);
@@ -969,8 +1012,10 @@ impl EncoderState {
     ) {
         let node = self.previous.index_to_node(prev_index);
         let value_fingerprint = self.previous.value_fingerprint_for_index(prev_index);
+        let before = local.encoder.position();
         let edge_count =
             NodeInfo::encode_promoted(&mut local.encoder, node, index, value_fingerprint, edges);
+        local.record_bytes += (local.encoder.position() - before) as i64;
         self.flush_mem_encoder(&mut *local);
         self.count_node(&mut *local);
         self.record(node, index, edge_count, edges, retained_graph, &mut *local);
@@ -991,6 +1036,7 @@ impl EncoderState {
         local.node_count -= 1;
         local.kind_stats[kind.as_usize()] -= 1;
         local.edge_count -= self.previous.edge_count_for_index(prev_index) as i64;
+        local.record_bytes -= self.previous.record_size_for_index(prev_index) as i64;
         local.overridden.push(prev_index);
     }
 
@@ -1017,6 +1063,7 @@ impl EncoderState {
                 node_max: local.next_node_index,
                 node_count: local.node_count,
                 edge_count: local.edge_count,
+                record_bytes: local.record_bytes,
                 overridden: mem::take(&mut local.overridden),
             }
         });
@@ -1026,14 +1073,16 @@ impl EncoderState {
         // Every count starts from the previous footer when carrying (the region already
         // holds those nodes) and from zero when writing a fresh file; the workers report
         // net changes in either case.
-        let (mut kind_stats, mut node_count, mut edge_count) = if self.carrying {
+        let (mut kind_stats, mut node_count, mut edge_count, mut record_bytes) = if self.carrying
+        {
             (
                 self.previous.kind_stats.clone(),
                 self.previous.live_node_count as i64,
                 self.previous.live_edge_count as i64,
+                self.previous.live_record_bytes as i64,
             )
         } else {
-            (iter::repeat_n(0, DepKind::MAX as usize + 1).collect(), 0, 0)
+            (iter::repeat_n(0, DepKind::MAX as usize + 1).collect(), 0, 0, 0)
         };
 
         let mut node_max = 0;
@@ -1043,6 +1092,7 @@ impl EncoderState {
             node_max = max(node_max, result.node_max);
             node_count += result.node_count;
             edge_count += result.edge_count;
+            record_bytes += result.record_bytes;
             for (i, stat) in result.kind_stats.iter().enumerate() {
                 // The per-worker values are net changes: an override decrements the kind
                 // it previously incremented, so the sum stays balanced per worker and the
@@ -1079,6 +1129,7 @@ impl EncoderState {
                     kind_stats[kind.as_usize()] -= 1;
                     node_count -= 1;
                     edge_count -= self.previous.edge_count_for_index(index) as i64;
+                    record_bytes -= self.previous.record_size_for_index(index) as i64;
                 }
             }
         }
@@ -1099,6 +1150,7 @@ impl EncoderState {
 
         self.previous.session_count.checked_add(1).unwrap().encode(&mut encoder);
         generation.encode(&mut encoder);
+        u64::try_from(record_bytes).unwrap().encode(&mut encoder);
 
         debug!(?node_max, ?node_count, ?edge_count);
         debug!("position: {:?}", encoder.position());
@@ -1186,10 +1238,18 @@ pub(crate) struct GraphEncoder {
     retained_graph: Option<Lock<RetainedDepGraph>>,
 }
 
-/// After this many consecutive carried generations, write a fresh file instead. Each
-/// carried generation leaves behind dead records, superseded records and their orphaned
-/// index slots; a compacting rewrite reclaims all of it.
-const MAX_CARRIED_GENERATIONS: u64 = 8;
+/// After this many consecutive carried generations, write a fresh file instead even if
+/// the dead-byte ratio has not tripped, bounding the growth of orphaned index slots
+/// (which the ratio does not measure). Each carried generation leaves behind dead
+/// records, superseded records and their orphaned index slots; a compacting rewrite
+/// reclaims all of it.
+const MAX_CARRIED_GENERATIONS: u64 = 16;
+
+/// Write a fresh file once the record region exceeds this multiple of its live record
+/// bytes. Dead and superseded records make decoding and the wholesale region copy
+/// proportionally more expensive, so this bounds that overhead at a fixed factor while
+/// letting low-churn graphs carry for many generations.
+const MAX_REGION_GROWTH: u64 = 2;
 
 impl GraphEncoder {
     pub(crate) fn new(
@@ -1211,7 +1271,8 @@ impl GraphEncoder {
         let carrying = previous.can_carry()
             && retained_graph.is_none()
             && !record_stats
-            && previous.generation + 1 < MAX_CARRIED_GENERATIONS;
+            && previous.generation + 1 < MAX_CARRIED_GENERATIONS
+            && previous.region_size() <= MAX_REGION_GROWTH * previous.live_record_bytes;
         let status = EncoderState::new(encoder, record_stats, previous, carrying);
         GraphEncoder { status, retained_graph, profiler: sess.prof.clone() }
     }
