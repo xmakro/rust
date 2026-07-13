@@ -611,11 +611,18 @@ fn get_flow_results<'a, 'tcx>(
 ) -> Results<'tcx, Borrowck<'a, 'tcx>> {
     // We compute these three analyses individually, but them combine them into
     // a single results so that `mbcx` can visit them all together.
-    let borrows = Borrows::new(tcx, body, regioncx, borrow_set).iterate_to_fixpoint(
-        tcx,
-        body,
-        Some("borrowck"),
-    );
+    let borrows_analysis = Borrows::new(tcx, body, regioncx, borrow_set);
+    let borrows = if borrow_set.location_map().is_empty() {
+        // A body without borrows has an empty dataflow domain: every entry
+        // state is the bottom value, so skip running the fixpoint engine.
+        let bottom = borrows_analysis.bottom_value(body);
+        Results {
+            analysis: borrows_analysis,
+            entry_states: IndexVec::from_elem_n(bottom, body.basic_blocks.len()),
+        }
+    } else {
+        borrows_analysis.iterate_to_fixpoint(tcx, body, Some("borrowck"))
+    };
     let uninits = MaybeUninitializedPlaces::new(tcx, body, move_data).iterate_to_fixpoint(
         tcx,
         body,
