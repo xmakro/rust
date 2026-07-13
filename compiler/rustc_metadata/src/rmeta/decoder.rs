@@ -277,14 +277,10 @@ impl<'a> MetaDecoder for &'a MetadataBlob {
 
     fn decoder(self, pos: usize) -> Self::Context {
         BlobDecodeContext {
-            // FIXME: This unwrap should never panic because we check that it won't when creating
-            // `MetadataBlob`. Ideally we'd just have a `MetadataDecoder` and hand out subslices of
-            // it as we do elsewhere in the compiler using `MetadataDecoder::split_at`. But we own
-            // the data for the decoder so holding onto the `MemDecoder` too would make us a
-            // self-referential struct which is downright goofy because `MetadataBlob` is already
-            // self-referential. Probably `MemDecoder` should contain an `OwnedSlice`, but that
-            // demands a significant refactoring due to our crate graph.
-            opaque: MemDecoder::new(self, pos).unwrap(),
+            // The blob passed full `MemDecoder` validation when the
+            // `MetadataBlob` was created, so skip re-validating the magic
+            // suffix here: this runs for every lazily-decoded item.
+            opaque: MemDecoder::new_prevalidated(self, pos),
             lazy_state: LazyState::NoNode,
             blob: self.blob(),
         }

@@ -293,6 +293,18 @@ impl<'a> MemDecoder<'a> {
         Ok(MemDecoder { start, current: data[position..].as_ptr(), end, _marker: PhantomData })
     }
 
+    /// Like [`MemDecoder::new`], but skips re-validating the `MAGIC_END_BYTES`
+    /// suffix. Callers must have validated `data` before (e.g. with a prior
+    /// successful `MemDecoder::new`); this is worthwhile because a decoder is
+    /// constructed for every lazily-decoded metadata item.
+    #[inline]
+    pub fn new_prevalidated(data: &'a [u8], position: usize) -> MemDecoder<'a> {
+        debug_assert!(data.ends_with(MAGIC_END_BYTES));
+        let data = &data[..data.len() - MAGIC_END_BYTES.len()];
+        let Range { start, end } = data.as_ptr_range();
+        MemDecoder { start, current: data[position..].as_ptr(), end, _marker: PhantomData }
+    }
+
     #[inline]
     pub fn split_at(&self, position: usize) -> MemDecoder<'a> {
         assert!(position <= self.len());
