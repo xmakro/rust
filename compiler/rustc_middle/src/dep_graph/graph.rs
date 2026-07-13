@@ -937,16 +937,96 @@ impl DepGraphData {
                 // in the previous compilation session too, so we can try to
                 // mark it as green by recursively marking all of its
                 // dependencies green.
-
-                // Reuse a per-worker buffer for the edges instead of allocating one per call.
-                // The recursion gives it back empty: each `EdgeFrame` pops its edges on drop.
-                let mut edge_buf = self.green_edge_buf.take();
-                let result = self.try_mark_previous_green(tcx, prev_index, None, &mut edge_buf);
-                debug_assert!(edge_buf.is_empty());
-                self.green_edge_buf.set(edge_buf);
+                let result = if self.current.encoder.is_carrying() {
+                    // The carried record region already contains this node's record, so
+                    // promoting it needs no edge list: verify the dependencies without
+                    // collecting their indices.
+                    self.try_mark_previous_green_carried(tcx, prev_index, None)
+                } else {
+                    // Reuse a per-worker buffer for the edges instead of allocating one per
+                    // call. The recursion gives it back empty: each `EdgeFrame` pops its
+                    // edges on drop.
+                    let mut edge_buf = self.green_edge_buf.take();
+                    let result = self.try_mark_previous_green(tcx, prev_index, None, &mut edge_buf);
+                    debug_assert!(edge_buf.is_empty());
+                    self.green_edge_buf.set(edge_buf);
+                    result
+                };
                 result.map(|dep_node_index| (prev_index, dep_node_index))
             }
         }
+    }
+
+    /// Try to mark a dep-node which existed in the previous compilation session as green,
+    /// without collecting its edges. Used when the record region is carried forward: the
+    /// node's record is already in the new file, so all promotion needs is the color-map
+    /// insert, and the edge indices (which equal the previous ones) are never materialized.
+    #[instrument(skip(self, tcx, prev_dep_node_index, frame), level = "debug")]
+    fn try_mark_previous_green_carried<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        prev_dep_node_index: SerializedDepNodeIndex,
+        frame: Option<&MarkFrame<'_>>,
+    ) -> Option<DepNodeIndex> {
+        let frame = MarkFrame { index: prev_dep_node_index, parent: frame };
+
+        // We never try to mark eval_always nodes as green
+        debug_assert!(!tcx.is_eval_always(self.previous.index_to_node(prev_dep_node_index).kind));
+
+        for parent_dep_node_index in self.previous.edge_targets_from(prev_dep_node_index) {
+            match self.colors.get(parent_dep_node_index) {
+                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Red => return None,
+                DepNodeColor::Unknown => {}
+            }
+
+            let parent_dep_node = self.previous.index_to_node(parent_dep_node_index);
+
+            // If this dependency isn't eval_always, try to mark it green recursively.
+            if !tcx.is_eval_always(parent_dep_node.kind)
+                && self
+                    .try_mark_previous_green_carried(tcx, parent_dep_node_index, Some(&frame))
+                    .is_some()
+            {
+                continue;
+            }
+
+            // We failed to mark it green, so we try to force the query.
+            if !tcx.try_force_from_dep_node(*parent_dep_node, parent_dep_node_index, &frame) {
+                return None;
+            }
+
+            match self.colors.get(parent_dep_node_index) {
+                DepNodeColor::Green(_) => continue,
+                DepNodeColor::Red => return None,
+                DepNodeColor::Unknown => {}
+            }
+
+            if tcx.dcx().has_errors_or_delayed_bugs().is_none() {
+                panic!("try_mark_previous_green_carried() - forcing failed to set a color");
+            }
+
+            // A forced query that errored leaves the color unset; give up like the
+            // collecting walk does and rely on the cache not being persisted.
+            return None;
+        }
+
+        // All dependencies are green: promote this node with just the color-map insert.
+        // `no_hash` nodes may fail this promotion due to already being conservatively
+        // colored red.
+        let dep_node_index = self.current.encoder.send_promoted_carried(
+            prev_dep_node_index,
+            &self.colors,
+        )?;
+
+        #[cfg(debug_assertions)]
+        self.current.record_edge(
+            dep_node_index,
+            *self.previous.index_to_node(prev_dep_node_index),
+            self.previous.value_fingerprint_for_index(prev_dep_node_index),
+        );
+
+        Some(dep_node_index)
     }
 
     /// Try to mark a dep-node which existed in the previous compilation session as green.

@@ -1220,6 +1220,34 @@ impl GraphEncoder {
         self.retained_graph.as_ref().map(|retained_graph| retained_graph.lock().clone())
     }
 
+    /// Whether this session carries the previous record region forward. When true,
+    /// promoting a node from the previous graph needs no edge list, so the marking
+    /// walk can skip collecting edge indices entirely.
+    #[inline]
+    pub(crate) fn is_carrying(&self) -> bool {
+        self.status.carrying
+    }
+
+    /// Marks a node promoted from the previous graph green without materializing its
+    /// edges. Only valid when carrying: the node's record is already in the new file.
+    ///
+    /// Returns Some if the node is now green, or None if it had already been
+    /// concurrently marked red.
+    #[inline]
+    pub(crate) fn send_promoted_carried(
+        &self,
+        prev_index: SerializedDepNodeIndex,
+        colors: &DepNodeColorMap,
+    ) -> Option<DepNodeIndex> {
+        debug_assert!(self.status.carrying);
+        let index = DepNodeIndex::from_u32(prev_index.as_u32());
+        match colors.try_set_color(prev_index, DesiredColor::Green { index }) {
+            TrySetColorResult::Success => Some(index),
+            TrySetColorResult::AlreadyRed => None,
+            TrySetColorResult::AlreadyGreen { index } => Some(index),
+        }
+    }
+
     /// Encodes a node that does not exists in the previous graph.
     pub(crate) fn send_new(
         &self,
