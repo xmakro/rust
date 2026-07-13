@@ -54,7 +54,7 @@ use rustc_middle::ty::adjustment::{
     PointerCoercion,
 };
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized};
 use rustc_span::{BytePos, DUMMY_SP, Span};
 use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::solve::inspect::{self, InferCtxtProofTreeExt, ProofTreeVisitor};
@@ -264,6 +264,29 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         // ultimately fall back to some form of subtyping.
         if a.is_ty_var() {
             return self.coerce_from_inference_variable(a, b);
+        }
+
+        // Fast path: identical types need no coercion, modulo three excluded
+        // classes. Without this, an exact-match coercion — every argument,
+        // assignment or return whose value already has the target type, i.e.
+        // the common case — pays for a snapshot plus a failed `CoerceUnsized`
+        // selection below, all to produce zero adjustments. Like the
+        // equivalent fast path on the LUB path, this skips vacuous `'r: 'r`
+        // region relations. Excluded are: references, because even an
+        // identical-type reference coercion inserts a reborrow adjustment
+        // that borrow checking depends on; anything containing a trait
+        // object, because `dyn Trait` unsizes to itself, so an identical-type
+        // coercion can legitimately record an unsize adjustment (which
+        // diagnostics also rely on); type parameters, which can do the same
+        // through a `CoerceUnsized` bound; and opaque types, so they still
+        // get registered by the relation machinery.
+        if a == b
+            && !matches!(a.kind(), ty::Ref(..))
+            && !a.has_type_flags(
+                TypeFlags::HAS_TY_DYN | TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_TY_OPAQUE,
+            )
+        {
+            return success(vec![], b, PredicateObligations::new());
         }
 
         // Consider coercing the subtype to a DST
