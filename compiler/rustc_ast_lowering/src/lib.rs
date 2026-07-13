@@ -103,6 +103,9 @@ pub fn provide(providers: &mut Providers) {
 struct LoweringContext<'a, 'hir> {
     tcx: TyCtxt<'hir>,
     resolver: &'a ResolverAstLowering<'hir>,
+    /// Whether spans should be parented to their owner; snapshotted from the
+    /// session so the per-span check doesn't re-read the options.
+    is_incremental: bool,
     current_disambiguator: PerParentDisambiguatorState,
 
     /// Used to allocate HIR nodes.
@@ -190,6 +193,7 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         Self {
             tcx,
             resolver,
+            is_incremental: tcx.sess.opts.incremental.is_some(),
             current_disambiguator,
             owner: current_ast_owner,
             arena: tcx.hir_arena,
@@ -930,7 +934,9 @@ impl<'hir> LoweringContext<'_, 'hir> {
             self.children.insert(def_id, hir::MaybeOwner::NonOwner(hir_id));
         }
 
-        if let Some(traits) = self.owner.trait_map.get(&ast_node_id) {
+        if !self.owner.trait_map.is_empty()
+            && let Some(traits) = self.owner.trait_map.get(&ast_node_id)
+        {
             self.trait_map.insert(hir_id.local_id, *traits);
         }
 
@@ -1042,6 +1048,11 @@ impl<'hir> LoweringContext<'_, 'hir> {
     /// Intercept all spans entering HIR.
     /// Mark a span as relative to the current owning item.
     fn lower_span(&self, span: Span) -> Span {
+        // In non-incremental builds span lowering is the identity; avoid
+        // re-reading the session options and building the lowerer per span.
+        if !self.is_incremental {
+            return span;
+        }
         self.span_lowerer().lower(span)
     }
 

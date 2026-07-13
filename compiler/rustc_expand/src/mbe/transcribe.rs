@@ -186,7 +186,10 @@ pub(super) fn transcribe<'a>(
             src_span,
             DelimSpacing::new(Spacing::Alone, Spacing::Alone)
         )],
-        result: Vec::new(),
+        // The output typically contains at least one token tree per template
+        // token tree, so the template length is a cheap capacity estimate
+        // that avoids the initial growth ladder of the result buffer.
+        result: Vec::with_capacity(src.tts.len()),
         result_stack: Vec::new(),
     };
 

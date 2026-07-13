@@ -50,14 +50,20 @@ impl<'tcx, T: LateLintPass<'tcx>> LateContextAndPass<'tcx, T> {
         let attrs = self.context.tcx.hir_attrs(id);
         let prev = self.context.last_node_with_lint_attrs;
         self.context.last_node_with_lint_attrs = id;
-        debug!("late context: enter_attrs({:?})", attrs);
-        lint_callback!(self, check_attributes, attrs);
-        for attr in attrs {
-            lint_callback!(self, check_attribute, attr);
+        // Skip the attribute callbacks entirely for the (overwhelmingly
+        // common) attribute-less nodes; they are no-ops on an empty slice.
+        if attrs.is_empty() {
+            f(self);
+        } else {
+            debug!("late context: enter_attrs({:?})", attrs);
+            lint_callback!(self, check_attributes, attrs);
+            for attr in attrs {
+                lint_callback!(self, check_attribute, attr);
+            }
+            f(self);
+            debug!("late context: exit_attrs({:?})", attrs);
+            lint_callback!(self, check_attributes_post, attrs);
         }
-        f(self);
-        debug!("late context: exit_attrs({:?})", attrs);
-        lint_callback!(self, check_attributes_post, attrs);
         self.context.last_node_with_lint_attrs = prev;
     }
 

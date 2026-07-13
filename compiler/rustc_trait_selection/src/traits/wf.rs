@@ -580,6 +580,12 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         }
 
         let predicates = self.tcx().predicates_of(def_id);
+        // Fast path: definitions with no predicates anywhere in their parent
+        // chain (most ADTs and functions) produce no obligations; skip the
+        // origin bookkeeping and instantiation entirely.
+        if predicates.predicates.is_empty() && predicates.parent.is_none() {
+            return Default::default();
+        }
         let mut origins = vec![def_id; predicates.predicates.len()];
         let mut head = predicates;
         while let Some(parent) = head.parent {

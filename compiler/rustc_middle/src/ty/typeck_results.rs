@@ -636,6 +636,10 @@ pub struct LocalTableInContext<'a, V> {
 }
 
 impl<'a, V> LocalTableInContext<'a, V> {
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     pub fn contains_key(&self, id: HirId) -> bool {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.data.contains_key(&id.local_id)
