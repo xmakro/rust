@@ -167,6 +167,14 @@ pub fn compute_implied_outlives_bounds_inner<'tcx>(
     Ok(outlives_bounds)
 }
 
+/// Whether `ty` contains the `bevy_ecs::ParamSet` type that the implied-bounds
+/// compat hack above applies to. Callers can use this to tell whether the
+/// `disable_implied_bounds_hack` flag can make any difference for a set of
+/// assumed-wf types.
+pub fn ty_contains_bevy_param_set<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    ty.visit_with(&mut ContainsBevyParamSet { tcx }).is_break()
+}
+
 struct ContainsBevyParamSet<'tcx> {
     tcx: TyCtxt<'tcx>,
 }

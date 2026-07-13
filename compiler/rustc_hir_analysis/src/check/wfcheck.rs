@@ -35,6 +35,7 @@ use rustc_trait_selection::traits::misc::{
     ConstParamTyImplementationError, type_allowed_to_implement_const_param_ty,
 };
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
+use rustc_trait_selection::traits::query::type_op::implied_outlives_bounds::ty_contains_bevy_param_set;
 use rustc_trait_selection::traits::{
     self, FulfillmentError, Obligation, ObligationCause, ObligationCauseCode, ObligationCtxt,
     WellFormedLoc,
@@ -183,7 +184,14 @@ where
     let assumed_wf_types = wfcx.ocx.assumed_wf_types_and_report_errors(param_env, body_def_id)?;
     debug!(?assumed_wf_types);
 
-    let infcx_compat = infcx.fork();
+    // The compat retry below can only change the outcome when the bevy
+    // `ParamSet` implied-bounds hack applies to one of the assumed-wf types;
+    // otherwise both outlives environments are identical. Only pay for the
+    // inference-context fork (a deep clone of all inference storage, once per
+    // WF-checked item) when the retry could matter.
+    let needs_compat_retry = !tcx.sess.opts.unstable_opts.no_implied_bounds_compat
+        && assumed_wf_types.iter().any(|&ty| ty_contains_bevy_param_set(tcx, ty));
+    let infcx_compat = needs_compat_retry.then(|| infcx.fork());
 
     // We specifically want to *disable* the implied bounds hack, first,
     // so we can detect when failures are due to bevy's implied bounds.
@@ -201,6 +209,10 @@ where
     if errors.is_empty() {
         return Ok(());
     }
+
+    let Some(infcx_compat) = infcx_compat else {
+        return Err(infcx.err_ctxt().report_region_errors(body_def_id, &errors));
+    };
 
     let outlives_env = OutlivesEnvironment::new_with_implied_bounds_compat(
         &infcx_compat,
