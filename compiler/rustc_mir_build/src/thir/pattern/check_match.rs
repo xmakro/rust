@@ -674,6 +674,18 @@ impl<'p, 'tcx> MatchVisitor<'p, 'tcx> {
     ) {
         let pattern_ty = pat.ty;
 
+        // Fast path: a bare binding or wildcard — the shape of almost every
+        // `let` statement and function parameter — is irrefutable for any
+        // type, so don't lower the pattern or run the usefulness engine on
+        // it. Anything nested (`x @ sub`, destructuring, constants) still
+        // runs the full analysis. The only per-pattern check from the full
+        // path that can apply to a bare binding is the binding-named-same-
+        // as-variant error, so run that directly.
+        if matches!(pat.kind, PatKind::Binding { subpattern: None, .. } | PatKind::Wild) {
+            check_for_bindings_named_same_as_variants(self, pat, Irrefutable);
+            return;
+        }
+
         let Ok((cx, report)) = self.analyze_binding(pat, Irrefutable, scrut) else { return };
         let witnesses = report.non_exhaustiveness_witnesses;
         if witnesses.is_empty() {
