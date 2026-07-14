@@ -242,6 +242,20 @@ pub(crate) fn eval_to_valtree<'tcx>(
     cid: GlobalId<'tcx>,
 ) -> EvalToValTreeResult<'tcx> {
     crate::assert_typing_mode(typing_env.typing_mode());
+
+    // Fast path: a trivial scalar constant of leaf type — e.g. a literal
+    // array length or const-generic argument, the most common type-level
+    // consts — would otherwise spin up two interpreter contexts (one to
+    // allocate and validate, one to read back) just to rebuild a value we
+    // already know. Build the leaf valtree directly.
+    if cid.promoted.is_none()
+        && let Some((mir::ConstValue::Scalar(Scalar::Int(int)), ty)) =
+            tcx.trivial_const(cid.instance.def_id())
+        && ty.is_primitive()
+    {
+        return Ok(ty::ValTree::from_scalar_int(tcx, int));
+    }
+
     let const_alloc = tcx.eval_to_allocation_raw(typing_env.as_query_input(cid))?;
 
     // FIXME Need to provide a span to `eval_to_valtree`

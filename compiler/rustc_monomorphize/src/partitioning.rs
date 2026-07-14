@@ -98,7 +98,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::sync::par_join;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir::LangItem;
@@ -216,6 +216,7 @@ where
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(cx.tcx);
     let cgu_name_cache = &mut UnordMap::default();
 
+    let mut inlined_memo = FxHashMap::default();
     for mono_item in mono_items {
         // Handle only root (GloballyShared) items directly here. Inlined (LocalCopy) items
         // are handled at the bottom of the loop based on reachability, with one exception.
@@ -264,7 +265,13 @@ where
         // external crates, and local functions the definition of which is
         // marked with `#[inline]`.
         let mut reachable_inlined_items = FxIndexSet::default();
-        get_reachable_inlined_items(cx.tcx, mono_item, cx.usage_map, &mut reachable_inlined_items);
+        get_reachable_inlined_items(
+            cx.tcx,
+            mono_item,
+            cx.usage_map,
+            &mut inlined_memo,
+            &mut reachable_inlined_items,
+        );
 
         // Add those inlined items. It's possible an inlined item is reachable
         // from multiple root items within a CGU, which is fine, it just means
@@ -301,14 +308,18 @@ where
         tcx: TyCtxt<'tcx>,
         item: MonoItem<'tcx>,
         usage_map: &UsageMap<'tcx>,
+        inlined_memo: &mut FxHashMap<MonoItem<'tcx>, bool>,
         visited: &mut FxIndexSet<MonoItem<'tcx>>,
     ) {
-        usage_map.for_each_inlined_used_item(tcx, item, |inlined_item| {
-            let is_new = visited.insert(inlined_item);
-            if is_new {
-                get_reachable_inlined_items(tcx, inlined_item, usage_map, visited);
-            }
-        });
+        let mut worklist = vec![item];
+        while let Some(item) = worklist.pop() {
+            usage_map.for_each_inlined_used_item(tcx, item, inlined_memo, |inlined_item| {
+                let is_new = visited.insert(inlined_item);
+                if is_new {
+                    worklist.push(inlined_item);
+                }
+            });
+        }
     }
 }
 
