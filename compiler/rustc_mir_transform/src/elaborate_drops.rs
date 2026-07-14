@@ -51,6 +51,18 @@ impl<'tcx> crate::MirPass<'tcx> for ElaborateDrops {
     #[instrument(level = "trace", skip(self, tcx, body))]
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         debug!("elaborate_drops({:?} @ {:?})", body.source, body.span);
+        // A body without `Drop` terminators has nothing to elaborate: the
+        // patch below could only ever come out empty. Skip the move-path
+        // construction and the two dataflow fixpoints, which are among the
+        // most expensive parts of the whole unoptimized pipeline, for the
+        // large class of drop-free bodies.
+        if !body
+            .basic_blocks
+            .iter()
+            .any(|block| matches!(block.terminator().kind, TerminatorKind::Drop { .. }))
+        {
+            return;
+        }
         // FIXME(#132279): This is used during the phase transition from analysis
         // to runtime, so we have to manually specify the correct typing mode.
         let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
