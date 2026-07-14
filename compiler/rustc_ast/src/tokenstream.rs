@@ -101,7 +101,7 @@ impl LazyAttrTokenStream {
 
     pub fn new_pending(
         start_token: (Token, Spacing),
-        cursor_snapshot: TokenCursor,
+        cursor_snapshot: FlatTokenCursor,
         num_calls: u32,
         break_last_token: u32,
         node_replacements: ThinVec<NodeReplacement>,
@@ -212,7 +212,7 @@ enum LazyAttrTokenStreamInner {
     // intermediate collection buffer to clone.
     Pending {
         start_token: (Token, Spacing),
-        cursor_snapshot: TokenCursor,
+        cursor_snapshot: FlatTokenCursor,
         num_calls: u32,
         break_last_token: u32,
         node_replacements: ThinVec<NodeReplacement>,
@@ -898,6 +898,177 @@ impl TokenTreeCursor {
     }
 }
 
+
+/// One entry of a [`FlatTokenCursor`]'s pre-flattened token buffer.
+///
+/// The buffer contains every token the tree-walking cursor would synthesize,
+/// in order, plus open/close entries for *skipped* invisible delimiters:
+/// those entries are filtered out by [`FlatTokenCursor::inlined_next`], but
+/// retaining them preserves the tree structure for tree-level lookahead and
+/// depth queries.
+#[derive(Clone, Copy, Debug)]
+pub struct FlatEntry {
+    pub token: Token,
+    pub spacing: Spacing,
+    /// The nesting depth this entry lives at. Open-delimiter entries carry
+    /// the *parent* depth, while the contents and the close-delimiter entry
+    /// carry the inner depth. This makes [`FlatTokenCursor::depth`] agree
+    /// with the `stack.len()` of the old tree-walking cursor at every point
+    /// in the token sequence.
+    pub depth: u32,
+}
+
+/// A linear cursor over a pre-flattened token stream, replacing the
+/// tree-walking `TokenCursor`: advancing is an index increment, lookahead is
+/// direct indexing, and cloning (for parser snapshots and lazy token stream
+/// replay) is two reference-count bumps.
+#[derive(Clone, Debug)]
+pub struct FlatTokenCursor {
+    pub entries: Arc<Vec<FlatEntry>>,
+    /// For every open-delimiter entry, the index of its matching
+    /// close-delimiter entry (zero for other entries). Lets the parser skip
+    /// a whole delimited sequence in one step.
+    pub matches: Arc<Vec<u32>>,
+    /// Index of the next entry to consume.
+    pub index: usize,
+}
+
+impl FlatTokenCursor {
+    pub fn new(stream: TokenStream) -> FlatTokenCursor {
+        let mut entries = Vec::new();
+        let mut matches = Vec::new();
+        // Iterative traversal; each stack element is the parent stream, the
+        // index of the tree *after* the `Delimited` we descended into, and
+        // the entry index of the open delimiter.
+        let mut stack: Vec<(TokenStream, usize, usize)> = Vec::new();
+        let mut stream = stream;
+        let mut i = 0;
+        loop {
+            if let Some(tree) = stream.get(i) {
+                i += 1;
+                match tree {
+                    &TokenTree::Token(token, spacing) => {
+                        debug_assert!(!token.kind.is_delim());
+                        entries.push(FlatEntry { token, spacing, depth: stack.len() as u32 });
+                        matches.push(0);
+                    }
+                    &TokenTree::Delimited(sp, spacing, delim, ref tts) => {
+                        let open_idx = entries.len();
+                        entries.push(FlatEntry {
+                            token: Token::new(delim.as_open_token_kind(), sp.open),
+                            spacing: spacing.open,
+                            depth: stack.len() as u32,
+                        });
+                        matches.push(0);
+                        let tts = tts.clone();
+                        stack.push((mem::replace(&mut stream, tts), i, open_idx));
+                        i = 0;
+                    }
+                }
+            } else if let Some((parent, parent_i, open_idx)) = stack.pop() {
+                let Some(&TokenTree::Delimited(sp, spacing, delim, _)) = parent.get(parent_i - 1)
+                else {
+                    unreachable!("parent tree should be Delimited")
+                };
+                matches[open_idx] = entries.len() as u32;
+                entries.push(FlatEntry {
+                    token: Token::new(delim.as_close_token_kind(), sp.close),
+                    spacing: spacing.close,
+                    depth: stack.len() as u32 + 1,
+                });
+                matches.push(0);
+                stream = parent;
+                i = parent_i;
+            } else {
+                break;
+            }
+        }
+        FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0 }
+    }
+
+    pub fn next(&mut self) -> (Token, Spacing) {
+        self.inlined_next()
+    }
+
+    /// This always-inlined version should only be used on hot code paths.
+    #[inline(always)]
+    pub fn inlined_next(&mut self) -> (Token, Spacing) {
+        while let Some(entry) = self.entries.get(self.index) {
+            self.index += 1;
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                continue;
+            }
+            return (entry.token, entry.spacing);
+        }
+        // We have exhausted the token stream. The use of `Spacing::Alone` is
+        // arbitrary and immaterial, because the `Eof` token's spacing is
+        // never used.
+        (Token::new(token::Eof, DUMMY_SP), Spacing::Alone)
+    }
+
+    /// The nesting depth at the current position. Agrees with the
+    /// `stack.len()` of the old tree-walking cursor.
+    pub fn depth(&self) -> usize {
+        self.entries.get(self.index).map_or(0, |e| e.depth as usize)
+    }
+
+    /// The `dist`-th (one-based) upcoming token, not counting skipped
+    /// invisible delimiters, without consuming anything. Returns `Eof` past
+    /// the end of the stream.
+    pub fn peek(&self, dist: usize) -> Token {
+        debug_assert!(dist >= 1);
+        let mut remaining = dist;
+        for entry in self.entries[self.index.min(self.entries.len())..].iter() {
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                continue;
+            }
+            remaining -= 1;
+            if remaining == 0 {
+                return entry.token;
+            }
+        }
+        Token::new(token::Eof, DUMMY_SP)
+    }
+
+    /// The delimiter of the innermost delimited sequence containing the
+    /// current position, or `None` in the outermost stream.
+    pub fn enclosing_delimiter(&self) -> Option<Delimiter> {
+        let mut rel = 0usize;
+        for entry in self.entries[self.index.min(self.entries.len())..].iter() {
+            if entry.token.kind.open_delim().is_some() {
+                rel += 1;
+            } else if let Some(delim) = entry.token.kind.close_delim() {
+                if rel == 0 {
+                    return Some(delim);
+                }
+                rel -= 1;
+            }
+        }
+        None
+    }
+
+    /// The entry index of the next entry (skipping skipped invisible
+    /// delimiters), i.e. the entry that the next call to `inlined_next`
+    /// would yield. Returns the buffer length at the end of the stream.
+    pub fn next_entry_index(&self) -> usize {
+        let mut i = self.index;
+        while let Some(entry) = self.entries.get(i) {
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        i
+    }
+}
+
 /// A `TokenStream` cursor that produces `Token`s. It's a bit odd that
 /// we (a) lex tokens into a nice tree structure (`TokenStream`), and then (b)
 /// use this type to emit them as a linear sequence. But a linear sequence is
@@ -1013,7 +1184,7 @@ mod size_asserts {
     static_assert_size!(AttrTokenStream, 8);
     static_assert_size!(AttrTokenTree, 32);
     static_assert_size!(LazyAttrTokenStream, 8);
-    static_assert_size!(LazyAttrTokenStreamInner, 88);
+    static_assert_size!(LazyAttrTokenStreamInner, 72);
     static_assert_size!(Option<LazyAttrTokenStream>, 8); // must be small, used in many AST nodes
     static_assert_size!(TokenStream, 8);
     static_assert_size!(TokenTree, 32);

@@ -3,7 +3,7 @@ use std::mem;
 
 use rustc_ast::token::Token;
 use rustc_ast::tokenstream::{
-    AttrsTarget, LazyAttrTokenStream, NodeRange, ParserRange, Spacing, TokenCursor,
+    AttrsTarget, LazyAttrTokenStream, NodeRange, ParserRange, Spacing, FlatTokenCursor,
 };
 use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, HasTokens};
 use rustc_data_structures::fx::FxHashSet;
@@ -19,7 +19,7 @@ use super::{Capturing, ForceCollect, Parser, Trailing};
 #[derive(Clone, Debug)]
 pub(super) struct CollectPos {
     start_token: (Token, Spacing),
-    cursor_snapshot: TokenCursor,
+    cursor_snapshot: FlatTokenCursor,
     start_pos: u32,
 }
 
