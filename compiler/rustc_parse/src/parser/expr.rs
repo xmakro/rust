@@ -2523,7 +2523,7 @@ impl<'a> Parser<'a> {
         }
 
         if self.token == TokenKind::Semi
-            && let Some((Delimiter::Parenthesis, _)) = self.token_cursor.parent_delim_and_span()
+            && self.token_cursor.enclosing_delimiter() == Some(Delimiter::Parenthesis)
             && self.may_recover()
         {
             // It is likely that the closure body is a block but where the
