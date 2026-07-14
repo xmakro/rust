@@ -7,7 +7,6 @@ use ast::mut_visit::{self, MutVisitor};
 use ast::token::IdentIsRaw;
 use ast::{CoroutineKind, ForLoopKind, GenBlockKind, MatchKind, Pat, Path, PathSegment, Recovered};
 use rustc_ast::token::{self, Delimiter, InvisibleOrigin, MetaVarKind, Token, TokenKind};
-use rustc_ast::tokenstream::TokenTree;
 use rustc_ast::util::case::Case;
 use rustc_ast::util::classify;
 use rustc_ast::util::parser::{AssocOp, ExprPrecedence, Fixity, prec_let_scrutinee_needs_par};
@@ -1278,13 +1277,13 @@ impl<'a> Parser<'a> {
             None
         };
         let open_paren = self.token.span;
-        let call_depth = self.token_cursor.stack.len();
+        let call_depth = self.token_cursor.depth();
 
         let seq = match self.parse_expr_paren_seq() {
             Ok(args) => Ok(self.mk_expr(lo.to(self.prev_token.span), self.mk_call(fun, args))),
             Err(err)
                 if self.is_expected_raw_ref_mut()
-                    && self.token_cursor.stack.len() == call_depth =>
+                    && self.token_cursor.depth() == call_depth =>
             {
                 let guar = err.emit();
                 // Preserve the call expression so later passes can still diagnose the callee,
@@ -2511,8 +2510,7 @@ impl<'a> Parser<'a> {
         }
 
         if self.token == TokenKind::Semi
-            && let Some(last) = self.token_cursor.stack.last()
-            && let Some(TokenTree::Delimited(_, _, Delimiter::Parenthesis, _)) = last.curr()
+            && self.token_cursor.enclosing_delimiter() == Some(Delimiter::Parenthesis)
             && self.may_recover()
         {
             // It is likely that the closure body is a block but where the
