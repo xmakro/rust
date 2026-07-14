@@ -208,7 +208,7 @@
 use std::cell::OnceCell;
 use std::ops::ControlFlow;
 
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::sync::{Lock, par_for_each_in};
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
@@ -287,17 +287,25 @@ impl<'tcx> UsageMap<'tcx> {
     }
 
     /// Internally iterate over all inlined items used by `item`.
+    ///
+    /// `inlined_memo` caches `instantiation_mode` per item: it is a pure
+    /// function of the item, but it performs several query lookups, and an
+    /// inlined item reachable from N roots would otherwise recompute it N
+    /// times during partitioning.
     pub(crate) fn for_each_inlined_used_item<F>(
         &self,
         tcx: TyCtxt<'tcx>,
         item: MonoItem<'tcx>,
+        inlined_memo: &mut FxHashMap<MonoItem<'tcx>, bool>,
         mut f: F,
     ) where
         F: FnMut(MonoItem<'tcx>),
     {
         let used_items = self.used_map.get(&item).unwrap();
         for used_item in used_items.iter() {
-            let is_inlined = used_item.instantiation_mode(tcx) == InstantiationMode::LocalCopy;
+            let is_inlined = *inlined_memo.entry(*used_item).or_insert_with(|| {
+                used_item.instantiation_mode(tcx) == InstantiationMode::LocalCopy
+            });
             if is_inlined {
                 f(*used_item);
             }
