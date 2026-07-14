@@ -2357,6 +2357,13 @@ impl<'tcx> WfCheckingCtxt<'_, 'tcx> {
     #[instrument(level = "debug", skip(self))]
     fn check_false_global_bounds(&mut self) {
         let tcx = self.ocx.infcx.tcx;
+
+        // No predicates, no possible false global bound; skip building the
+        // elaborator. This is the case for most items.
+        if tcx.predicates_of(self.body_def_id).predicates.is_empty() {
+            return;
+        }
+
         let mut span = tcx.def_span(self.body_def_id);
         let empty_env = ty::ParamEnv::empty();
 
