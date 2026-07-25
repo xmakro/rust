@@ -1,7 +1,7 @@
 use diagnostics::make_errors_for_mismatched_closing_delims;
 use rustc_ast::ast::{self, AttrStyle};
 use rustc_ast::token::{self, CommentKind, Delimiter, IdentIsRaw, Token, TokenKind};
-use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::tokenstream::FlatTokenCursor;
 use rustc_ast::util::unicode::{TEXT_FLOW_CONTROL_CHARS, contains_text_flow_control_chars};
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, StashKey};
@@ -68,7 +68,7 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
     mut start_pos: BytePos,
     override_span: Option<Span>,
     strip_tokens: StripTokens,
-) -> Result<TokenStream, Vec<Diag<'psess>>> {
+) -> Result<FlatTokenCursor, Vec<Diag<'psess>>> {
     match strip_tokens {
         StripTokens::Shebang | StripTokens::ShebangAndFrontmatter => {
             if let Some(shebang_len) = rustc_lexer::strip_shebang(src) {
@@ -97,15 +97,20 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
         token: Token::dummy(),
         diag_info: TokenTreeDiagInfo::default(),
     };
-    let res = lexer.lex_token_trees(/* is_delimited */ false);
+    // Lexing produces the parser's flat token buffer directly; a token *tree*
+    // is only rebuilt from it for the few callers that need one. Pre-size the
+    // buffers with a rough tokens-per-byte estimate to avoid regrowth.
+    let mut entries = Vec::with_capacity(src.len() / 6 + 16);
+    let mut matches = Vec::with_capacity(src.len() / 6 + 16);
+    let res = lexer.lex_token_trees(/* is_delimited */ false, 0, &mut entries, &mut matches);
 
     let mut unmatched_closing_delims: Vec<_> =
         make_errors_for_mismatched_closing_delims(&lexer.diag_info.unmatched_delims, psess);
 
     match res {
-        Ok((_open_spacing, stream)) => {
+        Ok(_open_spacing) => {
             if unmatched_closing_delims.is_empty() {
-                Ok(stream)
+                Ok(FlatTokenCursor::from_parts(entries, matches))
             } else {
                 // Return error if there are unmatched delimiters or unclosed delimiters.
                 Err(unmatched_closing_delims)

@@ -1003,6 +1003,19 @@ impl FlatTokenCursor {
         FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0 }
     }
 
+    /// Assembles a cursor from a pre-built buffer, as produced directly by
+    /// the lexer.
+    pub fn from_parts(entries: Vec<FlatEntry>, matches: Vec<u32>) -> FlatTokenCursor {
+        FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0 }
+    }
+
+    /// Rebuilds the token *tree* for the whole buffer, for the few consumers
+    /// that need a `TokenStream` rather than a parser (e.g. the proc-macro
+    /// server's `from_str`).
+    pub fn to_token_stream(&self) -> TokenStream {
+        flat_range_to_stream(&self.entries, &self.matches, 0, self.entries.len())
+    }
+
     pub fn next(&mut self) -> (Token, Spacing) {
         self.inlined_next()
     }
@@ -1084,6 +1097,44 @@ impl FlatTokenCursor {
         }
         i
     }
+}
+
+/// Rebuilds the token tree for the buffer range `start..end`, which must lie
+/// entirely at one nesting level (delimited sequences fully contained).
+pub fn flat_range_to_stream(
+    entries: &[FlatEntry],
+    matches: &[u32],
+    start: usize,
+    end: usize,
+) -> TokenStream {
+    let mut trees = Vec::new();
+    let mut i = start;
+    while i < end {
+        let entry = &entries[i];
+        if entry.token.kind.open_delim().is_some() {
+            trees.push(flat_delimited_at(entries, matches, i));
+            i = matches[i] as usize + 1;
+        } else {
+            trees.push(TokenTree::Token(entry.token, entry.spacing));
+            i += 1;
+        }
+    }
+    TokenStream::new(trees)
+}
+
+/// Rebuilds the `TokenTree::Delimited` whose open delimiter lives at
+/// `open_idx` in the flat token buffer.
+pub fn flat_delimited_at(entries: &[FlatEntry], matches: &[u32], open_idx: usize) -> TokenTree {
+    let open = &entries[open_idx];
+    let close_idx = matches[open_idx] as usize;
+    let close = &entries[close_idx];
+    let delim = open.token.kind.open_delim().unwrap();
+    TokenTree::Delimited(
+        DelimSpan::from_pair(open.token.span, close.token.span),
+        DelimSpacing::new(open.spacing, close.spacing),
+        delim,
+        flat_range_to_stream(entries, matches, open_idx + 1, close_idx),
+    )
 }
 
 /// A `TokenStream` cursor that produces `Token`s. It's a bit odd that

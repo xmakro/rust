@@ -1,5 +1,5 @@
 use rustc_ast::token::{self, Delimiter, Token};
-use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
+use rustc_ast::tokenstream::{FlatEntry, Spacing};
 use rustc_ast_pretty::pprust::token_to_string;
 use rustc_errors::Diag;
 
@@ -9,44 +9,48 @@ use super::diagnostics::{
 use super::{Lexer, UnmatchedDelim};
 
 impl<'psess, 'src> Lexer<'psess, 'src> {
-    // Lex into a token stream. The `Spacing` in the result is that of the
-    // opening delimiter.
+    // Lex into a flat token buffer, appending to `entries`/`matches`. The
+    // returned `Spacing` is that of the opening delimiter. Delimited
+    // sequences are emitted as an open-delimiter entry, the contents, and a
+    // close-delimiter entry, with `matches[open]` pointing at the close;
+    // this produces exactly the buffer that `FlatTokenCursor::new` would
+    // build from the token *tree*, without materializing the tree.
+    //
+    // Depth bookkeeping matches `FlatTokenCursor`: an open-delimiter entry
+    // carries the *parent* depth, the contents and the close-delimiter entry
+    // carry the inner depth.
     pub(super) fn lex_token_trees(
         &mut self,
         is_delimited: bool,
-    ) -> Result<(Spacing, TokenStream), Diag<'psess>> {
+        depth: u32,
+        entries: &mut Vec<FlatEntry>,
+        matches: &mut Vec<u32>,
+    ) -> Result<Spacing, Diag<'psess>> {
         // Move past the opening delimiter.
         let open_spacing = self.bump_minimal();
 
-        let mut buf = Vec::new();
         loop {
             if let Some(delim) = self.token.kind.open_delim() {
                 // Invisible delimiters cannot occur here because `TokenTreesReader` parses
                 // code directly from strings, with no macro expansion involved.
                 debug_assert!(!matches!(delim, Delimiter::Invisible(_)));
-                buf.push(match self.lex_token_tree_open_delim(delim) {
-                    Ok(val) => val,
-                    Err(errs) => return Err(errs),
-                })
+                self.lex_token_tree_open_delim(delim, depth, entries, matches)?
             } else if let Some(delim) = self.token.kind.close_delim() {
                 // Invisible delimiters cannot occur here because `TokenTreesReader` parses
                 // code directly from strings, with no macro expansion involved.
                 debug_assert!(!matches!(delim, Delimiter::Invisible(_)));
                 return if is_delimited {
-                    Ok((open_spacing, TokenStream::new(buf)))
+                    Ok(open_spacing)
                 } else {
                     Err(self.close_delim_err(delim))
                 };
             } else if self.token.kind == token::Eof {
-                return if is_delimited {
-                    Err(self.eof_err())
-                } else {
-                    Ok((open_spacing, TokenStream::new(buf)))
-                };
+                return if is_delimited { Err(self.eof_err()) } else { Ok(open_spacing) };
             } else {
                 // Get the next normal token.
                 let (this_tok, this_spacing) = self.bump();
-                buf.push(TokenTree::Token(this_tok, this_spacing));
+                entries.push(FlatEntry { token: this_tok, spacing: this_spacing, depth });
+                matches.push(0);
             }
         }
     }
@@ -54,19 +58,33 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
     fn lex_token_tree_open_delim(
         &mut self,
         open_delim: Delimiter,
-    ) -> Result<TokenTree, Diag<'psess>> {
+        depth: u32,
+        entries: &mut Vec<FlatEntry>,
+        matches: &mut Vec<u32>,
+    ) -> Result<(), Diag<'psess>> {
         // The span for beginning of the delimited section.
         let pre_span = self.token.span;
 
         self.diag_info.open_delimiters.push((open_delim, self.token.span));
 
+        // Emit the open-delimiter entry. Its spacing is produced by the
+        // recursive call below (which bumps past the delimiter), so it is
+        // patched in afterwards.
+        let open_idx = entries.len();
+        entries.push(FlatEntry { token: self.token, spacing: Spacing::Alone, depth });
+        matches.push(0);
+
         // Lex the token trees within the delimiters.
         // We stop at any delimiter so we can try to recover if the user
         // uses an incorrect delimiter.
-        let (open_spacing, tts) = self.lex_token_trees(/* is_delimited */ true)?;
+        let open_spacing =
+            self.lex_token_trees(/* is_delimited */ true, depth + 1, entries, matches)?;
+        entries[open_idx].spacing = open_spacing;
 
-        // Expand to cover the entire delimited token tree.
-        let delim_span = DelimSpan::from_pair(pre_span, self.token.span);
+        // The close-delimiter entry gets this span even in recovery cases,
+        // mirroring `DelimSpan::from_pair(pre_span, self.token.span)` in the
+        // tree-building lexer.
+        let close_span = self.token.span;
         let sm = self.psess.source_map();
 
         let close_spacing = if let Some(close_delim) = self.token.kind.close_delim() {
@@ -75,7 +93,7 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
                 self.diag_info.open_delimiters.pop().unwrap();
                 let close_delimiter_span = self.token.span;
 
-                if tts.is_empty() && close_delim == Delimiter::Brace {
+                if entries.len() == open_idx + 1 && close_delim == Delimiter::Brace {
                     let empty_block_span = pre_span.to(close_delimiter_span);
                     if !sm.is_multiline(empty_block_span) {
                         // Only track if the block is in the form of `{}`, otherwise it is
@@ -148,9 +166,15 @@ impl<'psess, 'src> Lexer<'psess, 'src> {
             Spacing::Alone
         };
 
-        let spacing = DelimSpacing::new(open_spacing, close_spacing);
+        matches[open_idx] = entries.len() as u32;
+        entries.push(FlatEntry {
+            token: Token::new(open_delim.as_close_token_kind(), close_span),
+            spacing: close_spacing,
+            depth: depth + 1,
+        });
+        matches.push(0);
 
-        Ok(TokenTree::Delimited(delim_span, spacing, open_delim, tts))
+        Ok(())
     }
 
     // Move on to the next token, returning the current token and its spacing.
