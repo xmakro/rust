@@ -28,9 +28,11 @@ pub use path::PathStyle;
 use rustc_ast::token::{
     self, IdentIsRaw, InvisibleOrigin, MetaVarKind, NtExprKind, NtPatKind, Token, TokenKind,
 };
+use std::sync::Arc;
+
 use rustc_ast::tokenstream::{
-    self, DelimSpacing, DelimSpan, FlatTokenCursor, ParserRange, ParserReplacement, Spacing,
-    TokenStream, TokenTree,
+    DelimSpacing, DelimSpan, FlatTokenCursor, FlatTokenSlice, FlatTt, ParserRange,
+    ParserReplacement, Spacing, TokenStream, TokenTree,
 };
 use rustc_ast::util::case::Case;
 use rustc_ast::util::classify;
@@ -1424,6 +1426,13 @@ impl<'a> Parser<'a> {
 
     /// Parses a single token tree from the input.
     pub fn parse_token_tree(&mut self) -> TokenTree {
+        self.parse_token_tree_flat().to_token_tree()
+    }
+
+    /// Parses a single token tree from the input, in flat form: a delimited
+    /// group is captured as a slice of the token buffer (two refcount bumps)
+    /// rather than rebuilt as a tree. Used for `tt` metavariable capture.
+    pub fn parse_token_tree_flat(&mut self) -> FlatTt {
         if self.token.kind.open_delim().is_some() {
             // The current token is the open delimiter, so the entry that
             // produced it is the one just before the cursor position.
@@ -1432,13 +1441,14 @@ impl<'a> Parser<'a> {
             let close_idx = self.token_cursor.matches[open_idx] as usize;
             debug_assert_eq!(self.token_cursor.entries[open_idx].token, self.token);
 
-            // Rebuild the `TokenTree::Delimited` we are currently within.
-            // That's what we are going to return.
-            let tree = tokenstream::flat_delimited_at(
-                &self.token_cursor.entries,
-                &self.token_cursor.matches,
-                open_idx,
-            );
+            // The delimited group we are currently within is what we are
+            // going to return.
+            let slice = FlatTokenSlice {
+                entries: Arc::clone(&self.token_cursor.entries),
+                matches: Arc::clone(&self.token_cursor.matches),
+                start: open_idx as u32,
+                end: close_idx as u32 + 1,
+            };
 
             if let Capturing::No = self.capture_state.capturing {
                 // We are not capturing tokens, so skip to the end of the
@@ -1461,12 +1471,12 @@ impl<'a> Parser<'a> {
 
             // Consume close delimiter
             self.bump();
-            tree
+            FlatTt::Slice(slice)
         } else {
             assert!(!self.token.kind.is_close_delim_or_eof());
             let prev_spacing = self.token_spacing;
             self.bump();
-            TokenTree::Token(self.prev_token, prev_spacing)
+            FlatTt::Token(self.prev_token, prev_spacing)
         }
     }
 
@@ -1852,7 +1862,7 @@ impl<'a> Parser<'a> {
 // Metavar captures of various kinds.
 #[derive(Clone, Debug)]
 pub enum ParseNtResult {
-    Tt(TokenTree),
+    Tt(FlatTt),
     Ident(Ident, IdentIsRaw),
     Lifetime(Ident, IdentIsRaw),
     Item(Box<ast::Item>),
