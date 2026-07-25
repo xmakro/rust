@@ -29,7 +29,7 @@ use rustc_ast::token::{
     self, IdentIsRaw, InvisibleOrigin, MetaVarKind, NtExprKind, NtPatKind, Token, TokenKind,
 };
 use rustc_ast::tokenstream::{
-    DelimSpacing, DelimSpan, FlatEntry, FlatTokenCursor, ParserRange, ParserReplacement, Spacing,
+    self, DelimSpacing, DelimSpan, FlatTokenCursor, ParserRange, ParserReplacement, Spacing,
     TokenStream, TokenTree,
 };
 use rustc_ast::util::case::Case;
@@ -345,9 +345,19 @@ impl<'a> Parser<'a> {
         stream: TokenStream,
         subparser_name: Option<&'static str>,
     ) -> Self {
+        Self::new_from_flat(psess, FlatTokenCursor::new(stream), subparser_name)
+    }
+
+    /// Like `new`, but takes an already-flattened token buffer, as produced
+    /// directly by the lexer for primary parses.
+    pub fn new_from_flat(
+        psess: &'a ParseSess,
+        token_cursor: FlatTokenCursor,
+        subparser_name: Option<&'static str>,
+    ) -> Self {
         let mut parser = Parser {
             psess,
-            token_cursor: FlatTokenCursor::new(stream),
+            token_cursor,
             subparser_name,
             capture_state: CaptureState {
                 capturing: Capturing::No,
@@ -1412,33 +1422,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Rebuilds the `TokenTree::Delimited` whose open delimiter lives at
-    /// `open_idx` in the flat token buffer.
-    fn rebuild_flat_subtree(entries: &[FlatEntry], matches: &[u32], open_idx: usize) -> TokenTree {
-        let open = &entries[open_idx];
-        let close_idx = matches[open_idx] as usize;
-        let close = &entries[close_idx];
-        let delim = open.token.kind.open_delim().unwrap();
-        let mut trees = Vec::new();
-        let mut i = open_idx + 1;
-        while i < close_idx {
-            let entry = &entries[i];
-            if entry.token.kind.open_delim().is_some() {
-                trees.push(Self::rebuild_flat_subtree(entries, matches, i));
-                i = matches[i] as usize + 1;
-            } else {
-                trees.push(TokenTree::Token(entry.token, entry.spacing));
-                i += 1;
-            }
-        }
-        TokenTree::Delimited(
-            DelimSpan::from_pair(open.token.span, close.token.span),
-            DelimSpacing::new(open.spacing, close.spacing),
-            delim,
-            TokenStream::new(trees),
-        )
-    }
-
     /// Parses a single token tree from the input.
     pub fn parse_token_tree(&mut self) -> TokenTree {
         if self.token.kind.open_delim().is_some() {
@@ -1451,7 +1434,7 @@ impl<'a> Parser<'a> {
 
             // Rebuild the `TokenTree::Delimited` we are currently within.
             // That's what we are going to return.
-            let tree = Self::rebuild_flat_subtree(
+            let tree = tokenstream::flat_delimited_at(
                 &self.token_cursor.entries,
                 &self.token_cursor.matches,
                 open_idx,

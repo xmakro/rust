@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use rustc_ast as ast;
 use rustc_ast::token;
-use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::tokenstream::{FlatTokenCursor, TokenStream};
 use rustc_ast_pretty::pprust;
 use rustc_errors::{Diag, EmissionGuarantee, FatalError, PResult, pluralize};
 pub use rustc_lexer::UNICODE_VERSION;
@@ -192,8 +192,8 @@ fn new_parser_from_source_file(
     strip_tokens: StripTokens,
 ) -> Result<Parser<'_>, Vec<Diag<'_>>> {
     let end_pos = source_file.end_position();
-    let stream = source_file_to_stream(psess, source_file, None, strip_tokens)?;
-    let mut parser = Parser::new(psess, stream, None);
+    let cursor = source_file_to_flat(psess, source_file, None, strip_tokens)?;
+    let mut parser = Parser::new_from_flat(psess, cursor, None);
     if parser.token == token::Eof {
         parser.token.span = Span::new(end_pos, end_pos, parser.token.span.ctxt(), None);
     }
@@ -226,6 +226,20 @@ fn source_file_to_stream<'psess>(
     override_span: Option<Span>,
     strip_tokens: StripTokens,
 ) -> Result<TokenStream, Vec<Diag<'psess>>> {
+    // The lexer produces the parser's flat token buffer; rebuild the token
+    // tree for the callers (proc-macro `from_str`, cmdline attributes, fake
+    // token streams for diagnostics) that need one.
+    Ok(source_file_to_flat(psess, source_file, override_span, strip_tokens)?.to_token_stream())
+}
+
+/// Given a source file, lexes it directly into the parser's flat token
+/// buffer, never materializing a token tree.
+fn source_file_to_flat<'psess>(
+    psess: &'psess ParseSess,
+    source_file: Arc<SourceFile>,
+    override_span: Option<Span>,
+    strip_tokens: StripTokens,
+) -> Result<FlatTokenCursor, Vec<Diag<'psess>>> {
     let src = source_file.src.as_ref().unwrap_or_else(|| {
         psess.dcx().bug(format!(
             "cannot lex `source_file` without source: {}",
