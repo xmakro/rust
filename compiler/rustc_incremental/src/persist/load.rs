@@ -112,7 +112,15 @@ fn load_dep_graph(sess: &Session) -> LoadResult {
                 return LoadResult::DataOutOfDate;
             }
 
-            let prev_graph = SerializedDepGraph::decode(&mut decoder, &sess.prof);
+            let mut prev_graph = SerializedDepGraph::decode(&mut decoder, &sess.prof);
+
+            // Retain the file bytes; the graph serves its edge lists directly from
+            // them for the rest of the session. The decoder borrows `mmap`, so release
+            // it before handing ownership to the freshly decoded (uniquely owned) graph.
+            drop(decoder);
+            std::sync::Arc::get_mut(&mut prev_graph)
+                .expect("freshly decoded dep graph is uniquely owned")
+                .attach_mmap(mmap);
 
             LoadResult::Ok { prev_graph, prev_work_products }
         }
