@@ -37,6 +37,8 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
         let query_cache_path = query_cache_path(sess);
         let dep_graph_path = dep_graph_path(sess);
         let staging_dep_graph_path = staging_dep_graph_path(sess);
+        let dep_graph_edges_path = dep_graph_edges_path(sess);
+        let staging_dep_graph_edges_path = staging_dep_graph_edges_path(sess);
 
         sess.time("assert_dep_graph", || assert_dep_graph(tcx));
         sess.time("check_clean", || clean::check_clean_annotations(tcx));
@@ -48,6 +50,15 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                         sess.dcx().emit_err(diagnostics::MoveDepGraph {
                             from: &staging_dep_graph_path,
                             to: &dep_graph_path,
+                            err,
+                        });
+                    }
+                    if let Err(err) =
+                        fs::rename(&staging_dep_graph_edges_path, &dep_graph_edges_path)
+                    {
+                        sess.dcx().emit_err(diagnostics::MoveDepGraph {
+                            from: &staging_dep_graph_edges_path,
+                            to: &dep_graph_edges_path,
                             err,
                         });
                     }

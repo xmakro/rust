@@ -128,6 +128,8 @@ mod tests;
 const LOCK_FILE_EXT: &str = ".lock";
 const DEP_GRAPH_FILENAME: &str = "dep-graph.bin";
 const STAGING_DEP_GRAPH_FILENAME: &str = "dep-graph.part.bin";
+const DEP_GRAPH_EDGES_FILENAME: &str = "dep-graph-edges.bin";
+const STAGING_DEP_GRAPH_EDGES_FILENAME: &str = "dep-graph-edges.part.bin";
 const WORK_PRODUCTS_FILENAME: &str = "work-products.bin";
 const QUERY_CACHE_FILENAME: &str = "query-cache.bin";
 
@@ -148,6 +150,17 @@ pub(crate) fn dep_graph_path(sess: &Session) -> PathBuf {
 /// see `build_dep_graph`.
 pub(crate) fn staging_dep_graph_path(sess: &Session) -> PathBuf {
     in_incr_comp_dir_sess(sess, STAGING_DEP_GRAPH_FILENAME)
+}
+
+/// Returns the path to a session's dependency-graph edge-list file, which holds
+/// the edge bytes of every node record in `dep-graph.bin`, in record order.
+pub(crate) fn dep_graph_edges_path(sess: &Session) -> PathBuf {
+    in_incr_comp_dir_sess(sess, DEP_GRAPH_EDGES_FILENAME)
+}
+
+/// Returns the path to a session's staging dependency-graph edge-list file.
+pub(crate) fn staging_dep_graph_edges_path(sess: &Session) -> PathBuf {
+    in_incr_comp_dir_sess(sess, STAGING_DEP_GRAPH_EDGES_FILENAME)
 }
 
 pub(crate) fn work_products_path(sess: &Session) -> PathBuf {
