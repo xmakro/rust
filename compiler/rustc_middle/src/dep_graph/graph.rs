@@ -172,11 +172,17 @@ impl DepGraph {
         prev_graph: Arc<SerializedDepGraph>,
         prev_work_products: WorkProductMap,
         encoder: FileEncoder<'static>,
+        edges_encoder: FileEncoder<'static>,
     ) -> DepGraph {
         let prev_graph_node_count = prev_graph.node_count();
 
-        let current =
-            CurrentDepGraph::new(session, prev_graph_node_count, encoder, Arc::clone(&prev_graph));
+        let current = CurrentDepGraph::new(
+            session,
+            prev_graph_node_count,
+            encoder,
+            edges_encoder,
+            Arc::clone(&prev_graph),
+        );
 
         let colors = DepNodeColorMap::new(prev_graph_node_count);
 
@@ -1200,6 +1206,7 @@ impl CurrentDepGraph {
         session: &Session,
         prev_graph_node_count: usize,
         encoder: FileEncoder<'static>,
+        edges_encoder: FileEncoder<'static>,
         previous: Arc<SerializedDepGraph>,
     ) -> Self {
         let mut stable_hasher = StableHasher::new();
@@ -1218,7 +1225,13 @@ impl CurrentDepGraph {
         let new_node_count_estimate = 102 * prev_graph_node_count / 100 + 200;
 
         CurrentDepGraph {
-            encoder: GraphEncoder::new(session, encoder, prev_graph_node_count, previous),
+            encoder: GraphEncoder::new(
+                session,
+                encoder,
+                edges_encoder,
+                prev_graph_node_count,
+                previous,
+            ),
             anon_node_to_index: ShardedHashMap::with_capacity(
                 // FIXME: The count estimate is off as anon nodes are only a portion of the nodes.
                 new_node_count_estimate / sharded::shards(),

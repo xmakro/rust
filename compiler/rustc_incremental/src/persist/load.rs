@@ -112,7 +112,36 @@ fn load_dep_graph(sess: &Session) -> LoadResult {
                 return LoadResult::DataOutOfDate;
             }
 
-            let prev_graph = SerializedDepGraph::decode(&mut decoder, &sess.prof);
+            // The edge lists live in their own file and are never decoded: the graph
+            // serves them in place from the retained bytes for the rest of the
+            // session. The two files are written and renamed as a pair, so a missing
+            // or mismatched edge-list file means the cache is unusable.
+            let edges_path = dep_graph_edges_path(sess);
+            let (edges_mmap, edges_start) =
+                match file_format::open_incremental_file(sess, &edges_path) {
+                    Ok(OpenFile { mmap, start_pos }) => (mmap, start_pos),
+                    Err(OpenFileError::NotFoundOrHeaderMismatch) => {
+                        return LoadResult::DataOutOfDate;
+                    }
+                    Err(OpenFileError::IoError { err }) => {
+                        return LoadResult::IoError { path: edges_path, err };
+                    }
+                };
+
+            // The edge bytes are never decoded, only served in place, but constructing
+            // a decoder validates the file trailer and strips it from the length.
+            let Ok(edges_decoder) = MemDecoder::new(&edges_mmap, edges_start) else {
+                sess.dcx().emit_warn(diagnostics::CorruptFile { path: &edges_path });
+                return LoadResult::DataOutOfDate;
+            };
+            let edges_len = edges_decoder.len();
+
+            let mut prev_graph =
+                SerializedDepGraph::decode(&mut decoder, edges_start, edges_len, &sess.prof);
+
+            std::sync::Arc::get_mut(&mut prev_graph)
+                .expect("freshly decoded dep graph is uniquely owned")
+                .attach_edges_mmap(edges_mmap);
 
             LoadResult::Ok { prev_graph, prev_work_products }
         }
@@ -218,7 +247,7 @@ pub fn setup_dep_graph(
         LoadResult::Ok { prev_graph, prev_work_products } => (prev_graph, prev_work_products),
     };
 
-    // Stream the dep-graph to an alternate file, to avoid overwriting anything in case of errors.
+    // Stream the dep-graph to alternate files, to avoid overwriting anything in case of errors.
     let path_buf = staging_dep_graph_path(sess);
 
     let mut encoder = FileEncoder::new(&path_buf).unwrap_or_else(|err| {
@@ -232,5 +261,13 @@ pub fn setup_dep_graph(
     // First encode the commandline arguments hash
     sess.opts.dep_tracking_hash(false).encode(&mut encoder);
 
-    DepGraph::new(sess, prev_graph, prev_work_products, encoder)
+    let edges_path_buf = staging_dep_graph_edges_path(sess);
+
+    let mut edges_encoder = FileEncoder::new(&edges_path_buf).unwrap_or_else(|err| {
+        sess.dcx().emit_fatal(diagnostics::CreateDepGraph { path: &edges_path_buf, err })
+    });
+
+    file_format::write_file_header(&mut edges_encoder, sess);
+
+    DepGraph::new(sess, prev_graph, prev_work_products, encoder, edges_encoder)
 }
