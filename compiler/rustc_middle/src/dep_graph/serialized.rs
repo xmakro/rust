@@ -38,12 +38,20 @@
 //! Dep-graph indices are bulk allocated to threads inside `LocalEncoderState`. Having threads
 //! own these indices helps avoid races when they are conditionally used when marking nodes green.
 //! It also reduces congestion on the shared index count.
+//!
+//! On most rebuilds the encoder also *carries* nodes: a node that exists in the previous graph
+//! keeps its previous index, so a node that was marked green can have its previous record
+//! re-emitted without rebuilding it, since its edge targets also kept their indices. New
+//! nodes then get indices above the previous index space, and indices of deleted nodes are left
+//! unoccupied. Once the index space grows past `MAX_INDEX_SPACE_RATIO` times the number of
+//! occupied indices, one session encodes every node afresh with densely allocated indices, at
+//! the cost of an ordinary save.
 
 use std::cell::RefCell;
 use std::cmp::max;
+use std::iter;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::{iter, mem};
 
 use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
 use rustc_data_structures::fx::FxHashMap;
@@ -58,7 +66,9 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::Session;
 use tracing::{debug, instrument};
 
-use super::graph::{CurrentDepGraph, DepNodeColorMap, DesiredColor, TrySetColorResult};
+use super::graph::{
+    CurrentDepGraph, DepNodeColor, DepNodeColorMap, DesiredColor, TrySetColorResult,
+};
 use super::retained::RetainedDepGraph;
 use super::{DepKind, DepNode, DepNodeIndex};
 
@@ -264,6 +274,35 @@ impl SerializedDepGraph {
     #[inline]
     pub fn live_node_count(&self) -> usize {
         self.live_node_count
+    }
+
+    /// Writes node `index`'s record into `encoder` exactly as it appears in this graph, and
+    /// returns its edge count.
+    ///
+    /// Decoding does not keep the header bytes, so the header is packed anew; the edges are
+    /// copied over still encoded.
+    #[inline]
+    fn re_emit_record(&self, index: SerializedDepNodeIndex, encoder: &mut MemEncoder) -> usize {
+        let edge_header = self.edge_list_indices[index];
+        let num_edges = edge_header.num_edges;
+        let bytes_per_index = edge_header.bytes_per_index();
+        let header = SerializedNodeHeader::with_bytes_per_index(
+            &self.nodes[index],
+            DepNodeIndex::from_u32(index.as_u32()),
+            self.value_fingerprints[index],
+            bytes_per_index,
+            num_edges as usize,
+        );
+        encoder.write_array(header.bytes);
+        if header.len().is_none() {
+            encoder.emit_u32(num_edges);
+        }
+
+        let start = edge_header.start();
+        encoder
+            .emit_raw_bytes(&self.edge_list_data[start..][..num_edges as usize * bytes_per_index]);
+
+        num_edges as usize
     }
 
     #[inline]
@@ -480,13 +519,26 @@ impl SerializedNodeHeader {
         edge_max_index: u32,
         edge_count: usize,
     ) -> Self {
+        let free_bytes = edge_max_index.leading_zeros() as usize / 8;
+        let bytes_per_index = max(1, DEP_NODE_SIZE - free_bytes);
+        Self::with_bytes_per_index(node, index, value_fingerprint, bytes_per_index, edge_count)
+    }
+
+    /// Like [`Self::new`], for a caller that already knows how wide the edge indices are and
+    /// so does not need the largest of them worked out first.
+    #[inline]
+    fn with_bytes_per_index(
+        node: &DepNode,
+        index: DepNodeIndex,
+        value_fingerprint: Fingerprint,
+        bytes_per_index: usize,
+        edge_count: usize,
+    ) -> Self {
         debug_assert_eq!(Self::TOTAL_BITS, Self::LEN_BITS + Self::WIDTH_BITS + Self::KIND_BITS);
+        debug_assert!((1..=DEP_NODE_SIZE).contains(&bytes_per_index));
 
         let mut head = node.kind.as_u16();
-
-        let free_bytes = edge_max_index.leading_zeros() as usize / 8;
-        let bytes_per_index = (DEP_NODE_SIZE - free_bytes).saturating_sub(1);
-        head |= (bytes_per_index as u16) << Self::KIND_BITS;
+        head |= ((bytes_per_index - 1) as u16) << Self::KIND_BITS;
 
         // Encode number of edges + 1 so that we can reserve 0 to indicate that the len doesn't fit
         // in this bitfield.
@@ -611,12 +663,22 @@ struct Stat {
 struct LocalEncoderState {
     next_node_index: u32,
     remaining_node_index: u32,
-    encoder: MemEncoder,
+    /// Taken by [`EncoderState::finish`] when the buffer is written out. A node encoded
+    /// after that has nowhere to go and panics in [`Self::encoder`]; carried nodes allocate
+    /// no index, so the poisoned index counter alone cannot catch them.
+    encoder: Option<MemEncoder>,
     node_count: usize,
     edge_count: usize,
 
     /// Stores the number of times we've encoded each dep kind.
     kind_stats: Vec<u32>,
+}
+
+impl LocalEncoderState {
+    #[inline]
+    fn encoder(&mut self) -> &mut MemEncoder {
+        self.encoder.as_mut().expect("dep node encoded after the graph was written out")
+    }
 }
 
 struct LocalEncoderResult {
@@ -628,23 +690,40 @@ struct LocalEncoderResult {
     kind_stats: Vec<u32>,
 }
 
+/// A session stops carrying once the index space is this many times the number of indices
+/// that hold a node. Dropped indices are never reused, so without a limit the index space
+/// would grow for as long as the incremental directory lives.
+const MAX_INDEX_SPACE_RATIO: usize = 2;
+
 struct EncoderState {
     next_node_index: AtomicU64,
     previous: Arc<SerializedDepGraph>,
     file: Lock<Option<FileEncoder<'static>>>,
     local: WorkerLocal<RefCell<LocalEncoderState>>,
     stats: Option<Lock<FxHashMap<DepKind, Stat>>>,
+    /// Whether nodes that already exist in the previous graph keep their previous index.
+    carrying: bool,
+    /// The first index handed out by [`Self::next_index`]. Carried indices all lie below it.
+    first_new_index: u32,
 }
 
 impl EncoderState {
     fn new(
         encoder: FileEncoder<'static>,
         record_stats: bool,
+        carrying: bool,
         previous: Arc<SerializedDepGraph>,
     ) -> Self {
+        let first_new_index = if carrying {
+            max(DepNodeIndex::FIRST_ALLOCATED, previous.index_space_len() as u32)
+        } else {
+            DepNodeIndex::FIRST_ALLOCATED
+        };
         Self {
             previous,
-            next_node_index: AtomicU64::new(0),
+            carrying,
+            first_new_index,
+            next_node_index: AtomicU64::new(first_new_index as u64),
             stats: record_stats.then(|| Lock::new(FxHashMap::default())),
             file: Lock::new(Some(encoder)),
             local: WorkerLocal::new(|_| {
@@ -653,7 +732,7 @@ impl EncoderState {
                     remaining_node_index: 0,
                     edge_count: 0,
                     node_count: 0,
-                    encoder: MemEncoder::new(),
+                    encoder: Some(MemEncoder::new()),
                     kind_stats: iter::repeat_n(0, DepKind::MAX as usize + 1).collect(),
                 })
             }),
@@ -663,18 +742,22 @@ impl EncoderState {
     #[inline]
     fn next_index(&self, local: &mut LocalEncoderState) -> DepNodeIndex {
         if local.remaining_node_index == 0 {
-            const COUNT: u32 = 256;
+            // A thread stopping mid-batch strands its unused indices, which while carrying
+            // are never filled again, so take one at a time. Most rebuilds allocate few
+            // indices; one where much of the crate changed pays an atomic increment per
+            // re-executed node, spread out between the queries that produce them.
+            let count = if self.carrying { 1 } else { 256 };
 
             // We assume that there won't be enough active threads to overflow `u64` from `u32::MAX` here.
-            // This can exceed u32::MAX by at most `N` * `COUNT` where `N` is the thread pool count since
+            // This can exceed u32::MAX by at most `N` * `count` where `N` is the thread pool count since
             // `try_into().unwrap()` will make threads panic when `self.next_node_index` exceeds u32::MAX.
             local.next_node_index =
-                self.next_node_index.fetch_add(COUNT as u64, Ordering::Relaxed).try_into().unwrap();
+                self.next_node_index.fetch_add(count as u64, Ordering::Relaxed).try_into().unwrap();
 
             // Check that we'll stay within `u32`
-            local.next_node_index.checked_add(COUNT).unwrap();
+            local.next_node_index.checked_add(count).unwrap();
 
-            local.remaining_node_index = COUNT;
+            local.remaining_node_index = count;
         }
 
         DepNodeIndex::from_u32(local.next_node_index)
@@ -685,6 +768,12 @@ impl EncoderState {
     fn bump_index(&self, local: &mut LocalEncoderState) {
         local.remaining_node_index -= 1;
         local.next_node_index += 1;
+    }
+
+    /// Counts one encoded node. Separate from [`Self::bump_index`] because not every encoded
+    /// node is allocated an index: singletons and carried nodes already have one.
+    #[inline]
+    fn count_node(&self, local: &mut LocalEncoderState) {
         local.node_count += 1;
     }
 
@@ -729,7 +818,7 @@ impl EncoderState {
 
     #[inline]
     fn flush_mem_encoder(&self, local: &mut LocalEncoderState) {
-        let data = &mut local.encoder.data;
+        let data = &mut local.encoder().data;
         if data.len() > 64 * 1024 {
             self.file.lock().as_mut().unwrap().emit_raw_bytes(&data[..]);
             data.clear();
@@ -744,8 +833,9 @@ impl EncoderState {
         retained_graph: &Option<Lock<RetainedDepGraph>>,
         local: &mut LocalEncoderState,
     ) {
-        node.encode(&mut local.encoder, index);
+        node.encode(local.encoder(), index);
         self.flush_mem_encoder(&mut *local);
+        self.count_node(&mut *local);
         self.record(&node.node, index, node.edges.len(), node.edges, retained_graph, &mut *local);
     }
 
@@ -769,6 +859,21 @@ impl EncoderState {
         self.encode_node(index, &node, retained_graph, local);
     }
 
+    /// Re-emits a node's record from the previous graph instead of encoding it again.
+    ///
+    /// Only valid while carrying, which keeps the node and its edge targets at their previous
+    /// indices, so the record on disk is still the right one. The retained graph never exists
+    /// while carrying, so no edges are handed on for it.
+    #[inline]
+    fn carry_node(&self, prev_index: SerializedDepNodeIndex, local: &mut LocalEncoderState) {
+        let edge_count = self.previous.re_emit_record(prev_index, local.encoder());
+        self.flush_mem_encoder(&mut *local);
+        self.count_node(&mut *local);
+        let node = self.previous.index_to_node(prev_index);
+        let index = DepNodeIndex::from_u32(prev_index.as_u32());
+        self.record(node, index, edge_count, &[], &None, &mut *local);
+    }
+
     fn finish(&self, profiler: &SelfProfilerRef, current: &CurrentDepGraph) -> FileEncodeResult {
         // Prevent more indices from being allocated.
         self.next_node_index.store(u32::MAX as u64 + 1, Ordering::SeqCst);
@@ -779,7 +884,7 @@ impl EncoderState {
             // Prevent more indices from being allocated on this thread.
             local.remaining_node_index = 0;
 
-            let data = mem::take(&mut local.encoder.data);
+            let data = local.encoder.take().expect("dep graph written out twice").data;
             self.file.lock().as_mut().unwrap().emit_raw_bytes(&data);
 
             LocalEncoderResult {
@@ -794,7 +899,9 @@ impl EncoderState {
 
         let mut kind_stats: Vec<u32> = iter::repeat_n(0, DepKind::MAX as usize + 1).collect();
 
-        let mut node_max = 0;
+        // Nothing allocates the singleton indices or the ones carried over, so the per-thread
+        // maxima below do not account for them.
+        let mut node_max = self.first_new_index;
         let mut node_count = 0;
         let mut edge_count = 0;
 
@@ -856,6 +963,7 @@ impl EncoderState {
             eprintln!("[incremental]");
             eprintln!("[incremental] Total Node Count: {}", total_node_count);
             eprintln!("[incremental] Total Edge Count: {}", total_edge_count);
+            eprintln!("[incremental] Carrying Dep Graph: {}", self.carrying);
 
             if cfg!(debug_assertions) {
                 let total_read_count = current.total_read_count.load(Ordering::Relaxed);
@@ -911,8 +1019,25 @@ impl GraphEncoder {
             .unstable_opts
             .query_dep_graph
             .then(|| Lock::new(RetainedDepGraph::new(prev_index_space_len)));
-        let status = EncoderState::new(encoder, sess.opts.unstable_opts.incremental_info, previous);
+        // The retained graph is indexed by dep node index and is walked in full, so it wants a
+        // dense index space rather than one inherited from the previous session. An empty
+        // previous graph has nothing to carry, and a fresh build wants its index allocation
+        // batched.
+        let carrying = retained_graph.is_none()
+            && previous.live_node_count() > 0
+            && prev_index_space_len <= MAX_INDEX_SPACE_RATIO * previous.live_node_count();
+        let status = EncoderState::new(
+            encoder,
+            sess.opts.unstable_opts.incremental_info,
+            carrying,
+            previous,
+        );
         GraphEncoder { status, retained_graph, profiler: sess.prof.clone() }
+    }
+
+    #[inline]
+    pub(crate) fn is_carrying(&self) -> bool {
+        self.status.carrying
     }
 
     pub(crate) fn retained_dep_graph(&self) -> Option<RetainedDepGraph> {
@@ -935,6 +1060,22 @@ impl GraphEncoder {
         index
     }
 
+    /// Encodes a node at one of the indices reserved below [`DepNodeIndex::FIRST_ALLOCATED`],
+    /// where only the singleton nodes live.
+    pub(crate) fn send_new_at(
+        &self,
+        index: DepNodeIndex,
+        node: DepNode,
+        value_fingerprint: Fingerprint,
+        edges: &[DepNodeIndex],
+    ) {
+        debug_assert!(index.as_u32() < DepNodeIndex::FIRST_ALLOCATED);
+        let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph");
+        let node = NodeInfo { node, value_fingerprint, edges };
+        let mut local = self.status.local.borrow_mut();
+        self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
+    }
+
     /// Encodes a node that exists in the previous graph, but was re-executed.
     ///
     /// This will also ensure the dep node is colored either red or green.
@@ -952,7 +1093,12 @@ impl GraphEncoder {
 
         let mut local = self.status.local.borrow_mut();
 
-        let index = self.status.next_index(&mut *local);
+        let carrying = self.status.carrying;
+        let index = if carrying {
+            DepNodeIndex::from_u32(prev_index.as_u32())
+        } else {
+            self.status.next_index(&mut *local)
+        };
         let color = if is_green { DesiredColor::Green { index } } else { DesiredColor::Red };
 
         // Use `try_set_color` to avoid racing when `send_promoted` is called concurrently
@@ -963,7 +1109,9 @@ impl GraphEncoder {
             TrySetColorResult::AlreadyGreen { index } => return index,
         }
 
-        self.status.bump_index(&mut *local);
+        if !carrying {
+            self.status.bump_index(&mut *local);
+        }
         self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
         index
     }
@@ -984,20 +1132,37 @@ impl GraphEncoder {
         let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph");
 
         let mut local = self.status.local.borrow_mut();
-        let index = self.status.next_index(&mut *local);
+        let carrying = self.status.carrying;
+        let index = if carrying {
+            DepNodeIndex::from_u32(prev_index.as_u32())
+        } else {
+            self.status.next_index(&mut *local)
+        };
 
         // Use `try_set_color` to avoid racing when `send_promoted` or `send_and_color`
         // is called concurrently on the same index.
         match colors.try_set_color(prev_index, DesiredColor::Green { index }) {
             TrySetColorResult::Success => {
-                self.status.bump_index(&mut *local);
-                self.status.encode_promoted_node(
-                    index,
-                    prev_index,
-                    &self.retained_graph,
-                    &mut *local,
-                    edges,
-                );
+                if carrying {
+                    debug_assert!(self.retained_graph.is_none());
+                    debug_assert!(
+                        self.status
+                            .previous
+                            .edge_targets_from(prev_index)
+                            .all(|target| matches!(colors.get(target), DepNodeColor::Green(_))),
+                        "carried node {prev_index:?} names a target that is not green",
+                    );
+                    self.status.carry_node(prev_index, &mut *local);
+                } else {
+                    self.status.bump_index(&mut *local);
+                    self.status.encode_promoted_node(
+                        index,
+                        prev_index,
+                        &self.retained_graph,
+                        &mut *local,
+                        edges,
+                    );
+                }
                 Some(index)
             }
             TrySetColorResult::AlreadyRed => None,
