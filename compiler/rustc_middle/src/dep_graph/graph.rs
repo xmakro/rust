@@ -75,8 +75,12 @@ rustc_index::newtype_index! {
 rustc_data_structures::static_assert_size!(Option<DepNodeIndex>, 4);
 
 impl DepNodeIndex {
-    const SINGLETON_ZERO_DEPS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
+    pub(super) const SINGLETON_ZERO_DEPS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
     pub const FOREVER_RED_NODE: DepNodeIndex = DepNodeIndex::from_u32(1);
+
+    /// Indices below this belong to the singleton nodes, which sit at the same index in
+    /// every session.
+    pub(super) const FIRST_ALLOCATED: u32 = 2;
 }
 
 impl From<DepNodeIndex> for QueryInvocationId {
@@ -186,26 +190,40 @@ impl DepGraph {
         let colors = DepNodeColorMap::new(prev_index_space_len);
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
-        let _green_node_index = current.alloc_new_node(
+        current.alloc_singleton_node(
+            DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
             &[],
             Fingerprint::ZERO,
         );
-        assert_eq!(_green_node_index, DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE);
 
         // Create a single always-red node, with no dependencies of its own.
         // Other nodes can use the always-red node as a fake dependency, to
         // ensure that their dependency list will never be all-green.
-        let red_node_index = current.alloc_new_node(
+        current.alloc_singleton_node(
+            DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
             &[],
             Fingerprint::ZERO,
         );
-        assert_eq!(red_node_index, DepNodeIndex::FOREVER_RED_NODE);
         if prev_index_space_len > 0 {
             let prev_index =
                 const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
             let result = colors.try_set_color(prev_index, DesiredColor::Red);
+            assert_matches!(result, TrySetColorResult::Success);
+
+            // The record just written covers the previous anon singleton too: an anonymous
+            // node with no dependencies never changes, and nothing looks an anon node up by
+            // key, so the fresh session seed in this one's key does not matter. Color the
+            // previous one green up front, or promoting it would write a second record to
+            // that index.
+            let prev_index = const {
+                SerializedDepNodeIndex::from_u32(
+                    DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE.as_u32(),
+                )
+            };
+            let color = DesiredColor::Green { index: DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE };
+            let result = colors.try_set_color(prev_index, color);
             assert_matches!(result, TrySetColorResult::Success);
         }
 
@@ -1266,6 +1284,20 @@ impl CurrentDepGraph {
         self.record_edge(dep_node_index, key, value_fingerprint);
 
         dep_node_index
+    }
+
+    #[inline(always)]
+    fn alloc_singleton_node(
+        &self,
+        index: DepNodeIndex,
+        key: DepNode,
+        edges: &[DepNodeIndex],
+        value_fingerprint: Fingerprint,
+    ) {
+        self.encoder.send_new_at(index, key, value_fingerprint, edges);
+
+        #[cfg(debug_assertions)]
+        self.record_edge(index, key, value_fingerprint);
     }
 }
 
