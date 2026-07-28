@@ -644,7 +644,7 @@ impl EncoderState {
     ) -> Self {
         Self {
             previous,
-            next_node_index: AtomicU64::new(0),
+            next_node_index: AtomicU64::new(DepNodeIndex::FIRST_ALLOCATED as u64),
             stats: record_stats.then(|| Lock::new(FxHashMap::default())),
             file: Lock::new(Some(encoder)),
             local: WorkerLocal::new(|_| {
@@ -685,6 +685,12 @@ impl EncoderState {
     fn bump_index(&self, local: &mut LocalEncoderState) {
         local.remaining_node_index -= 1;
         local.next_node_index += 1;
+    }
+
+    /// Counts one encoded node. The singleton nodes are encoded at a reserved index rather
+    /// than an allocated one, so this is separate from [`Self::bump_index`].
+    #[inline]
+    fn count_node(&self, local: &mut LocalEncoderState) {
         local.node_count += 1;
     }
 
@@ -746,6 +752,7 @@ impl EncoderState {
     ) {
         node.encode(&mut local.encoder, index);
         self.flush_mem_encoder(&mut *local);
+        self.count_node(&mut *local);
         self.record(&node.node, index, node.edges.len(), node.edges, retained_graph, &mut *local);
     }
 
@@ -806,6 +813,10 @@ impl EncoderState {
                 kind_stats[i] += stat;
             }
         }
+
+        // The reserved indices are occupied by the singleton nodes without any thread having
+        // allocated them, so they are not covered by the per-thread maxima above.
+        node_max = max(node_max, DepNodeIndex::FIRST_ALLOCATED);
 
         // Encode the number of each dep kind encountered
         for count in kind_stats.iter() {
@@ -931,6 +942,23 @@ impl GraphEncoder {
         let mut local = self.status.local.borrow_mut();
         let index = self.status.next_index(&mut *local);
         self.status.bump_index(&mut *local);
+        self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
+        index
+    }
+
+    /// Encodes a node at a reserved index instead of an allocated one. Only the singleton
+    /// nodes live at a reserved index; see [`DepNodeIndex::FIRST_ALLOCATED`].
+    pub(crate) fn send_new_at(
+        &self,
+        index: DepNodeIndex,
+        node: DepNode,
+        value_fingerprint: Fingerprint,
+        edges: &[DepNodeIndex],
+    ) -> DepNodeIndex {
+        debug_assert!(index.as_u32() < DepNodeIndex::FIRST_ALLOCATED);
+        let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph");
+        let node = NodeInfo { node, value_fingerprint, edges };
+        let mut local = self.status.local.borrow_mut();
         self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
         index
     }

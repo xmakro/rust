@@ -75,8 +75,12 @@ rustc_index::newtype_index! {
 rustc_data_structures::static_assert_size!(Option<DepNodeIndex>, 4);
 
 impl DepNodeIndex {
-    const SINGLETON_ZERO_DEPS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
+    pub(super) const SINGLETON_ZERO_DEPS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
     pub const FOREVER_RED_NODE: DepNodeIndex = DepNodeIndex::from_u32(1);
+
+    /// The two singleton nodes sit at a fixed index in every session, so index allocation
+    /// starts above them.
+    pub(super) const FIRST_ALLOCATED: u32 = 2;
 }
 
 impl From<DepNodeIndex> for QueryInvocationId {
@@ -186,22 +190,22 @@ impl DepGraph {
         let colors = DepNodeColorMap::new(prev_index_space_len);
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
-        let _green_node_index = current.alloc_new_node(
+        current.alloc_singleton_node(
+            DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
             &[],
             Fingerprint::ZERO,
         );
-        assert_eq!(_green_node_index, DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE);
 
         // Create a single always-red node, with no dependencies of its own.
         // Other nodes can use the always-red node as a fake dependency, to
         // ensure that their dependency list will never be all-green.
-        let red_node_index = current.alloc_new_node(
+        current.alloc_singleton_node(
+            DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
             &[],
             Fingerprint::ZERO,
         );
-        assert_eq!(red_node_index, DepNodeIndex::FOREVER_RED_NODE);
         if prev_index_space_len > 0 {
             let prev_index =
                 const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
@@ -1261,6 +1265,23 @@ impl CurrentDepGraph {
         value_fingerprint: Fingerprint,
     ) -> DepNodeIndex {
         let dep_node_index = self.encoder.send_new(key, value_fingerprint, edges);
+
+        #[cfg(debug_assertions)]
+        self.record_edge(dep_node_index, key, value_fingerprint);
+
+        dep_node_index
+    }
+
+    /// Writes one of the singleton nodes at its reserved index.
+    #[inline(always)]
+    fn alloc_singleton_node(
+        &self,
+        index: DepNodeIndex,
+        key: DepNode,
+        edges: &[DepNodeIndex],
+        value_fingerprint: Fingerprint,
+    ) -> DepNodeIndex {
+        let dep_node_index = self.encoder.send_new_at(index, key, value_fingerprint, edges);
 
         #[cfg(debug_assertions)]
         self.record_edge(dep_node_index, key, value_fingerprint);
