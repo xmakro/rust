@@ -689,7 +689,11 @@ pub enum TerminatorEdges<'mir, 'tcx> {
     Double(BasicBlock, BasicBlock),
     /// Special action for `Yield`, `Call` and `InlineAsm` terminators.
     AssignOnReturn {
-        return_: Box<[BasicBlock]>,
+        // Inline storage avoids a heap allocation on the very common `Call`
+        // terminator (which has at most one return target) and on `Yield`
+        // (at most two), both of which are visited repeatedly by every
+        // dataflow analysis. `InlineAsm` with many targets still spills.
+        return_: SmallVec<[BasicBlock; 2]>,
         /// The cleanup block, if it exists.
         cleanup: Option<BasicBlock>,
         place: CallReturnPlaces<'mir, 'tcx>,
@@ -783,7 +787,7 @@ impl<'tcx> TerminatorKind<'tcx> {
                 ref targets,
                 unwind,
             } => TerminatorEdges::AssignOnReturn {
-                return_: targets.to_owned(),
+                return_: targets.iter().copied().collect(),
                 cleanup: unwind.cleanup_block(),
                 place: CallReturnPlaces::InlineAsm(operands),
             },
