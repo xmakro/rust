@@ -55,6 +55,7 @@ use rustc_data_structures::stable_hash::{StableHasher, StableOrd};
 use rustc_hir::def_id::DefId;
 use rustc_hir::definitions::DefPathHash;
 use rustc_macros::{Decodable, Encodable, StableHash};
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_span::Symbol;
 
 use super::{DepNodeIndex, KeyFingerprintStyle, SerializedDepNodeIndex};
@@ -149,6 +150,25 @@ impl fmt::Debug for DepNode {
             }
             Ok(())
         })
+    }
+}
+
+// `DepKind` is encoded as its `u16` discriminant, which is only meaningful to
+// the compiler build that assigned it, so anything containing an encoded
+// `DepNode` must be discarded on version mismatch.
+impl<E: Encoder> Encodable<E> for DepNode {
+    fn encode(&self, e: &mut E) {
+        e.emit_u16(self.kind.as_u16());
+        self.key_fingerprint.encode(e);
+    }
+}
+
+impl<D: Decoder> Decodable<D> for DepNode {
+    fn decode(d: &mut D) -> Self {
+        DepNode {
+            kind: DepKind::from_u16(d.read_u16()),
+            key_fingerprint: PackedFingerprint::decode(d),
+        }
     }
 }
 

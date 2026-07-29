@@ -22,7 +22,7 @@ use rustc_span::{
     SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
 };
 
-use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
+use crate::dep_graph::{DepNode, DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
 use crate::mir::interpret::{AllocDecodingSession, AllocDecodingState};
 use crate::mir::{self, interpret};
 use crate::mono::MonoItem;
@@ -330,8 +330,10 @@ impl OnDiskCache {
         tcx: TyCtxt<'_>,
         dep_node_index: SerializedDepNodeIndex,
     ) -> Option<QuerySideEffect> {
+        // Side-effect nodes are exempt from the `(kind, key_fingerprint)`
+        // uniqueness guarantee, so their values are tagged with the index.
         let side_effect: Option<QuerySideEffect> =
-            self.load_indexed(tcx, dep_node_index, &self.side_effects_index);
+            self.load_indexed(tcx, dep_node_index, &self.side_effects_index, dep_node_index);
         side_effect
     }
 
@@ -347,24 +349,29 @@ impl OnDiskCache {
         &self,
         tcx: TyCtxt<'tcx>,
         dep_node_index: SerializedDepNodeIndex,
+        node: DepNode,
     ) -> Option<T>
     where
         T: for<'a> Decodable<CacheDecoder<'a, 'tcx>>,
     {
-        self.load_indexed(tcx, dep_node_index, &self.query_values_index)
+        // See `encode_query_value` for why values are tagged with the node
+        // itself instead of its index.
+        self.load_indexed(tcx, dep_node_index, &self.query_values_index, node)
     }
 
-    fn load_indexed<'tcx, T>(
+    fn load_indexed<'tcx, T, Tag>(
         &self,
         tcx: TyCtxt<'tcx>,
         dep_node_index: SerializedDepNodeIndex,
         index: &FxHashMap<SerializedDepNodeIndex, AbsoluteBytePos>,
+        expected_tag: Tag,
     ) -> Option<T>
     where
         T: for<'a> Decodable<CacheDecoder<'a, 'tcx>>,
+        Tag: for<'a> Decodable<CacheDecoder<'a, 'tcx>> + Eq + fmt::Debug,
     {
         let pos = index.get(&dep_node_index).cloned()?;
-        let value = self.with_decoder(tcx, pos, |decoder| decode_tagged(decoder, dep_node_index));
+        let value = self.with_decoder(tcx, pos, |decoder| decode_tagged(decoder, expected_tag));
         Some(value)
     }
 
@@ -825,11 +832,20 @@ impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
         ((end_pos - start_pos) as u64).encode(self);
     }
 
-    pub fn encode_query_value<V: Encodable<Self>>(&mut self, index: DepNodeIndex, value: &V) {
+    pub fn encode_query_value<V: Encodable<Self>>(
+        &mut self,
+        index: DepNodeIndex,
+        node: DepNode,
+        value: &V,
+    ) {
         let index = SerializedDepNodeIndex::from_curr_for_serialization(index);
 
         self.query_values_index.push((index, AbsoluteBytePos::new(self.position())));
-        self.encode_tagged(index, value);
+        // The tag lets the load path check that the bytes at this position
+        // belong to the node it asked for. Unlike the index the position is
+        // looked up by, the node identifies the value across sessions: indices
+        // are reassigned per session, `(kind, key_fingerprint)` is stable.
+        self.encode_tagged(node, value);
     }
 
     fn encode_side_effect(&mut self, index: DepNodeIndex, side_effect: &QuerySideEffect) {

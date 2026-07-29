@@ -95,7 +95,8 @@ fn encode_query_values_inner<'a, 'tcx, C, V>(
     assert!(all_inactive(&query.state));
     query.cache.for_each(&mut |key, value, dep_node| {
         if query.will_cache_on_disk_for_key(*key) {
-            encoder.encode_query_value::<V>(dep_node, &erase::restore_val::<V>(*value));
+            let node = DepNode::construct(tcx, query.dep_kind, key);
+            encoder.encode_query_value::<V>(dep_node, node, &erase::restore_val::<V>(*value));
         }
     });
 }
@@ -169,7 +170,8 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
         tcx.dep_graph.data().expect("should always be present in incremental mode");
 
     let prof_timer = tcx.prof.incr_cache_loading();
-    let value = ensure_sufficient_stack(|| (query.try_load_from_disk_fn)(tcx, prev_index));
+    let value =
+        ensure_sufficient_stack(|| (query.try_load_from_disk_fn)(tcx, prev_index, dep_node));
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
     let Some(value) = value else {
@@ -197,6 +199,7 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
 pub(crate) fn try_load_from_disk<'tcx, V>(
     tcx: TyCtxt<'tcx>,
     prev_index: SerializedDepNodeIndex,
+    node: DepNode,
 ) -> Option<V>
 where
     V: for<'a> Decodable<CacheDecoder<'a, 'tcx>>,
@@ -206,5 +209,6 @@ where
     // The call to `with_query_deserialization` enforces that no new `DepNodes`
     // are created during deserialization. See the docs of that method for more
     // details.
-    tcx.dep_graph.with_query_deserialization(|| on_disk_cache.try_load_query_value(tcx, prev_index))
+    tcx.dep_graph
+        .with_query_deserialization(|| on_disk_cache.try_load_query_value(tcx, prev_index, node))
 }

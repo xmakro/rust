@@ -10,7 +10,7 @@ use rustc_errors::Diag;
 use rustc_hir::def_id::LocalDefId;
 use rustc_span::Span;
 
-use crate::dep_graph::{DepKind, DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
+use crate::dep_graph::{DepKind, DepNode, DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
 use crate::ich::StableHashState;
 use crate::queries::{ExternProviders, Providers, QueryArenas, QueryVTables, TaggedQueryKey};
 use crate::query::on_disk_cache::OnDiskCache;
@@ -93,8 +93,11 @@ pub struct QueryVTable<'tcx, C: QueryCache> {
     /// Function pointer that tries to load a query value from disk.
     ///
     /// This should only be called after a successful check of [`Self::will_cache_on_disk_for_key`].
-    pub try_load_from_disk_fn:
-        fn(tcx: TyCtxt<'tcx>, prev_index: SerializedDepNodeIndex) -> Option<C::Value>,
+    pub try_load_from_disk_fn: fn(
+        tcx: TyCtxt<'tcx>,
+        prev_index: SerializedDepNodeIndex,
+        node: DepNode,
+    ) -> Option<C::Value>,
 
     /// Function pointer that hashes this query's result values.
     ///
