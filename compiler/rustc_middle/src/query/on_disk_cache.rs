@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::{fmt, mem};
 
+use rustc_data_structures::fingerprint::PackedFingerprint;
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::sync::{HashMapExt, Lock, RwLock};
@@ -351,7 +352,16 @@ impl OnDiskCache {
     where
         T: for<'a> Decodable<CacheDecoder<'a, 'tcx>>,
     {
-        self.load_indexed(tcx, dep_node_index, &self.query_values_index)
+        let pos = self.query_values_index.get(&dep_node_index).cloned()?;
+        // See `encode_query_value` for why values are tagged with their
+        // node's key fingerprint instead of its index.
+        let key_fingerprint = tcx
+            .dep_graph
+            .data()
+            .expect("always present in incremental mode")
+            .prev_key_fingerprint_of(dep_node_index);
+        let value = self.with_decoder(tcx, pos, |decoder| decode_tagged(decoder, key_fingerprint));
+        Some(value)
     }
 
     fn load_indexed<'tcx, T>(
@@ -825,11 +835,20 @@ impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
         ((end_pos - start_pos) as u64).encode(self);
     }
 
-    pub fn encode_query_value<V: Encodable<Self>>(&mut self, index: DepNodeIndex, value: &V) {
+    pub fn encode_query_value<V: Encodable<Self>>(
+        &mut self,
+        index: DepNodeIndex,
+        key_fingerprint: PackedFingerprint,
+        value: &V,
+    ) {
         let index = SerializedDepNodeIndex::from_curr_for_serialization(index);
 
         self.query_values_index.push((index, AbsoluteBytePos::new(self.position())));
-        self.encode_tagged(index, value);
+        // The tag lets the load path check that the bytes at this position
+        // belong to the node it asked for. The key fingerprint identifies the
+        // node independently of the index the position was looked up by, and
+        // stays valid across sessions while indices are reassigned.
+        self.encode_tagged(key_fingerprint, value);
     }
 
     fn encode_side_effect(&mut self, index: DepNodeIndex, side_effect: &QuerySideEffect) {

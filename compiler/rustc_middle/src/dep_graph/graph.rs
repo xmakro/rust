@@ -706,6 +706,11 @@ impl DepGraphData {
     }
 
     #[inline]
+    pub fn prev_key_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> PackedFingerprint {
+        self.previous.index_to_node(prev_index).key_fingerprint
+    }
+
+    #[inline]
     pub(crate) fn prev_node_of(&self, prev_index: SerializedDepNodeIndex) -> &DepNode {
         self.previous.index_to_node(prev_index)
     }
