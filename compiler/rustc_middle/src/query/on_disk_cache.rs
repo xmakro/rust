@@ -30,6 +30,9 @@ use crate::mono::MonoItem;
 use crate::ty::codec::{RefDecodable, TyDecoder, TyEncoder};
 use crate::ty::{self, Ty, TyCtxt};
 
+#[cfg(test)]
+mod tests;
+
 const TAG_FILE_FOOTER: u128 = 0xC0FFEE_C0FFEE_C0FFEE_C0FFEE_C0FFEE;
 
 // A normal span encoded with both location information and a `SyntaxContext`
@@ -69,12 +72,9 @@ pub struct OnDiskCache {
 
     alloc_decoding_state: AllocDecodingState,
 
-    // A map from syntax context ids to the position of their associated
-    // `SyntaxContextData`. We use a `u32` instead of a `SyntaxContext`
-    // to represent the fact that we are storing *encoded* ids. When we decode
-    // a `SyntaxContext`, a new id will be allocated from the global `HygieneData`,
-    // which will almost certainly be different than the serialized id.
-    syntax_contexts: FxHashMap<u32, AbsoluteBytePos>,
+    // One table per data region of the cache file, ordered oldest first.
+    // See `SyntaxContextTable`.
+    syntax_context_tables: Vec<SyntaxContextTable>,
     // A map from the `DefPathHash` of an `ExpnId` to the position
     // of their associated `ExpnData`. Ideally, we would store a `DefId`,
     // but we need to decode this before we've constructed a `TyCtxt` (which
@@ -85,8 +85,6 @@ pub struct OnDiskCache {
     // we could look up the `ExpnData` from the metadata of foreign crates,
     // but it seemed easier to have `OnDiskCache` be independent of the `CStore`.
     expn_data: UnhashMap<ExpnHash, AbsoluteBytePos>,
-    // Additional information used when decoding hygiene data.
-    hygiene_context: HygieneDecodeContext,
     // Maps `ExpnHash`es to their raw value from the *previous*
     // compilation session. This is used as an initial 'guess' when
     // we try to map an `ExpnHash` to its value in the current
@@ -104,8 +102,8 @@ struct Footer {
     // Most uses only need values up to u32::MAX, but benchmarking indicates that we can use a u64
     // without measurable overhead. This permits larger const allocations without ICEing.
     interpret_alloc_index: Vec<u64>,
-    // See `OnDiskCache.syntax_contexts`
-    syntax_contexts: FxHashMap<u32, AbsoluteBytePos>,
+    // See `SyntaxContextTable`, one table per data region, ordered oldest first.
+    syntax_context_tables: Vec<SyntaxContextTable>,
     // See `OnDiskCache.expn_data`
     expn_data: UnhashMap<ExpnHash, AbsoluteBytePos>,
     foreign_expn_data: UnhashMap<ExpnHash, u32>,
@@ -114,7 +112,7 @@ struct Footer {
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Encodable, Decodable)]
 struct SourceFileIndex(u32);
 
-#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, Encodable, Decodable)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord, Encodable, Decodable)]
 pub struct AbsoluteBytePos(u64);
 
 impl AbsoluteBytePos {
@@ -127,6 +125,60 @@ impl AbsoluteBytePos {
     fn to_usize(self) -> usize {
         self.0 as usize
     }
+}
+
+/// Maps the syntax context ids encoded in one region of the cache file to the
+/// positions of their associated `SyntaxContextData`. The ids are `u32`s rather
+/// than `SyntaxContext`s to represent the fact that they are *encoded* ids:
+/// decoding a `SyntaxContext` allocates a new id from the global `HygieneData`,
+/// which will almost certainly differ from the serialized one.
+///
+/// Encoded ids are only meaningful together with the data region that was
+/// encoded in the same session, so each region has its own table, selected by
+/// the position an id is decoded from (see [`syntax_context_table_for`]). The
+/// stored positions are absolute: a table stays valid only for as long as its
+/// region's bytes keep their absolute positions in the file. A cache file
+/// currently contains a single region, ending at the footer.
+struct SyntaxContextTable {
+    /// Position one past the end of the data region this table describes.
+    region_end: AbsoluteBytePos,
+    /// The position of the `SyntaxContextData` for each id encoded in the region.
+    positions: FxHashMap<u32, AbsoluteBytePos>,
+    /// Runtime cache of the ids already decoded this session. Decoded ids are
+    /// id-space specific, hence one cache per table. Not serialized.
+    decode_context: HygieneDecodeContext,
+}
+
+impl SyntaxContextTable {
+    fn new(region_end: AbsoluteBytePos, positions: FxHashMap<u32, AbsoluteBytePos>) -> Self {
+        SyntaxContextTable { region_end, positions, decode_context: Default::default() }
+    }
+}
+
+impl<E: SpanEncoder> Encodable<E> for SyntaxContextTable {
+    fn encode(&self, e: &mut E) {
+        self.region_end.encode(e);
+        self.positions.encode(e);
+    }
+}
+
+impl<D: SpanDecoder> Decodable<D> for SyntaxContextTable {
+    fn decode(d: &mut D) -> Self {
+        let region_end = Decodable::decode(d);
+        let positions = Decodable::decode(d);
+        SyntaxContextTable::new(region_end, positions)
+    }
+}
+
+/// Selects the table for the data region containing `position`: the first
+/// table whose region ends past it. Requires `tables` to be ordered by
+/// ascending `region_end`. Returns `None` if the position lies past the last
+/// region.
+fn syntax_context_table_for(
+    tables: &[SyntaxContextTable],
+    position: AbsoluteBytePos,
+) -> Option<&SyntaxContextTable> {
+    tables.get(tables.partition_point(|table| table.region_end <= position))
 }
 
 #[derive(Encodable, Decodable, Clone, Debug)]
@@ -165,6 +217,8 @@ impl OnDiskCache {
         let footer: Footer =
             decoder.with_position(footer_pos, |decoder| decode_tagged(decoder, TAG_FILE_FOOTER));
 
+        // `syntax_context_table_for` selects tables by binary search.
+        debug_assert!(footer.syntax_context_tables.is_sorted_by_key(|table| table.region_end));
         Ok(Self {
             serialized_data: RwLock::new(Some(data)),
             file_index_to_stable_id: footer.file_index_to_stable_id,
@@ -172,10 +226,9 @@ impl OnDiskCache {
             query_values_index: footer.query_values_index.into_iter().collect(),
             side_effects_index: footer.side_effects_index.into_iter().collect(),
             alloc_decoding_state: AllocDecodingState::new(footer.interpret_alloc_index),
-            syntax_contexts: footer.syntax_contexts,
+            syntax_context_tables: footer.syntax_context_tables,
             expn_data: footer.expn_data,
             foreign_expn_data: footer.foreign_expn_data,
-            hygiene_context: Default::default(),
         })
     }
 
@@ -187,10 +240,9 @@ impl OnDiskCache {
             query_values_index: Default::default(),
             side_effects_index: Default::default(),
             alloc_decoding_state: AllocDecodingState::new(Vec::new()),
-            syntax_contexts: FxHashMap::default(),
+            syntax_context_tables: Vec::new(),
             expn_data: UnhashMap::default(),
             foreign_expn_data: UnhashMap::default(),
-            hygiene_context: Default::default(),
         }
     }
 
@@ -301,6 +353,11 @@ impl OnDiskCache {
             let footer_pos = encoder.position() as u64;
             let query_values_index = mem::take(&mut encoder.query_values_index);
             let side_effects_index = mem::take(&mut encoder.side_effects_index);
+
+            // This session's data forms a single region ending at the footer.
+            let syntax_context_tables =
+                vec![SyntaxContextTable::new(AbsoluteBytePos(footer_pos), syntax_contexts)];
+
             encoder.encode_tagged(
                 TAG_FILE_FOOTER,
                 &Footer {
@@ -308,7 +365,7 @@ impl OnDiskCache {
                     query_values_index,
                     side_effects_index,
                     interpret_alloc_index,
-                    syntax_contexts,
+                    syntax_context_tables,
                     expn_data,
                     foreign_expn_data,
                 },
@@ -395,10 +452,9 @@ impl OnDiskCache {
             file_index_to_file: &self.file_index_to_file,
             file_index_to_stable_id: &self.file_index_to_stable_id,
             alloc_decoding_session: self.alloc_decoding_state.new_decoding_session(),
-            syntax_contexts: &self.syntax_contexts,
+            syntax_context_tables: &self.syntax_context_tables,
             expn_data: &self.expn_data,
             foreign_expn_data: &self.foreign_expn_data,
-            hygiene_context: &self.hygiene_context,
         };
         f(&mut decoder)
     }
@@ -415,10 +471,9 @@ pub struct CacheDecoder<'a, 'tcx> {
     file_index_to_file: &'a Lock<FxHashMap<SourceFileIndex, Arc<SourceFile>>>,
     file_index_to_stable_id: &'a FxHashMap<SourceFileIndex, EncodedSourceFileId>,
     alloc_decoding_session: AllocDecodingSession<'a>,
-    syntax_contexts: &'a FxHashMap<u32, AbsoluteBytePos>,
+    syntax_context_tables: &'a [SyntaxContextTable],
     expn_data: &'a UnhashMap<ExpnHash, AbsoluteBytePos>,
     foreign_expn_data: &'a UnhashMap<ExpnHash, u32>,
-    hygiene_context: &'a HygieneDecodeContext,
 }
 
 impl<'a, 'tcx> CacheDecoder<'a, 'tcx> {
@@ -558,11 +613,16 @@ impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for Vec<u8> {
 
 impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
     fn decode_syntax_context(&mut self) -> SyntaxContext {
-        let syntax_contexts = self.syntax_contexts;
-        rustc_span::hygiene::decode_syntax_context(self, self.hygiene_context, |this, id| {
+        // Select the table belonging to the region this id is being decoded from.
+        let position = AbsoluteBytePos::new(self.opaque.position());
+        let table =
+            syntax_context_table_for(self.syntax_context_tables, position).unwrap_or_else(|| {
+                bug!("syntax context decoded from {position:?}, past the last data region")
+            });
+        rustc_span::hygiene::decode_syntax_context(self, &table.decode_context, |this, id| {
             // This closure is invoked if we haven't already decoded the data for the `SyntaxContext` we are deserializing.
             // We look up the position of the associated `SyntaxData` and decode it.
-            let pos = syntax_contexts.get(&id).unwrap();
+            let pos = table.positions.get(&id).unwrap();
             this.with_position(pos.to_usize(), |decoder| {
                 let data: SyntaxContextKey = decode_tagged(decoder, TAG_SYNTAX_CONTEXT);
                 data
