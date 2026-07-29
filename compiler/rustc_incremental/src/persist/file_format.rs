@@ -26,7 +26,7 @@ use crate::diagnostics;
 const FILE_MAGIC: &[u8] = b"RSIC";
 
 /// Change this if the header format changes.
-const HEADER_FORMAT_VERSION: u16 = 1;
+const HEADER_FORMAT_VERSION: u16 = 2;
 
 pub(crate) fn write_file_header(stream: &mut FileEncoder<'_>, sess: &Session) {
     stream.emit_raw_bytes(FILE_MAGIC);
@@ -37,6 +37,12 @@ pub(crate) fn write_file_header(stream: &mut FileEncoder<'_>, sess: &Session) {
         u8::try_from(rustc_version.len()).expect("version string should not exceed 255 bytes");
     stream.emit_raw_bytes(&[rustc_version_len]);
     stream.emit_raw_bytes(rustc_version.as_bytes());
+}
+
+/// The number of bytes [`write_file_header`] emits, which is the position at
+/// which a file's data region starts.
+pub(crate) fn header_size(sess: &Session) -> usize {
+    FILE_MAGIC.len() + size_of::<u16>() + size_of::<u8>() + rustc_version(sess).len()
 }
 
 pub(crate) fn save_in<F>(sess: &Session, path_buf: PathBuf, name: &str, encode: F)

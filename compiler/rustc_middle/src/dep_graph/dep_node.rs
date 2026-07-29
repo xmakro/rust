@@ -208,17 +208,39 @@ pub struct DepKindVTable<'tcx> {
         fn(tcx: TyCtxt<'tcx>, dep_node: DepNode, prev_index: SerializedDepNodeIndex) -> bool,
     >,
 
-    /// Load the on-disk cached value of a query into memory. The node is known
-    /// to be green, with `prev_index` its index in the previous session's dep
-    /// graph and `dep_node_index` its index in the current session's dep graph.
+    /// Load the on-disk cached value of a query into memory (or, depending on
+    /// [`CachePromotionMode`], only verify it). The node is known to be
+    /// green, with `prev_index` its index in the previous session's dep graph
+    /// and `dep_node_index` its index in the current session's dep graph.
+    ///
+    /// Used when saving the query cache (see `OnDiskCache::serialize`):
+    /// without carrying, values that are not in memory would be lost to the
+    /// next session; with carrying, values keep their bytes but the
+    /// verification that decoding performs still needs to run.
     pub promote_from_disk_fn: Option<
         fn(
             tcx: TyCtxt<'tcx>,
             dep_node: DepNode,
             prev_index: SerializedDepNodeIndex,
             dep_node_index: DepNodeIndex,
+            mode: CachePromotionMode,
         ),
     >,
+}
+
+/// What [`DepKindVTable::promote_from_disk_fn`] should do with a disk-cached
+/// value that is not in the memory cache.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CachePromotionMode {
+    /// Load the value into the memory cache, so that it is serialized as part
+    /// of this session. Used when the previous cache file's data is not
+    /// carried forward into the new file.
+    Promote,
+    /// Only decode the value and verify its fingerprint, without keeping it.
+    /// Used when the previous file's data is carried forward: the value's
+    /// bytes are copied into the new file directly, but the verification
+    /// that loading performs should still happen.
+    VerifyOnly,
 }
 
 /// A "work product" corresponds to a `.o` (or other) file that we

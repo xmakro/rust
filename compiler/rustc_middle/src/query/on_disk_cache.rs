@@ -56,6 +56,17 @@ pub struct OnDiskCache {
     // The complete cache data in serialized form.
     serialized_data: RwLock<Option<Mmap>>,
 
+    // The byte range of the previous session's data region (everything before
+    // the footer). When possible, this region is carried forward verbatim into
+    // the next cache file, so that the values of green nodes never need to be
+    // decoded and re-encoded. A value keeps working because its node keeps its
+    // index, which is also the tag embedded in its bytes. Values of deleted
+    // nodes ride along unreferenced until a rewrite, and since indices get
+    // reused, such a value's tag can match a later node's index; the tag check
+    // alone therefore cannot catch an entry mispointed into the region.
+    start_pos: usize,
+    footer_pos: usize,
+
     file_index_to_stable_id: FxHashMap<SourceFileIndex, EncodedSourceFileId>,
 
     // Caches that are populated lazily during decoding.
@@ -70,6 +81,10 @@ pub struct OnDiskCache {
     side_effects_index: FxHashMap<SerializedDepNodeIndex, AbsoluteBytePos>,
 
     alloc_decoding_state: AllocDecodingState,
+
+    /// The previous session's raw allocation index, kept for seeding the next
+    /// session's index when the data region is carried forward.
+    prev_interpret_alloc_index: Vec<u64>,
 
     // One table per data region of the cache file, ordered oldest first.
     // See `SyntaxContextTable`.
@@ -136,8 +151,9 @@ impl AbsoluteBytePos {
 /// encoded in the same session, so each region has its own table, selected by
 /// the position an id is decoded from (see [`syntax_context_table_for`]). The
 /// stored positions are absolute: a table stays valid only for as long as its
-/// region's bytes keep their absolute positions in the file. A cache file
-/// currently contains a single region, ending at the footer.
+/// region's bytes keep their absolute positions in the file. Regions carried
+/// forward from earlier sessions keep their tables; this session's region ends
+/// at the footer.
 struct SyntaxContextTable {
     /// Position one past the end of the data region this table describes.
     region_end: AbsoluteBytePos,
@@ -180,7 +196,7 @@ fn syntax_context_table_for(
     tables.get(tables.partition_point(|table| table.region_end <= position))
 }
 
-#[derive(Encodable, Decodable, Clone, Debug)]
+#[derive(Encodable, Decodable, Clone, Debug, PartialEq, Eq, Hash)]
 struct EncodedSourceFileId {
     stable_source_file_id: StableSourceFileId,
     stable_crate_id: StableCrateId,
@@ -220,10 +236,13 @@ impl OnDiskCache {
         debug_assert!(footer.syntax_context_tables.is_sorted_by_key(|table| table.region_end));
         Ok(Self {
             serialized_data: RwLock::new(Some(data)),
+            start_pos,
+            footer_pos,
             file_index_to_stable_id: footer.file_index_to_stable_id,
             file_index_to_file: Default::default(),
             query_values_index: footer.query_values_index.into_iter().collect(),
             side_effects_index: footer.side_effects_index.into_iter().collect(),
+            prev_interpret_alloc_index: footer.interpret_alloc_index.clone(),
             alloc_decoding_state: AllocDecodingState::new(footer.interpret_alloc_index),
             syntax_context_tables: footer.syntax_context_tables,
             expn_data: footer.expn_data,
@@ -234,10 +253,13 @@ impl OnDiskCache {
     pub fn new_empty() -> Self {
         Self {
             serialized_data: RwLock::new(None),
+            start_pos: 0,
+            footer_pos: 0,
             file_index_to_stable_id: Default::default(),
             file_index_to_file: Default::default(),
             query_values_index: Default::default(),
             side_effects_index: Default::default(),
+            prev_interpret_alloc_index: Vec::new(),
             alloc_decoding_state: AllocDecodingState::new(Vec::new()),
             syntax_context_tables: Vec::new(),
             expn_data: UnhashMap::default(),
@@ -251,31 +273,131 @@ impl OnDiskCache {
         *self.serialized_data.write() = None;
     }
 
+    /// Take ownership of the serialized backing `Mmap`, so its data region can
+    /// be carried forward into the next cache file while the old file itself
+    /// is unlinked and replaced.
+    pub fn take_serialized_data_mmap(&self) -> Option<Mmap> {
+        self.serialized_data.write().take()
+    }
+
+    /// Bound the number of carried generations: every generation keeps its
+    /// own syntax context table alive and dead data from red nodes
+    /// accumulates, so occasionally fall back to a full re-encode, which
+    /// compacts the cache again.
+    const MAX_CARRIED_GENERATIONS: usize = 8;
+
+    /// Whether [`OnDiskCache::serialize`] can carry the previous cache file's
+    /// data region forward into a new file whose data region starts at
+    /// `expected_start_pos`. When it cannot, values that are not in memory
+    /// must be promoted into the memory cache before the previous file's
+    /// data is dropped, or they will be lost to the next session.
+    pub fn can_carry_data(&self, expected_start_pos: usize) -> bool {
+        self.footer_pos > self.start_pos
+            // The copied region keeps its offsets only if the new file's
+            // header has the same length as the old one.
+            && self.start_pos == expected_start_pos
+            && self.syntax_context_tables.len() < Self::MAX_CARRIED_GENERATIONS
+            && self.serialized_data.read().as_ref().is_some_and(|data| data.len() >= self.footer_pos)
+    }
+
     /// Serialize the current-session data that will be loaded by [`OnDiskCache`]
     /// in a subsequent incremental compilation session.
-    pub fn serialize(tcx: TyCtxt<'_>, encoder: FileEncoder<'static>) -> FileEncodeResult {
+    ///
+    /// When `carried_data` holds the previous session's cache contents, its
+    /// data region is copied into the new file verbatim, and the values of
+    /// green dep nodes are referenced at their old positions instead of being
+    /// decoded into memory and re-encoded. All position-dependent references
+    /// inside the region (type and symbol shorthands, allocation data) stay
+    /// valid because the region keeps its exact offsets.
+    ///
+    /// The caller must only pass `carried_data` when [`OnDiskCache::can_carry_data`]
+    /// held; otherwise it must promote on-disk values into the memory cache
+    /// before dropping them (see `save_dep_graph`).
+    pub fn serialize(
+        tcx: TyCtxt<'_>,
+        mut encoder: FileEncoder<'static>,
+        carried_data: Option<Mmap>,
+    ) -> FileEncodeResult {
         // Serializing the `DepGraph` should not modify it.
         tcx.dep_graph.with_ignore(|| {
+            let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
+
+            let carried: Option<&[u8]> = carried_data.as_deref().map(|data| {
+                // `can_carry_data` verified this against the header size the
+                // caller expected; the copied region keeps its offsets only
+                // if the new file's header has the same length as the old
+                // one, so a mismatch here would corrupt the cache.
+                assert_eq!(on_disk_cache.start_pos, encoder.position());
+                &data[on_disk_cache.start_pos..on_disk_cache.footer_pos]
+            });
+
+            // Copy the previous data region before anything else is encoded.
+            if let Some(bytes) = carried {
+                encoder.emit_raw_bytes(bytes);
+            }
+
             // Allocate `SourceFileIndex`es.
             let (file_to_file_index, file_index_to_stable_id) = {
                 let files = tcx.sess.source_map().files();
                 let mut file_to_file_index =
                     FxHashMap::with_capacity_and_hasher(files.len(), Default::default());
-                let mut file_index_to_stable_id =
-                    FxHashMap::with_capacity_and_hasher(files.len(), Default::default());
 
-                for (index, file) in files.iter().enumerate() {
-                    let index = SourceFileIndex(index as u32);
-                    let file_ptr: *const SourceFile = &raw const **file;
-                    file_to_file_index.insert(file_ptr, index);
-                    let source_file_id = EncodedSourceFileId::new(tcx, file);
-                    file_index_to_stable_id.insert(index, source_file_id);
+                if carried.is_some() {
+                    // Spans in the carried region reference the previous
+                    // sessions' file indices: preserve every old assignment,
+                    // including ones whose file is gone (their indices must
+                    // not be reused), and append new files after them.
+                    let mut file_index_to_stable_id = on_disk_cache.file_index_to_stable_id.clone();
+                    // The maps are only used for lookups and max computation here,
+                    // so the iteration order does not affect the output.
+                    #[allow(rustc::potential_query_instability)]
+                    let mut stable_id_to_index: FxHashMap<
+                        EncodedSourceFileId,
+                        SourceFileIndex,
+                    > = file_index_to_stable_id.iter().map(|(&i, id)| (id.clone(), i)).collect();
+                    #[allow(rustc::potential_query_instability)]
+                    let next_index_init =
+                        file_index_to_stable_id.keys().map(|i| i.0).max().map_or(0, |m| m + 1);
+                    let mut next_index = next_index_init;
+
+                    for file in files.iter() {
+                        let source_file_id = EncodedSourceFileId::new(tcx, file);
+                        let index = *stable_id_to_index
+                            .entry(source_file_id.clone())
+                            .or_insert_with(|| {
+                                let index = SourceFileIndex(next_index);
+                                next_index += 1;
+                                index
+                            });
+                        let file_ptr: *const SourceFile = &raw const **file;
+                        file_to_file_index.insert(file_ptr, index);
+                        file_index_to_stable_id.insert(index, source_file_id);
+                    }
+                    (file_to_file_index, file_index_to_stable_id)
+                } else {
+                    let mut file_index_to_stable_id =
+                        FxHashMap::with_capacity_and_hasher(files.len(), Default::default());
+
+                    for (index, file) in files.iter().enumerate() {
+                        let index = SourceFileIndex(index as u32);
+                        let file_ptr: *const SourceFile = &raw const **file;
+                        file_to_file_index.insert(file_ptr, index);
+                        let source_file_id = EncodedSourceFileId::new(tcx, file);
+                        file_index_to_stable_id.insert(index, source_file_id);
+                    }
+
+                    (file_to_file_index, file_index_to_stable_id)
                 }
-
-                (file_to_file_index, file_index_to_stable_id)
             };
 
             let hygiene_encode_context = HygieneEncodeContext::default();
+
+            // Allocation indices embedded in the carried region reference the
+            // previous sessions' allocation table: keep its entries (their
+            // data lives in the copied region at unchanged positions) and
+            // make this session's encoder assign indices after them.
+            let alloc_index_offset =
+                if carried.is_some() { on_disk_cache.prev_interpret_alloc_index.len() } else { 0 };
 
             let mut encoder = CacheEncoder {
                 tcx,
@@ -283,6 +405,7 @@ impl OnDiskCache {
                 type_shorthands: Default::default(),
                 predicate_shorthands: Default::default(),
                 interpret_allocs: Default::default(),
+                alloc_index_offset: alloc_index_offset.try_into().unwrap(),
                 caching_source_map_view: CachingSourceMapView::new(tcx.sess.source_map()),
                 file_to_file_index,
                 hygiene_context: &hygiene_encode_context,
@@ -290,6 +413,19 @@ impl OnDiskCache {
                 query_values_index: Default::default(),
                 side_effects_index: Default::default(),
             };
+
+            // Reference the values of green nodes at their positions in the
+            // carried region. Values that are in memory anyway (for example
+            // because the query re-executed) are also encoded freshly below;
+            // fresh entries are appended after these carried entries, and the
+            // load path lets later entries win.
+            if carried.is_some() {
+                tcx.dep_graph.for_each_green_prev_index(&mut |prev_index| {
+                    if let Some(&pos) = on_disk_cache.query_values_index.get(&prev_index) {
+                        encoder.query_values_index.push((prev_index, pos));
+                    }
+                });
+            }
 
             // Encode query return values.
             tcx.sess.time("encode_query_values", || {
@@ -302,7 +438,13 @@ impl OnDiskCache {
             }
 
             let interpret_alloc_index = {
-                let mut interpret_alloc_index = Vec::new();
+                // Carried values reference the previous sessions' allocation
+                // entries by index: keep them, and append this session's.
+                let mut interpret_alloc_index = if carried.is_some() {
+                    on_disk_cache.prev_interpret_alloc_index.clone()
+                } else {
+                    Vec::new()
+                };
                 let mut n = 0;
                 loop {
                     let new_n = encoder.interpret_allocs.len();
@@ -324,8 +466,19 @@ impl OnDiskCache {
             };
 
             let mut syntax_contexts = FxHashMap::default();
-            let mut expn_data = UnhashMap::default();
-            let mut foreign_expn_data = UnhashMap::default();
+            // Expansions are keyed by their session-independent hash, so
+            // carried entries (whose data lives in the copied region) share
+            // one table with this session's; fresh entries overwrite.
+            let mut expn_data = if carried.is_some() {
+                on_disk_cache.expn_data.clone()
+            } else {
+                UnhashMap::default()
+            };
+            let mut foreign_expn_data = if carried.is_some() {
+                on_disk_cache.foreign_expn_data.clone()
+            } else {
+                UnhashMap::default()
+            };
 
             // Encode all hygiene data (`SyntaxContextData` and `ExpnData`) from the current
             // session.
@@ -353,9 +506,20 @@ impl OnDiskCache {
             let query_values_index = mem::take(&mut encoder.query_values_index);
             let side_effects_index = mem::take(&mut encoder.side_effects_index);
 
-            // This session's data forms a single region ending at the footer.
-            let syntax_context_tables =
-                vec![SyntaxContextTable::new(AbsoluteBytePos(footer_pos), syntax_contexts)];
+            // The carried regions keep their syntax context tables (their
+            // encoded ids live in their own id spaces); this session's table
+            // covers the region up to the footer.
+            let mut syntax_context_tables: Vec<SyntaxContextTable> = if carried.is_some() {
+                on_disk_cache
+                    .syntax_context_tables
+                    .iter()
+                    .map(|table| SyntaxContextTable::new(table.region_end, table.positions.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            syntax_context_tables
+                .push(SyntaxContextTable::new(AbsoluteBytePos(footer_pos), syntax_contexts));
 
             encoder.encode_tagged(
                 TAG_FILE_FOOTER,
@@ -847,6 +1011,9 @@ pub struct CacheEncoder<'a, 'tcx> {
     type_shorthands: FxHashMap<Ty<'tcx>, usize>,
     predicate_shorthands: FxHashMap<ty::PredicateKind<'tcx>, usize>,
     interpret_allocs: FxIndexSet<interpret::AllocId>,
+    /// Number of allocation entries carried over from previous sessions;
+    /// indices assigned by this encoder start after them.
+    alloc_index_offset: u32,
     caching_source_map_view: CachingSourceMapView<'tcx>,
     file_to_file_index: FxHashMap<*const SourceFile, SourceFileIndex>,
     hygiene_context: &'a HygieneEncodeContext,
@@ -1030,7 +1197,7 @@ impl<'a, 'tcx> TyEncoder<'tcx> for CacheEncoder<'a, 'tcx> {
     fn encode_alloc_id(&mut self, alloc_id: &interpret::AllocId) {
         let (index, _) = self.interpret_allocs.insert_full(*alloc_id);
 
-        index.encode(self);
+        (self.alloc_index_offset as usize + index).encode(self);
     }
 }
 

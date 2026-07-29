@@ -252,6 +252,14 @@ pub(crate) struct MoveDepGraph<'a> {
 }
 
 #[derive(Diagnostic)]
+#[diag("failed to move query cache from `{$from}` to `{$to}`: {$err}")]
+pub(crate) struct MoveQueryCache<'a> {
+    pub from: &'a Path,
+    pub to: &'a Path,
+    pub err: std::io::Error,
+}
+
+#[derive(Diagnostic)]
 #[diag("failed to create dependency graph at `{$path}`: {$err}")]
 pub(crate) struct CreateDepGraph<'a> {
     pub path: &'a Path,

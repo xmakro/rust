@@ -1,7 +1,7 @@
 use std::fs;
 
 use rustc_data_structures::sync::par_join;
-use rustc_middle::dep_graph::{DepGraph, WorkProductMap};
+use rustc_middle::dep_graph::{CachePromotionMode, DepGraph, WorkProductMap};
 use rustc_middle::query::on_disk_cache;
 use rustc_middle::ty::TyCtxt;
 use rustc_serialize::Encodable as RustcEncodable;
@@ -35,6 +35,7 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
         }
 
         let query_cache_path = query_cache_path(sess);
+        let staging_query_cache_path = staging_query_cache_path(sess);
         let dep_graph_path = dep_graph_path(sess);
         let staging_dep_graph_path = staging_dep_graph_path(sess);
 
@@ -61,27 +62,61 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                     // even if there was no previous session.
                     let on_disk_cache = tcx.query_system.on_disk_cache.as_ref().unwrap();
 
-                    // For every green dep node that has a disk-cached value from the
-                    // previous session, make sure the value is loaded into the memory
-                    // cache, so that it will be serialized as part of this session.
-                    //
-                    // This reads data from the previous session, so it needs to happen
-                    // before dropping the mmap.
-                    //
-                    // FIXME(Zalathar): This step is intended to be cheap, but still does
-                    // quite a lot of work, especially in builds with few or no changes.
-                    // Can we be smarter about how we identify values that need promotion?
-                    // Can we promote values without decoding them into the memory cache?
-                    tcx.dep_graph.exec_cache_promotions(tcx);
+                    // When possible, the values of green nodes are carried forward
+                    // from the previous cache file byte for byte, so its contents
+                    // must stay readable while the new file is written: the mapping
+                    // is kept alive until serialization is done. Carrying is
+                    // periodically skipped to compact the cache (see
+                    // `can_carry_data`).
+                    let carry = on_disk_cache.can_carry_data(file_format::header_size(sess));
 
-                    // Drop the memory map so that we can remove the file and write to it.
-                    on_disk_cache.close_serialized_data_mmap();
+                    let carried_data = if carry {
+                        // Carried values are not decoded, so the verification that
+                        // loading performs would not run for them. Preserve its
+                        // coverage: verify the same subset of not-loaded values
+                        // that promotion (below) would have, without re-encoding.
+                        tcx.dep_graph.exec_cache_promotions(tcx, CachePromotionMode::VerifyOnly);
 
-                    file_format::save_in(sess, query_cache_path, "query cache", |encoder| {
-                        tcx.sess.time("incr_comp_serialize_result_cache", || {
-                            on_disk_cache::OnDiskCache::serialize(tcx, encoder)
-                        })
-                    });
+                        on_disk_cache.take_serialized_data_mmap()
+                    } else {
+                        // For every green dep node that has a disk-cached value from
+                        // the previous session, make sure the value is loaded into
+                        // the memory cache, so that it will be serialized as part of
+                        // this session.
+                        //
+                        // This reads data from the previous session, so it needs to
+                        // happen before dropping the mmap.
+                        tcx.dep_graph.exec_cache_promotions(tcx, CachePromotionMode::Promote);
+
+                        // The mapping is not needed anymore.
+                        on_disk_cache.close_serialized_data_mmap();
+                        None
+                    };
+
+                    // The new file is written to a staging path and swapped in
+                    // when complete: the old file stays mapped while its data
+                    // region is copied into the new one, and on Windows a
+                    // mapped file cannot be removed or replaced.
+                    file_format::save_in(
+                        sess,
+                        staging_query_cache_path.clone(),
+                        "query cache",
+                        |encoder| {
+                            tcx.sess.time("incr_comp_serialize_result_cache", || {
+                                on_disk_cache::OnDiskCache::serialize(tcx, encoder, carried_data)
+                            })
+                        },
+                    );
+
+                    // `serialize` consumed and dropped the mapping, so the old
+                    // file can be replaced now.
+                    if let Err(err) = fs::rename(&staging_query_cache_path, &query_cache_path) {
+                        sess.dcx().emit_err(diagnostics::MoveQueryCache {
+                            from: &staging_query_cache_path,
+                            to: &query_cache_path,
+                            err,
+                        });
+                    }
                 });
             },
         );
