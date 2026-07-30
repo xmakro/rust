@@ -3,7 +3,8 @@ use std::panic;
 use tracing::instrument;
 
 pub use self::dep_node::{
-    DepKind, DepKindVTable, DepNode, WorkProductId, dep_kind_from_label, label_strs,
+    CachePromotionMode, DepKind, DepKindVTable, DepNode, WorkProductId, dep_kind_from_label,
+    label_strs,
 };
 pub use self::dep_node_key::DepNodeKey;
 pub use self::graph::{

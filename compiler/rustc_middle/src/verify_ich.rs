@@ -9,6 +9,20 @@ use crate::dep_graph::{DepGraphData, SerializedDepNodeIndex};
 use crate::ich::StableHashState;
 use crate::ty::TyCtxt;
 
+/// Whether a value loaded from the on-disk cache should have its fingerprint
+/// verified with `incremental_verify_ich`. If `-Zincremental-verify-ich` is
+/// specified, re-hash results from the cache and make sure that they have the
+/// expected fingerprint.
+///
+/// If not, we still seek to verify a subset of fingerprints loaded from disk.
+/// Re-hashing results is fairly expensive, so we can't currently afford to
+/// verify every hash. This subset should still give us some coverage of
+/// potential bugs.
+pub fn should_verify_loaded_value(tcx: TyCtxt<'_>, prev_fingerprint: Fingerprint) -> bool {
+    prev_fingerprint.split().1.as_u64().is_multiple_of(32)
+        || tcx.sess.opts.unstable_opts.incremental_verify_ich
+}
+
 #[inline]
 #[instrument(skip(tcx, dep_graph_data, result, hash_result, format_value), level = "debug")]
 pub fn incremental_verify_ich<'tcx, V>(

@@ -6,18 +6,20 @@ use rustc_data_structures::unord::UnordMap;
 use rustc_middle::bug;
 #[expect(unused_imports, reason = "used by doc comments")]
 use rustc_middle::dep_graph::DepKindVTable;
-use rustc_middle::dep_graph::{DepNode, DepNodeIndex, DepNodeKey, SerializedDepNodeIndex};
+use rustc_middle::dep_graph::{
+    CachePromotionMode, DepNode, DepNodeIndex, DepNodeKey, SerializedDepNodeIndex,
+};
 use rustc_middle::query::erase::{Erasable, Erased};
 use rustc_middle::query::on_disk_cache::{CacheDecoder, CacheEncoder};
 use rustc_middle::query::{QueryCache, QueryJobId, QueryVTable, erase};
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::ty::tls::{self, ImplicitCtxt};
-use rustc_middle::verify_ich::incremental_verify_ich;
+use rustc_middle::verify_ich::{incremental_verify_ich, should_verify_loaded_value};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::def_id::LOCAL_CRATE;
 
 use crate::error::{QueryOverflow, QueryOverflowNote};
-use crate::execution::{all_inactive, should_verify_loaded_value};
+use crate::execution::all_inactive;
 use crate::job::find_dep_kind_root;
 use crate::query_impl::for_each_query_vtable;
 use crate::{CollectActiveJobsKind, collect_active_query_jobs};
@@ -143,6 +145,7 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
     dep_node: DepNode,
     prev_index: SerializedDepNodeIndex,
     dep_node_index: DepNodeIndex,
+    mode: CachePromotionMode,
 ) {
     debug_assert!(tcx.dep_graph.is_green(&dep_node));
 
@@ -159,7 +162,9 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
         return;
     }
 
-    // If the value is already in memory, then promotion isn't needed.
+    // If the value is already in memory, then it was verified when it was
+    // loaded (or computed afresh) and will be re-encoded, so neither
+    // promotion nor verification is needed.
     if query.cache.lookup(&key).is_some() {
         return;
     }
@@ -177,21 +182,38 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
         bug!("failed to load disk-cached value for green node {dep_node:?}");
     };
 
-    // Verify the fingerprints of the same subset of loaded values as
-    // `load_from_disk_or_invoke_provider_green` does.
-    let prev_fingerprint = dep_graph_data.prev_value_fingerprint_of(prev_index);
-    if should_verify_loaded_value(tcx, prev_fingerprint) {
-        incremental_verify_ich(
-            tcx,
-            dep_graph_data,
-            &value,
-            prev_index,
-            query.hash_value_fn,
-            query.format_value,
-        );
-    }
+    match mode {
+        CachePromotionMode::Promote => {
+            // Verify the fingerprints of the same subset of loaded values as
+            // `load_from_disk_or_invoke_provider_green` does.
+            let prev_fingerprint = dep_graph_data.prev_value_fingerprint_of(prev_index);
+            if should_verify_loaded_value(tcx, prev_fingerprint) {
+                incremental_verify_ich(
+                    tcx,
+                    dep_graph_data,
+                    &value,
+                    prev_index,
+                    query.hash_value_fn,
+                    query.format_value,
+                );
+            }
 
-    query.cache.complete(key, value, dep_node_index);
+            query.cache.complete(key, value, dep_node_index);
+        }
+        CachePromotionMode::VerifyOnly => {
+            // The caller already selected this node for verification, and its
+            // on-disk bytes are carried forward as they are: verify the
+            // decoded value and drop it.
+            incremental_verify_ich(
+                tcx,
+                dep_graph_data,
+                &value,
+                prev_index,
+                query.hash_value_fn,
+                query.format_value,
+            );
+        }
+    }
 }
 
 pub(crate) fn try_load_from_disk<'tcx, V>(

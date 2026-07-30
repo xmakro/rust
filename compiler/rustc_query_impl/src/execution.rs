@@ -1,7 +1,6 @@
 use std::hash::Hash;
 use std::mem::ManuallyDrop;
 
-use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::hash_table::{Entry, HashTable};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::{DynSend, DynSync};
@@ -13,7 +12,7 @@ use rustc_middle::query::{
     QueryState, QueryVTable,
 };
 use rustc_middle::ty::TyCtxt;
-use rustc_middle::verify_ich::incremental_verify_ich;
+use rustc_middle::verify_ich::{incremental_verify_ich, should_verify_loaded_value};
 use rustc_span::{DUMMY_SP, Span};
 use tracing::debug;
 
@@ -483,20 +482,6 @@ fn execute_job_incr<'tcx, C: QueryCache>(
     prof_timer.finish_with_query_invocation_id(dep_node_index.into());
 
     (result, dep_node_index)
-}
-
-/// Whether a value loaded from the on-disk cache should have its fingerprint
-/// verified with `incremental_verify_ich`. If `-Zincremental-verify-ich` is
-/// specified, re-hash results from the cache and make sure that they have the
-/// expected fingerprint.
-///
-/// If not, we still seek to verify a subset of fingerprints loaded from disk.
-/// Re-hashing results is fairly expensive, so we can't currently afford to
-/// verify every hash. This subset should still give us some coverage of
-/// potential bugs.
-pub(crate) fn should_verify_loaded_value(tcx: TyCtxt<'_>, prev_fingerprint: Fingerprint) -> bool {
-    prev_fingerprint.split().1.as_u64().is_multiple_of(32)
-        || tcx.sess.opts.unstable_opts.incremental_verify_ich
 }
 
 /// Given that the dep node for this query+key is green, obtain a value for it

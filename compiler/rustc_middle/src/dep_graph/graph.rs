@@ -26,7 +26,7 @@ use {super::debug::EdgeFilter, std::env};
 use super::edges::{ReadsRecorder, SMALL_READS_MAX, TaskReads};
 use super::retained::RetainedDepGraph;
 use super::serialized::{GraphEncoder, SerializedDepGraph, SerializedDepNodeIndex};
-use super::{DepKind, DepNode, WorkProductId, read_deps, with_deps};
+use super::{CachePromotionMode, DepKind, DepNode, WorkProductId, read_deps, with_deps};
 use crate::ich::StableHashState;
 use crate::ty::TyCtxt;
 use crate::verify_ich::incremental_verify_ich;
@@ -718,7 +718,6 @@ impl DepGraphData {
         matches!(self.colors.get(prev_index), DepNodeColor::Green(_))
     }
 
-    #[inline]
     pub fn prev_value_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> Fingerprint {
         self.previous.value_fingerprint_for_index(prev_index)
     }
@@ -1068,26 +1067,60 @@ impl DepGraph {
         }
     }
 
-    /// This method loads all on-disk cacheable query results into memory, so
-    /// they can be written out to the new cache file again. Most query results
-    /// will already be in memory but in the case where we marked something as
-    /// green but then did not need the value, that value will never have been
-    /// loaded from disk.
+    /// Invokes `f` for every node of the previous session that was marked
+    /// green during this session, together with its current-session index.
+    /// Used when saving the query cache, to reference the still-valid values
+    /// of green nodes at their positions in the previous cache file.
+    pub fn for_each_green_prev_index(&self, f: &mut dyn FnMut(SerializedDepNodeIndex)) {
+        let data = self.data.as_ref().unwrap();
+        for prev_index in data.colors.values.indices() {
+            if let DepNodeColor::Green(dep_node_index) = data.colors.get(prev_index) {
+                // A green node keeps its index across sessions.
+                debug_assert_eq!(prev_index.as_u32(), dep_node_index.as_u32());
+                f(prev_index);
+            }
+        }
+    }
+
+    /// With [`CachePromotionMode::Promote`], loads all on-disk cacheable
+    /// query results into memory, so they can be written out to the new cache
+    /// file again. Most query results will already be in memory but in the
+    /// case where we marked something as green but then did not need the
+    /// value, that value will never have been loaded from disk.
+    ///
+    /// With [`CachePromotionMode::VerifyOnly`], used when the on-disk values
+    /// are carried forward instead of re-encoded, only decodes and verifies
+    /// the values that `Promote` would have verified, and drops them again.
     ///
     /// This method will only load queries that will end up in the disk cache.
     /// Other queries will not be executed.
-    pub fn exec_cache_promotions<'tcx>(&self, tcx: TyCtxt<'tcx>) {
-        let _prof_timer = tcx.prof.generic_activity("incr_comp_query_cache_promotion");
+    pub fn exec_cache_promotions<'tcx>(&self, tcx: TyCtxt<'tcx>, mode: CachePromotionMode) {
+        let _prof_timer = tcx.prof.generic_activity(match mode {
+            CachePromotionMode::Promote => "incr_comp_query_cache_promotion",
+            CachePromotionMode::VerifyOnly => "incr_comp_query_cache_verification",
+        });
 
         let data = self.data.as_ref().unwrap();
         for prev_index in data.colors.values.indices() {
             match data.colors.get(prev_index) {
                 DepNodeColor::Green(dep_node_index) => {
+                    // When only verifying, filter by the same predicate the
+                    // promotion path applies after decoding, so that all the
+                    // per-node work below is skipped for values that would
+                    // not be verified anyway.
+                    if mode == CachePromotionMode::VerifyOnly
+                        && !crate::verify_ich::should_verify_loaded_value(
+                            tcx,
+                            data.previous.value_fingerprint_for_index(prev_index),
+                        )
+                    {
+                        continue;
+                    }
                     let dep_node = data.previous.index_to_node(prev_index);
                     if let Some(promote_fn) =
                         tcx.dep_kind_vtable(dep_node.kind).promote_from_disk_fn
                     {
-                        promote_fn(tcx, *dep_node, prev_index, dep_node_index)
+                        promote_fn(tcx, *dep_node, prev_index, dep_node_index, mode)
                     };
                 }
                 DepNodeColor::Unknown | DepNodeColor::Red => {

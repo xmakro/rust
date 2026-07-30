@@ -130,6 +130,7 @@ const DEP_GRAPH_FILENAME: &str = "dep-graph.bin";
 const STAGING_DEP_GRAPH_FILENAME: &str = "dep-graph.part.bin";
 const WORK_PRODUCTS_FILENAME: &str = "work-products.bin";
 const QUERY_CACHE_FILENAME: &str = "query-cache.bin";
+const STAGING_QUERY_CACHE_FILENAME: &str = "query-cache.part.bin";
 
 // We encode integers using the following base, so they are shorter than decimal
 // or hexadecimal numbers (we want short file and directory names). Since these
@@ -157,6 +158,14 @@ pub(crate) fn work_products_path(sess: &Session) -> PathBuf {
 /// Returns the path to a session's query cache.
 pub(crate) fn query_cache_path(sess: &Session) -> PathBuf {
     in_incr_comp_dir_sess(sess, QUERY_CACHE_FILENAME)
+}
+
+/// Returns the path the query cache is written to before it replaces the
+/// previous session's file. The new file is written while the previous one
+/// is still memory-mapped (its data region is carried forward into the new
+/// file), so it cannot be written to the final path directly.
+pub(crate) fn staging_query_cache_path(sess: &Session) -> PathBuf {
+    in_incr_comp_dir_sess(sess, STAGING_QUERY_CACHE_FILENAME)
 }
 
 /// Locks a given session directory.
