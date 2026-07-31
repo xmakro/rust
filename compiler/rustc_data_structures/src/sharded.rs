@@ -143,8 +143,12 @@ pub fn shards() -> usize {
 pub type ShardedHashMap<K, V> = Sharded<hash_table::HashTable<(K, V)>>;
 
 impl<K: Eq, V> ShardedHashMap<K, V> {
+    /// `cap` is the capacity of the map as a whole, so it is spread across the shards rather than
+    /// handed to each of them. Callers size it from observed total entry counts, and with 32 shards
+    /// giving every shard the full figure overshoots by that factor.
     pub fn with_capacity(cap: usize) -> Self {
-        Self::new(|| HashTable::with_capacity(cap))
+        let per_shard = cap.div_ceil(shards());
+        Self::new(|| HashTable::with_capacity(per_shard))
     }
     pub fn len(&self) -> usize {
         self.lock_shards().map(|shard| shard.len()).sum()
