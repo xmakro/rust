@@ -275,6 +275,34 @@ impl<T: Idx> DenseBitSet<T> {
         BitIter::new(&self.words)
     }
 
+    /// Returns the smallest set bit within `range`, if any.
+    pub fn first_set_in(&self, range: impl RangeBounds<T>) -> Option<T> {
+        let (start, end) = inclusive_start_end(range, self.domain_size)?;
+        let (start_word_index, start_mask) = word_index_and_mask(start);
+        let (end_word_index, _) = word_index_and_mask(end);
+
+        // Mask off the bits before `start`; they are outside the range.
+        let start_word = self.words[start_word_index] & !(start_mask - 1);
+        if start_word != 0 {
+            let pos = min_bit(start_word) + WORD_BITS * start_word_index;
+            // A hit beyond `end` can only occur in the last word of the range, so there is nothing
+            // left to search.
+            return if pos <= end { Some(T::new(pos)) } else { None };
+        }
+
+        if let Some(offset) =
+            self.words[start_word_index + 1..=end_word_index].iter().position(|&w| w != 0)
+        {
+            let word_idx = start_word_index + 1 + offset;
+            let pos = min_bit(self.words[word_idx]) + WORD_BITS * word_idx;
+            if pos <= end {
+                return Some(T::new(pos));
+            }
+        }
+
+        None
+    }
+
     pub fn last_set_in(&self, range: impl RangeBounds<T>) -> Option<T> {
         let (start, end) = inclusive_start_end(range, self.domain_size)?;
         let (start_word_index, _) = word_index_and_mask(start);
@@ -1746,6 +1774,11 @@ fn clear_excess_bits_in_final_word(domain_size: usize, words: &mut [Word]) {
         let mask = (1 << num_bits_in_final_word) - 1;
         words[words.len() - 1] &= mask;
     }
+}
+
+#[inline]
+fn min_bit(word: Word) -> usize {
+    word.trailing_zeros() as usize
 }
 
 #[inline]

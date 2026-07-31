@@ -792,6 +792,49 @@ fn dense_insert_range() {
 }
 
 #[test]
+fn dense_first_set_in() {
+    fn easy(set: &DenseBitSet<usize>, needle: impl RangeBounds<usize>) -> Option<usize> {
+        set.iter().find(|e| needle.contains(e))
+    }
+
+    #[track_caller]
+    fn cmp(set: &DenseBitSet<usize>, needle: impl RangeBounds<usize> + Clone + std::fmt::Debug) {
+        assert_eq!(
+            set.first_set_in(needle.clone()),
+            easy(set, needle.clone()),
+            "{:?} in {:?}",
+            needle,
+            set
+        );
+    }
+    let mut set = DenseBitSet::new_empty(300);
+    cmp(&set, 50..=50);
+    set.insert(WORD_BITS);
+    cmp(&set, WORD_BITS..=WORD_BITS);
+    set.insert(WORD_BITS - 1);
+    cmp(&set, 0..=WORD_BITS - 1);
+    cmp(&set, 0..=5);
+    cmp(&set, 10..100);
+    set.insert(100);
+    cmp(&set, 100..110);
+    cmp(&set, 99..100);
+    cmp(&set, 99..=100);
+
+    for i in 0..=WORD_BITS * 2 {
+        for j in i..=WORD_BITS * 2 {
+            for k in 0..WORD_BITS * 2 {
+                let mut set = DenseBitSet::new_empty(300);
+                cmp(&set, i..j);
+                cmp(&set, i..=j);
+                set.insert(k);
+                cmp(&set, i..j);
+                cmp(&set, i..=j);
+            }
+        }
+    }
+}
+
+#[test]
 fn dense_last_set_before() {
     fn easy(set: &DenseBitSet<usize>, needle: impl RangeBounds<usize>) -> Option<usize> {
         let mut last_leq = None;

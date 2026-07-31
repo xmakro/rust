@@ -34,11 +34,10 @@
 
 use std::cmp::Ordering;
 
-use rustc_data_structures::work_queue::WorkQueue;
 use rustc_index::bit_set::{DenseBitSet, MixedBitSet};
 use rustc_index::{Idx, IndexVec};
 use rustc_middle::bug;
-use rustc_middle::mir::{self, BasicBlock, CallReturnPlaces, Location, TerminatorEdges, traversal};
+use rustc_middle::mir::{self, BasicBlock, CallReturnPlaces, Location, TerminatorEdges};
 use rustc_middle::ty::TyCtxt;
 use tracing::error;
 
@@ -260,19 +259,7 @@ pub trait Analysis<'tcx> {
             bug!("`initialize_start_block` is not yet supported for backward dataflow analyses");
         }
 
-        let mut dirty_queue: WorkQueue<BasicBlock> = WorkQueue::with_none(body.basic_blocks.len());
-
-        if Self::Direction::IS_FORWARD {
-            for (bb, _) in traversal::reverse_postorder(body) {
-                dirty_queue.insert(bb);
-            }
-        } else {
-            // Reverse post-order on the reverse CFG may generate a better iteration order for
-            // backward dataflow analyses, but probably not enough to matter.
-            for (bb, _) in traversal::postorder(body) {
-                dirty_queue.insert(bb);
-            }
-        }
+        let mut dirty_queue = DirtyQueue::new(body, Self::Direction::IS_BACKWARD);
 
         // `state` is not actually used between iterations;
         // this is just an optimization to avoid reallocating
@@ -308,6 +295,113 @@ pub trait Analysis<'tcx> {
         }
 
         results
+    }
+}
+
+/// Placeholder position for a block that is not part of the visit order, i.e. one that is
+/// unreachable from the start block.
+const NO_POSITION: u32 = u32::MAX;
+
+/// Ditto, for a block that is currently queued in `DirtyQueue::unreachable`.
+const NO_POSITION_DIRTY: u32 = u32::MAX - 1;
+
+/// The set of blocks whose entry state may still change, used by [`Analysis::iterate_to_fixpoint`].
+///
+/// The queue repeatedly sweeps the analysis's visit order (reverse postorder for forward analyses,
+/// postorder for backward ones) and yields the dirty blocks it passes, instead of yielding blocks
+/// in insertion order. A sweep computes every input of a block except those coming from loop back
+/// edges before the block itself, so the number of sweeps needed is bounded by the loop nesting
+/// depth rather than by the size of the CFG. Insertion order gives no such bound: it interleaves
+/// the loops of the CFG arbitrarily, and on a function with many loops in sequence (a coroutine
+/// with many `.await`s, say) the number of visits per block grows with the number of loops.
+struct DirtyQueue<'a> {
+    /// The blocks to visit, in reverse postorder.
+    ///
+    /// Postorder is this same sequence walked back to front, so backward analyses reuse it in
+    /// reverse rather than storing an order of their own. (Reverse postorder on the reverse CFG
+    /// may be a better order for them, but probably not enough to matter.)
+    rpo: &'a [BasicBlock],
+
+    /// Whether `rpo` is to be walked back to front.
+    backward: bool,
+
+    /// The position of each block within the visit order, or `NO_POSITION`/`NO_POSITION_DIRTY` for
+    /// blocks that have none.
+    positions: IndexVec<BasicBlock, u32>,
+
+    /// The dirty blocks, keyed by their position in the visit order.
+    dirty: DenseBitSet<usize>,
+
+    /// How far the current sweep has gotten.
+    cursor: usize,
+
+    /// Dirty blocks that have no position. Backward analyses reach these, as an unreachable block
+    /// can be a predecessor of a reachable one.
+    unreachable: Vec<BasicBlock>,
+}
+
+impl<'a> DirtyQueue<'a> {
+    /// Creates a queue in which every block of the visit order is dirty.
+    fn new(body: &'a mir::Body<'_>, backward: bool) -> Self {
+        let rpo = body.basic_blocks.reverse_postorder();
+        let mut positions = IndexVec::from_elem_n(NO_POSITION, body.basic_blocks.len());
+        for (i, &bb) in rpo.iter().enumerate() {
+            positions[bb] = if backward { (rpo.len() - 1 - i) as u32 } else { i as u32 };
+        }
+
+        DirtyQueue {
+            rpo,
+            backward,
+            positions,
+            dirty: DenseBitSet::new_filled(rpo.len()),
+            cursor: 0,
+            unreachable: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn block_at(&self, pos: usize) -> BasicBlock {
+        if self.backward { self.rpo[self.rpo.len() - 1 - pos] } else { self.rpo[pos] }
+    }
+
+    #[inline]
+    fn insert(&mut self, bb: BasicBlock) {
+        match self.positions[bb] {
+            NO_POSITION => {
+                self.positions[bb] = NO_POSITION_DIRTY;
+                self.unreachable.push(bb);
+            }
+            NO_POSITION_DIRTY => {}
+            pos => {
+                self.dirty.insert(pos as usize);
+            }
+        }
+    }
+
+    /// Yields the next dirty block of the current sweep, starting a new sweep once the visit order
+    /// runs out.
+    ///
+    /// Restarting the sweep at a block dirtied behind the cursor as soon as that happens would be a
+    /// pessimization, not an improvement: a block joined from many back edges, such as the resume
+    /// dispatch of a coroutine, would then be recomputed once per back edge instead of once per
+    /// sweep.
+    #[inline]
+    fn pop(&mut self) -> Option<BasicBlock> {
+        let next = self
+            .dirty
+            .first_set_in(self.cursor..)
+            .or_else(|| if self.cursor > 0 { self.dirty.first_set_in(0..) } else { None });
+
+        if let Some(pos) = next {
+            self.dirty.remove(pos);
+            self.cursor = pos;
+            Some(self.block_at(pos))
+        } else if let Some(bb) = self.unreachable.pop() {
+            self.positions[bb] = NO_POSITION;
+            Some(bb)
+        } else {
+            None
+        }
     }
 }
 
