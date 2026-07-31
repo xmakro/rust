@@ -3,8 +3,6 @@
 //! well formed is performed elsewhere (e.g. during type checking or item well formedness
 //! checking).
 
-use std::iter;
-
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
 use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
@@ -579,32 +577,62 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
             return Default::default();
         }
 
-        let predicates = self.tcx().predicates_of(def_id);
-        let mut origins = vec![def_id; predicates.predicates.len()];
-        let mut head = predicates;
-        while let Some(parent) = head.parent {
-            head = self.tcx().predicates_of(parent);
-            origins.extend(iter::repeat(parent).take(head.predicates.len()));
+        let tcx = self.tcx();
+        let preds = tcx.predicates_of(def_id);
+        let mut obligations = match preds.parent {
+            Some(parent) => {
+                self.nominal_obligations_for_parents(tcx, parent, args, preds.predicates.len())
+            }
+            None => PredicateObligations::with_capacity(preds.predicates.len()),
+        };
+        // Most items have no parent; keeping that case out of the recursion lets this call inline.
+        self.push_own_obligations(tcx, def_id, args, preds, &mut obligations);
+        trace!(?obligations);
+        obligations
+    }
+
+    /// Emits the obligations for `def_id` and every ancestor in its `predicates_of` parent
+    /// chain, outermost first because diagnostics rely on that order.
+    fn nominal_obligations_for_parents(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        def_id: DefId,
+        args: GenericArgsRef<'tcx>,
+        descendant_count: usize,
+    ) -> PredicateObligations<'tcx> {
+        let preds = tcx.predicates_of(def_id);
+        let count = descendant_count + preds.predicates.len();
+        let mut obligations = match preds.parent {
+            Some(parent) => self.nominal_obligations_for_parents(tcx, parent, args, count),
+            None => PredicateObligations::with_capacity(count),
+        };
+        self.push_own_obligations(tcx, def_id, args, preds, &mut obligations);
+        obligations
+    }
+
+    #[inline(always)]
+    fn push_own_obligations(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        def_id: DefId,
+        args: GenericArgsRef<'tcx>,
+        preds: ty::GenericPredicates<'tcx>,
+        obligations: &mut PredicateObligations<'tcx>,
+    ) {
+        for (clause, span) in preds.instantiate_own(tcx, args) {
+            let code = ObligationCauseCode::WhereClause(def_id, span);
+            let cause = self.cause(code);
+            let obligation = traits::Obligation::with_depth(
+                tcx,
+                cause,
+                self.recursion_depth,
+                self.param_env,
+                clause.skip_norm_wip(),
+            );
+            if !obligation.has_escaping_bound_vars() {
+                obligations.push(obligation);
+            }
         }
-
-        let predicates = predicates.instantiate(self.tcx(), args);
-        trace!("{:#?}", predicates);
-        debug_assert_eq!(predicates.predicates.len(), origins.len());
-
-        iter::zip(predicates, origins.into_iter().rev())
-            .map(|((pred, span), origin_def_id)| {
-                let code = ObligationCauseCode::WhereClause(origin_def_id, span);
-                let cause = self.cause(code);
-                traits::Obligation::with_depth(
-                    self.tcx(),
-                    cause,
-                    self.recursion_depth,
-                    self.param_env,
-                    pred.skip_norm_wip(),
-                )
-            })
-            .filter(|pred| !pred.has_escaping_bound_vars())
-            .collect()
     }
 
     fn add_wf_preds_for_dyn_ty(
