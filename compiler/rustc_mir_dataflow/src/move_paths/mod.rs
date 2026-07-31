@@ -189,21 +189,38 @@ pub trait HasMoveData<'tcx> {
 
 #[derive(Debug)]
 pub struct LocationMap<T> {
-    /// Location-indexed (BasicBlock for outer index, index within BB
-    /// for inner index) map.
-    pub(crate) map: IndexVec<BasicBlock, Vec<T>>,
+    /// All per-location entries live in the single flat `data` vector.
+    /// `block_starts[bb]` gives the index in `data` where block `bb`'s entries
+    /// start; each block has one entry per statement plus one for its terminator.
+    data: Vec<T>,
+    block_starts: IndexVec<BasicBlock, usize>,
+}
+
+impl<T> LocationMap<T> {
+    #[inline]
+    fn offset(&self, loc: Location) -> usize {
+        let offset = self.block_starts[loc.block] + loc.statement_index;
+        // A block's entries end where the next block's begin, or at the end of
+        // `data` for the last block.
+        debug_assert!(
+            offset
+                < self.block_starts.raw.get(loc.block.as_usize() + 1).copied().unwrap_or(self.data.len()),
+            "{loc:?} is out of range for its block",
+        );
+        offset
+    }
 }
 
 impl<T> Index<Location> for LocationMap<T> {
     type Output = T;
     fn index(&self, index: Location) -> &Self::Output {
-        &self.map[index.block][index.statement_index]
+        &self.data[self.offset(index)]
     }
 }
 
 impl<T> IndexMut<Location> for LocationMap<T> {
     fn index_mut(&mut self, index: Location) -> &mut Self::Output {
-        &mut self.map[index.block][index.statement_index]
+        &mut self.data[self.offset(index)]
     }
 }
 
@@ -212,13 +229,13 @@ where
     T: Default + Clone,
 {
     fn new(body: &Body<'_>) -> Self {
-        LocationMap {
-            map: body
-                .basic_blocks
-                .iter()
-                .map(|block| vec![T::default(); block.statements.len() + 1])
-                .collect(),
+        let mut block_starts = IndexVec::with_capacity(body.basic_blocks.len());
+        let mut total = 0;
+        for block in body.basic_blocks.iter() {
+            block_starts.push(total);
+            total += block.statements.len() + 1;
         }
+        LocationMap { data: vec![T::default(); total], block_starts }
     }
 }
 
