@@ -1784,6 +1784,30 @@ struct UnderMacro(bool);
 
 impl KeywordIdents {
     fn check_tokens(&mut self, cx: &EarlyContext<'_>, tokens: &TokenStream) {
+        // A stream that is a lazy view of a flat token buffer can be checked
+        // in place: every token (including nested group contents) is an
+        // entry, and delimiter entries reset the `$` state exactly like the
+        // tree traversal below. This keeps the pre-expansion lint from
+        // materializing the tree of every macro invocation's arguments.
+        if let Some(view) = tokens.flat_view() {
+            let mut prev_dollar = false;
+            for entry in view.entries() {
+                let token = &entry.token;
+                if let Some((ident, token::IdentIsRaw::No)) = token.ident() {
+                    if !prev_dollar {
+                        self.check_ident_token(cx, UnderMacro(true), ident, "");
+                    }
+                } else if let Some((ident, token::IdentIsRaw::No)) = token.lifetime() {
+                    self.check_ident_token(cx, UnderMacro(true), ident.without_first_quote(), "'");
+                } else if token.kind == TokenKind::Dollar {
+                    prev_dollar = true;
+                    continue;
+                }
+                prev_dollar = false;
+            }
+            return;
+        }
+
         // Check if the preceding token is `$`, because we want to allow `$async`, etc.
         let mut prev_dollar = false;
         for tt in tokens.iter() {

@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::hash::Hash;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{cmp, fmt, iter, mem};
 
 use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
@@ -514,7 +514,7 @@ fn attrs_and_tokens_to_token_trees(
                 for inner_attr in inner_attrs {
                     tts.extend(inner_attr.token_trees());
                 }
-                tts.extend(stream.0.iter().cloned());
+                tts.extend(stream.iter().cloned());
                 let stream = TokenStream::new(tts);
                 *tree = TokenTree::Delimited(*span, *spacing, Delimiter::Brace, stream);
                 return true;
@@ -620,25 +620,124 @@ pub enum Spacing {
     JointHidden,
 }
 
+/// The backing of a [`TokenStream`]: either materialized token trees, or a
+/// lazily materialized view of one nesting level of a flat token buffer.
+/// The latter lets macro-invocation arguments flow from the parser to the
+/// mbe matcher without the token tree ever being built; any tree-level
+/// access materializes it on first use.
+#[derive(Clone)]
+pub(crate) enum TokenStreamInner {
+    Eager(Vec<TokenTree>),
+    Flat { view: FlatTokenSlice, trees: OnceLock<Vec<TokenTree>> },
+}
+
 /// A `TokenStream` is an abstract sequence of tokens, organized into [`TokenTree`]s.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Encodable, Decodable)]
-pub struct TokenStream(Arc<Vec<TokenTree>>);
+#[derive(Clone)]
+pub struct TokenStream(pub(crate) Arc<TokenStreamInner>);
+
+// Manual impl printing the token trees in the same format as the old derived
+// impl on `TokenStream(Arc<Vec<TokenTree>>)`. For a flat view this
+// materializes (and prints) only the viewed range — the derived impl would
+// dump the whole underlying buffer for every view, which makes debug dumps
+// of unexpanded macro calls quadratic in crate size.
+impl fmt::Debug for TokenStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TokenStream").field(self.trees_vec()).finish()
+    }
+}
+
+impl Default for TokenStream {
+    fn default() -> TokenStream {
+        TokenStream::new(Vec::new())
+    }
+}
+
+impl PartialEq for TokenStream {
+    fn eq(&self, other: &TokenStream) -> bool {
+        self.trees_vec() == other.trees_vec()
+    }
+}
+
+impl Eq for TokenStream {}
+
+impl std::hash::Hash for TokenStream {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.trees_vec().hash(state);
+    }
+}
+
+impl<E: rustc_serialize::Encoder> rustc_serialize::Encodable<E> for TokenStream
+where
+    Vec<TokenTree>: rustc_serialize::Encodable<E>,
+{
+    fn encode(&self, e: &mut E) {
+        self.trees_vec().encode(e);
+    }
+}
+
+impl<D: rustc_serialize::Decoder> rustc_serialize::Decodable<D> for TokenStream
+where
+    Vec<TokenTree>: rustc_serialize::Decodable<D>,
+{
+    fn decode(d: &mut D) -> TokenStream {
+        TokenStream::new(rustc_serialize::Decodable::decode(d))
+    }
+}
 
 impl TokenStream {
     pub fn new(tts: Vec<TokenTree>) -> TokenStream {
-        TokenStream(Arc::new(tts))
+        TokenStream(Arc::new(TokenStreamInner::Eager(tts)))
+    }
+
+    /// Creates a stream that is a lazily materialized view of a flat buffer
+    /// range covering one nesting level.
+    pub fn from_flat_view(view: FlatTokenSlice) -> TokenStream {
+        TokenStream(Arc::new(TokenStreamInner::Flat { view, trees: OnceLock::new() }))
+    }
+
+    /// The flat view backing this stream, if it has one (and tree access
+    /// would thus require materialization).
+    pub fn flat_view(&self) -> Option<&FlatTokenSlice> {
+        match &*self.0 {
+            TokenStreamInner::Flat { view, .. } => Some(view),
+            TokenStreamInner::Eager(_) => None,
+        }
+    }
+
+    /// The materialized token trees, materializing a flat view on first use.
+    fn trees_vec(&self) -> &Vec<TokenTree> {
+        match &*self.0 {
+            TokenStreamInner::Eager(trees) => trees,
+            TokenStreamInner::Flat { view, trees } => trees.get_or_init(|| view.to_tree_vec()),
+        }
+    }
+
+    /// Mutable access to the trees, converting a flat view into an eager
+    /// stream first.
+    fn vec_mut(&mut self) -> &mut Vec<TokenTree> {
+        if let TokenStreamInner::Flat { .. } = &*self.0 {
+            let trees = self.trees_vec().clone();
+            self.0 = Arc::new(TokenStreamInner::Eager(trees));
+        }
+        match Arc::make_mut(&mut self.0) {
+            TokenStreamInner::Eager(trees) => trees,
+            TokenStreamInner::Flat { .. } => unreachable!(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        match &*self.0 {
+            TokenStreamInner::Eager(trees) => trees.is_empty(),
+            TokenStreamInner::Flat { view, .. } => view.len() == 0,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.trees_vec().len()
     }
 
     pub fn get(&self, index: usize) -> Option<&TokenTree> {
-        self.0.get(index)
+        self.trees_vec().get(index)
     }
 
     pub fn iter(&self) -> TokenStreamIter<'_> {
@@ -682,7 +781,7 @@ impl TokenStream {
     /// construction within the compiler just build a `Vec<TokenTree>` with
     /// normal `Vec` operations and then do `TokenStream::new`.
     pub fn push_tree_with_gluing(&mut self, tt: TokenTree) {
-        let vec_mut = Arc::make_mut(&mut self.0);
+        let vec_mut = self.vec_mut();
 
         if Self::try_glue_to_last(vec_mut, &tt) {
             // nothing else to do
@@ -699,11 +798,12 @@ impl TokenStream {
     /// construction within the compiler just build a `Vec<TokenTree>` with
     /// normal `Vec` operations and then do `TokenStream::new`.
     pub fn push_stream_with_gluing(&mut self, stream: TokenStream) {
-        let vec_mut = Arc::make_mut(&mut self.0);
+        let vec_mut = self.vec_mut();
 
-        let stream_iter = stream.0.iter().cloned();
+        let stream_trees = stream.trees_vec();
+        let stream_iter = stream_trees.iter().cloned();
 
-        if let Some(first) = stream.0.first()
+        if let Some(first) = stream_trees.first()
             && Self::try_glue_to_last(vec_mut, first)
         {
             // Now skip the first token tree from `stream`.
@@ -726,7 +826,7 @@ impl TokenStream {
         fn desugar_inner(mut stream: TokenStream) -> Option<TokenStream> {
             let mut i = 0;
             let mut modified = false;
-            while let Some(tt) = stream.0.get(i) {
+            while let Some(tt) = stream.get(i) {
                 match tt {
                     &TokenTree::Token(
                         Token { kind: token::DocComment(_, attr_style, data), span },
@@ -734,7 +834,7 @@ impl TokenStream {
                     ) => {
                         let desugared = desugared_tts(attr_style, data, span);
                         let desugared_len = desugared.len();
-                        Arc::make_mut(&mut stream.0).splice(i..i + 1, desugared);
+                        stream.vec_mut().splice(i..i + 1, desugared);
                         modified = true;
                         i += desugared_len;
                     }
@@ -745,7 +845,7 @@ impl TokenStream {
                         if let Some(desugared_delim_stream) = desugar_inner(delim_stream.clone()) {
                             let new_tt =
                                 TokenTree::Delimited(sp, spacing, delim, desugared_delim_stream);
-                            Arc::make_mut(&mut stream.0)[i] = new_tt;
+                            stream.vec_mut()[i] = new_tt;
                             modified = true;
                         }
                         i += 1;
@@ -807,7 +907,7 @@ impl TokenStream {
     pub fn add_comma(&self) -> Option<(TokenStream, Span)> {
         // Used to suggest if a user writes `foo!(a b);`
         let mut suggestion = None;
-        let mut iter = self.0.iter().enumerate().peekable();
+        let mut iter = self.trees_vec().iter().enumerate().peekable();
         while let Some((pos, ts)) = iter.next() {
             if let Some((_, next)) = iter.peek() {
                 let sp = match (&ts, &next) {
@@ -829,8 +929,9 @@ impl TokenStream {
             }
         }
         if let Some((pos, comma, sp)) = suggestion {
-            let mut new_stream = Vec::with_capacity(self.0.len() + 1);
-            let parts = self.0.split_at(pos + 1);
+            let trees = self.trees_vec();
+            let mut new_stream = Vec::with_capacity(trees.len() + 1);
+            let parts = trees.split_at(pos + 1);
             new_stream.extend_from_slice(parts.0);
             new_stream.push(comma);
             new_stream.extend_from_slice(parts.1);
@@ -848,23 +949,28 @@ impl FromIterator<TokenTree> for TokenStream {
 
 impl StableHash for TokenStream {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
-        self.0.as_slice().stable_hash(hcx, hasher);
+        for sub_tt in self.iter() {
+            sub_tt.stable_hash(hcx, hasher);
+        }
     }
 }
 
 #[derive(Clone)]
-pub struct TokenStreamIter<'t>(std::slice::Iter<'t, TokenTree>);
+pub struct TokenStreamIter<'t> {
+    stream: &'t TokenStream,
+    index: usize,
+}
 
 impl<'t> TokenStreamIter<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        TokenStreamIter(stream.0.as_slice().iter())
+        TokenStreamIter { stream, index: 0 }
     }
 
     // Peeking could be done via `Peekable`, but most iterators need peeking,
     // and this is simple and avoids the need to use `peekable` and `Peekable`
     // at all the use sites.
     pub fn peek(&self) -> Option<&'t TokenTree> {
-        self.0.as_slice().first()
+        self.stream.get(self.index)
     }
 }
 
@@ -872,11 +978,15 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
-        self.0.next()
+        self.stream.get(self.index).map(|tree| {
+            self.index += 1;
+            tree
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
+        let remaining = self.stream.len().saturating_sub(self.index);
+        (remaining, Some(remaining))
     }
 }
 
@@ -947,19 +1057,35 @@ pub struct FlatTokenCursor {
     /// a whole delimited sequence in one step.
     pub matches: Arc<Vec<u32>>,
     /// Index of the next entry to consume.
-    pub index: usize,
+    pub index: u32,
+    /// Exclusive end of the entry range this cursor may consume. Equal to
+    /// `entries.len()` except for cursors over a sub-range of a buffer
+    /// (macro-invocation arguments), which yield `Eof` at the range end.
+    pub end: u32,
 }
 
 /// A view of one contiguous entry range of a flat token buffer — either a
 /// whole delimited group (open and close entries included) or a run of
 /// entries at one nesting level. Cloning is two reference-count bumps; this
 /// is the flat analog of an `Arc`-shared subtree.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FlatTokenSlice {
     pub entries: Arc<Vec<FlatEntry>>,
     pub matches: Arc<Vec<u32>>,
     pub start: u32,
     pub end: u32,
+}
+
+// Manual impl: the derived one would print the whole underlying buffer
+// (which can be an entire crate's tokens) for every view.
+impl fmt::Debug for FlatTokenSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatTokenSlice")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("entries", &self.entries())
+            .finish()
+    }
 }
 
 impl FlatTokenSlice {
@@ -980,6 +1106,12 @@ impl FlatTokenSlice {
 
     pub fn to_token_stream(&self) -> TokenStream {
         flat_range_to_stream(&self.entries, &self.matches, self.start as usize, self.end as usize)
+    }
+
+    /// Materializes the token trees of this slice, which must cover one
+    /// whole nesting level.
+    pub fn to_tree_vec(&self) -> Vec<TokenTree> {
+        flat_range_to_trees(&self.entries, &self.matches, self.start as usize, self.end as usize)
     }
 }
 
@@ -1162,14 +1294,26 @@ impl FlatTokenCursor {
     /// Assembles a cursor from a pre-built buffer, as produced directly by
     /// the lexer.
     pub fn from_parts(entries: Vec<FlatEntry>, matches: Vec<u32>) -> FlatTokenCursor {
-        FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0 }
+        let end = entries.len() as u32;
+        FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0, end }
     }
 
-    /// Rebuilds the token *tree* for the whole buffer, for the few consumers
-    /// that need a `TokenStream` rather than a parser (e.g. the proc-macro
-    /// server's `from_str`).
+    /// A cursor over the sub-range of a buffer covered by `view`, sharing
+    /// the backing buffer. The cursor yields `Eof` at the range end.
+    pub fn from_view(view: &FlatTokenSlice) -> FlatTokenCursor {
+        FlatTokenCursor {
+            entries: Arc::clone(&view.entries),
+            matches: Arc::clone(&view.matches),
+            index: view.start,
+            end: view.end,
+        }
+    }
+
+    /// Rebuilds the token *tree* for the remaining (unconsumed) range, for
+    /// the few consumers that need a `TokenStream` rather than a parser
+    /// (e.g. the proc-macro server's `from_str`).
     pub fn to_token_stream(&self) -> TokenStream {
-        flat_range_to_stream(&self.entries, &self.matches, 0, self.entries.len())
+        flat_range_to_stream(&self.entries, &self.matches, self.index as usize, self.end as usize)
     }
 
     pub fn next(&mut self) -> (Token, Spacing) {
@@ -1179,7 +1323,9 @@ impl FlatTokenCursor {
     /// This always-inlined version should only be used on hot code paths.
     #[inline(always)]
     pub fn inlined_next(&mut self) -> (Token, Spacing) {
-        while let Some(entry) = self.entries.get(self.index) {
+        while let Some(entry) =
+            self.entries.get(self.index as usize).filter(|_| self.index < self.end)
+        {
             self.index += 1;
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
                 && origin.skip()
@@ -1197,7 +1343,11 @@ impl FlatTokenCursor {
     /// The nesting depth at the current position. Agrees with the
     /// `stack.len()` of the old tree-walking cursor.
     pub fn depth(&self) -> usize {
-        self.entries.get(self.index).map_or(0, |e| e.depth as usize)
+        if self.index < self.end {
+            self.entries.get(self.index as usize).map_or(0, |e| e.depth as usize)
+        } else {
+            0
+        }
     }
 
     /// The `dist`-th (one-based) upcoming token, not counting skipped
@@ -1206,7 +1356,7 @@ impl FlatTokenCursor {
     pub fn peek(&self, dist: usize) -> Token {
         debug_assert!(dist >= 1);
         let mut remaining = dist;
-        for entry in self.entries[self.index.min(self.entries.len())..].iter() {
+        for entry in self.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
                 && origin.skip()
             {
@@ -1224,7 +1374,7 @@ impl FlatTokenCursor {
     /// current position, or `None` in the outermost stream.
     pub fn enclosing_delimiter(&self) -> Option<Delimiter> {
         let mut rel = 0usize;
-        for entry in self.entries[self.index.min(self.entries.len())..].iter() {
+        for entry in self.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
             if entry.token.kind.open_delim().is_some() {
                 rel += 1;
             } else if let Some(delim) = entry.token.kind.close_delim() {
@@ -1241,8 +1391,8 @@ impl FlatTokenCursor {
     /// delimiters), i.e. the entry that the next call to `inlined_next`
     /// would yield. Returns the buffer length at the end of the stream.
     pub fn next_entry_index(&self) -> usize {
-        let mut i = self.index;
-        while let Some(entry) = self.entries.get(i) {
+        let mut i = self.index as usize;
+        while let Some(entry) = self.entries.get(i).filter(|_| i < self.end as usize) {
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
                 && origin.skip()
             {
@@ -1263,6 +1413,15 @@ pub fn flat_range_to_stream(
     start: usize,
     end: usize,
 ) -> TokenStream {
+    TokenStream::new(flat_range_to_trees(entries, matches, start, end))
+}
+
+pub fn flat_range_to_trees(
+    entries: &[FlatEntry],
+    matches: &[u32],
+    start: usize,
+    end: usize,
+) -> Vec<TokenTree> {
     let mut trees = Vec::new();
     let mut i = start;
     while i < end {
@@ -1275,7 +1434,7 @@ pub fn flat_range_to_stream(
             i += 1;
         }
     }
-    TokenStream::new(trees)
+    trees
 }
 
 /// Rebuilds the `TokenTree::Delimited` whose open delimiter lives at
