@@ -169,6 +169,8 @@ impl BestFailure {
 impl<'dcx, 'matcher> Tracker<'matcher> for CollectTrackerAndEmitter<'dcx, 'matcher> {
     type Failure = (Token, u32, &'static str);
 
+    const NEEDS_TRACKING: bool = true;
+
     fn build_failure(tok: Token, position: u32, msg: &'static str) -> Self::Failure {
         (tok, position, msg)
     }

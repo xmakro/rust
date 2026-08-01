@@ -334,6 +334,11 @@ pub(super) trait Tracker<'matcher> {
     /// The contents of `ParseResult::Failure`.
     type Failure;
 
+    /// Whether this tracker needs to observe every matcher location via
+    /// `before_match_loc`. When `false`, the matcher may take fast paths that
+    /// skip those callbacks.
+    const NEEDS_TRACKING: bool;
+
     /// Arm failed to match. If the token is `token::Eof`, it indicates an unexpected
     /// end of macro invocation. Otherwise, it indicates that no rules expected the given token.
     /// The usize is the approximate position of the token in the input token stream.
@@ -360,6 +365,8 @@ pub(super) struct NoopTracker;
 
 impl<'matcher> Tracker<'matcher> for NoopTracker {
     type Failure = ();
+
+    const NEEDS_TRACKING: bool = false;
 
     fn build_failure(_tok: Token, _position: u32, _msg: &'static str) -> Self::Failure {}
 
