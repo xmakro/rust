@@ -1807,6 +1807,16 @@ pub(super) fn parser_from_cx(
     mut tts: TokenStream,
     recovery: Recovery,
 ) -> Parser<'_> {
+    // Macro-invocation arguments usually arrive as a lazy view of the flat
+    // token buffer; parse straight from it, unless doc comments require the
+    // desugaring pre-pass (rare).
+    if let Some(view) = tts.flat_view()
+        && !view.entries().iter().any(|e| matches!(e.token.kind, token::DocComment(..)))
+    {
+        let cursor = FlatTokenCursor::from_view(view);
+        return Parser::new_from_flat(psess, cursor, rustc_parse::MACRO_ARGUMENTS)
+            .recovery(recovery);
+    }
     tts.desugar_doc_comments();
     Parser::new(psess, tts, rustc_parse::MACRO_ARGUMENTS).recovery(recovery)
 }
