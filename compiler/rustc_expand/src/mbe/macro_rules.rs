@@ -40,7 +40,9 @@ use crate::base::{
 use crate::diagnostics;
 use crate::expand::{AstFragment, AstFragmentKind, ensure_complete_parse, parse_ast_fragment};
 use crate::mbe::macro_check::check_meta_variables;
-use crate::mbe::macro_parser::{Error, ErrorReported, Failure, MatcherLoc, Success, TtParser};
+use crate::mbe::macro_parser::{
+    Error, ErrorReported, Failure, FlatMatchInput, MatcherLoc, Success, TtParser, flat_matchable,
+};
 use crate::mbe::quoted::{RulePart, parse_one_tt};
 use crate::mbe::transcribe::{MacroRhs, transcribe};
 use crate::mbe::{self, KleeneOp};
@@ -148,18 +150,20 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
 
 pub(crate) enum MacroRule {
     /// A function-style rule, for use with `m!()`
-    Func { lhs: Vec<MatcherLoc>, lhs_span: Span, rhs: MacroRhs },
+    Func { lhs: Vec<MatcherLoc>, lhs_flat: bool, lhs_span: Span, rhs: MacroRhs },
     /// An attr rule, for use with `#[m]`
     Attr {
         unsafe_rule: bool,
         args: Vec<MatcherLoc>,
+        args_flat: bool,
         args_span: Span,
         body: Vec<MatcherLoc>,
+        body_flat: bool,
         body_span: Span,
         rhs: MacroRhs,
     },
     /// A derive rule, for use with `#[m]`
-    Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: MacroRhs },
+    Derive { body: Vec<MatcherLoc>, body_flat: bool, body_span: Span, rhs: MacroRhs },
 }
 
 pub struct MacroRulesMacroExpander {
@@ -570,11 +574,11 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     // hacky, but speeds up the `html5ever` benchmark significantly. (Issue
     // 68836 suggests a more comprehensive but more complex change to deal with
     // this situation.)
-    let parser = parser_from_cx(psess, arg.clone(), T::recovery());
+    let mut arm_input = ArmInput::new(psess, arg.clone());
     // Try each arm's matchers.
     let mut tt_parser = TtParser::new(name);
     for (i, rule) in rules.iter().enumerate() {
-        let MacroRule::Func { lhs, .. } = rule else { continue };
+        let MacroRule::Func { lhs, lhs_flat, .. } = rule else { continue };
         let _tracing_span = trace_span!("Matching arm", %i);
 
         // Take a snapshot of the state of pre-expansion gating at this point.
@@ -583,7 +587,7 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
         // are not recorded. On the first `Success(..)`ful matcher, the spans are merged.
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
-        let result = tt_parser.parse_tt(&mut Cow::Borrowed(&parser), lhs, track);
+        let result = arm_input.match_arm(&mut tt_parser, lhs, *lhs_flat, track);
 
         track.after_arm(true, &result);
 
@@ -633,15 +637,15 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
     track: &mut T,
 ) -> Result<(usize, &'matcher MacroRule, NamedMatches), CanRetry> {
     // This uses the same strategy as `try_match_macro`
-    let args_parser = parser_from_cx(psess, attr_args.clone(), T::recovery());
-    let body_parser = parser_from_cx(psess, attr_body.clone(), T::recovery());
+    let mut args_input = ArmInput::new(psess, attr_args.clone());
+    let mut body_input = ArmInput::new(psess, attr_body.clone());
     let mut tt_parser = TtParser::new(name);
     for (i, rule) in rules.iter().enumerate() {
-        let MacroRule::Attr { args, body, .. } = rule else { continue };
+        let MacroRule::Attr { args, args_flat, body, body_flat, .. } = rule else { continue };
 
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
-        let result = tt_parser.parse_tt(&mut Cow::Borrowed(&args_parser), args, track);
+        let result = args_input.match_arm(&mut tt_parser, args, *args_flat, track);
         track.after_arm(false, &result);
 
         let mut named_matches = match result {
@@ -654,7 +658,7 @@ pub(super) fn try_match_macro_attr<'matcher, T: Tracker<'matcher>>(
             ErrorReported(guar) => return Err(CanRetry::No(guar)),
         };
 
-        let result = tt_parser.parse_tt(&mut Cow::Borrowed(&body_parser), body, track);
+        let result = body_input.match_arm(&mut tt_parser, body, *body_flat, track);
         track.after_arm(true, &result);
 
         match result {
@@ -687,14 +691,14 @@ pub(super) fn try_match_macro_derive<'matcher, T: Tracker<'matcher>>(
     track: &mut T,
 ) -> Result<(usize, &'matcher MacroRule, NamedMatches), CanRetry> {
     // This uses the same strategy as `try_match_macro`
-    let body_parser = parser_from_cx(psess, body.clone(), T::recovery());
+    let mut body_input = ArmInput::new(psess, body.clone());
     let mut tt_parser = TtParser::new(name);
     for (i, rule) in rules.iter().enumerate() {
-        let MacroRule::Derive { body, .. } = rule else { continue };
+        let MacroRule::Derive { body, body_flat, .. } = rule else { continue };
 
         let mut gated_spans_snapshot = mem::take(&mut *psess.gated_spans.spans.borrow_mut());
 
-        let result = tt_parser.parse_tt(&mut Cow::Borrowed(&body_parser), body, track);
+        let result = body_input.match_arm(&mut tt_parser, body, *body_flat, track);
         track.after_arm(true, &result);
 
         match result {
@@ -829,19 +833,35 @@ pub fn compile_declarative_macro(
             return dummy_syn_ext(guar.unwrap());
         };
         let lhs = mbe::macro_parser::compute_locs(&delimited.tts);
+        let lhs_flat = flat_matchable(&lhs);
         if let Some(args) = args {
             let args_span = args.span();
             let mbe::TokenTree::Delimited(.., delimited) = args else {
                 return dummy_syn_ext(guar.unwrap());
             };
             let args = mbe::macro_parser::compute_locs(&delimited.tts);
+            let args_flat = flat_matchable(&args);
             let body_span = lhs_span;
             let rhs = MacroRhs::new(rhs);
-            rules.push(MacroRule::Attr { unsafe_rule, args, args_span, body: lhs, body_span, rhs });
+            rules.push(MacroRule::Attr {
+                unsafe_rule,
+                args,
+                args_flat,
+                args_span,
+                body: lhs,
+                body_flat: lhs_flat,
+                body_span,
+                rhs,
+            });
         } else if is_derive {
-            rules.push(MacroRule::Derive { body: lhs, body_span: lhs_span, rhs: MacroRhs::new(rhs) });
+            rules.push(MacroRule::Derive {
+                body: lhs,
+                body_flat: lhs_flat,
+                body_span: lhs_span,
+                rhs: MacroRhs::new(rhs),
+            });
         } else {
-            rules.push(MacroRule::Func { lhs, lhs_span, rhs: MacroRhs::new(rhs) });
+            rules.push(MacroRule::Func { lhs, lhs_flat, lhs_span, rhs: MacroRhs::new(rhs) });
         }
         if p.token == token::Eof {
             break;
@@ -1801,21 +1821,75 @@ fn is_defined_in_current_crate(node_id: NodeId) -> bool {
     node_id != DUMMY_NODE_ID
 }
 
-pub(super) fn parser_from_cx(
-    psess: &ParseSess,
-    mut tts: TokenStream,
-    recovery: Recovery,
-) -> Parser<'_> {
-    // Macro-invocation arguments usually arrive as a lazy view of the flat
-    // token buffer; parse straight from it, unless doc comments require the
-    // desugaring pre-pass (rare).
+/// The flat token cursor over macro-invocation arguments: usually a direct
+/// view of the flat token buffer, with the doc-comment desugaring pre-pass
+/// applied via materialization when needed (rare).
+pub(super) fn cursor_from_cx(mut tts: TokenStream) -> FlatTokenCursor {
     if let Some(view) = tts.flat_view()
         && !view.entries().iter().any(|e| matches!(e.token.kind, token::DocComment(..)))
     {
-        let cursor = FlatTokenCursor::from_view(view);
-        return Parser::new_from_flat(psess, cursor, rustc_parse::MACRO_ARGUMENTS)
-            .recovery(recovery);
+        return FlatTokenCursor::from_view(view);
     }
     tts.desugar_doc_comments();
-    Parser::new(psess, tts, rustc_parse::MACRO_ARGUMENTS).recovery(recovery)
+    FlatTokenCursor::new(tts)
+}
+
+pub(super) fn parser_from_cx(
+    psess: &ParseSess,
+    tts: TokenStream,
+    recovery: Recovery,
+) -> Parser<'_> {
+    Parser::new_from_flat(psess, cursor_from_cx(tts), rustc_parse::MACRO_ARGUMENTS)
+        .recovery(recovery)
+}
+
+/// One matching input for arm matching: the flat cursor for the fast path,
+/// plus the parser-driven fallback, built lazily since the flat path (taken
+/// by every non-tracking invocation) usually never needs it.
+struct ArmInput<'psess> {
+    psess: &'psess ParseSess,
+    tts: TokenStream,
+    /// The flat-path input, built on the first arm that can use it, so
+    /// definitions whose arms all need the parser pay nothing for it (and
+    /// vice versa).
+    flat: Option<FlatMatchInput>,
+    parser: Option<Parser<'psess>>,
+}
+
+impl<'psess> ArmInput<'psess> {
+    fn new(psess: &'psess ParseSess, tts: TokenStream) -> ArmInput<'psess> {
+        ArmInput { psess, tts, flat: None, parser: None }
+    }
+
+    /// Matches one arm: on the flat path when no tracker observes the
+    /// process and the matcher is in the flat subset (`matcher_flat`, the
+    /// flag computed at definition time), on the parser-driven path
+    /// otherwise.
+    fn match_arm<'matcher, T: Tracker<'matcher>>(
+        &mut self,
+        tt_parser: &mut TtParser,
+        matcher: &'matcher [MatcherLoc],
+        matcher_flat: bool,
+        track: &mut T,
+    ) -> NamedParseResult<T::Failure> {
+        if !T::NEEDS_TRACKING && matcher_flat {
+            let input = match self.flat {
+                Some(ref mut input) => {
+                    input.reset();
+                    input
+                }
+                None => {
+                    let cursor = cursor_from_cx(self.tts.clone());
+                    self.flat.insert(FlatMatchInput::new(&cursor))
+                }
+            };
+            return tt_parser.parse_tt_flat(input, matcher, track);
+        }
+        let psess = self.psess;
+        let tts = &self.tts;
+        let parser = self
+            .parser
+            .get_or_insert_with(|| parser_from_cx(psess, tts.clone(), T::recovery()));
+        tt_parser.parse_tt(&mut Cow::Borrowed(parser), matcher, track)
+    }
 }
