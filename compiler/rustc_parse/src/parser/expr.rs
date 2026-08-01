@@ -1066,8 +1066,8 @@ impl<'a> Parser<'a> {
     ///
     /// See also [`TokenKind::break_two_token_op`] which does similar splitting of `>>` into `>`.
     //
-    // FIXME: With current `TokenCursor` it's hard to break tokens into more than 2
-    //  parts unless those parts are processed immediately. `TokenCursor` should either
+    // FIXME: With current `FlatTokenCursor` it's hard to break tokens into more than 2
+    //  parts unless those parts are processed immediately. `FlatTokenCursor` should either
     //  support pushing "future tokens" (would be also helpful to `break_and_eat`), or
     //  we should break everything including floats into more basic proc-macro style
     //  tokens in the lexer (probably preferable).
@@ -1142,7 +1142,7 @@ impl<'a> Parser<'a> {
             [IdentLike(_), Punct('.'), IdentLike(_), Punct('+' | '-')] |
             // 1.2e+3 | 1.2e-3
             [IdentLike(_), Punct('.'), IdentLike(_), Punct('+' | '-'), IdentLike(_)] => {
-                // See the FIXME about `TokenCursor` above.
+                // See the FIXME about `FlatTokenCursor` above.
                 self.error_unexpected_after_dot();
                 DestructuredFloat::Error
             }

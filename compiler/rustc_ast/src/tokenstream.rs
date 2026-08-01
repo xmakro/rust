@@ -963,43 +963,6 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct TokenTreeCursor {
-    stream: TokenStream,
-    /// Points to the current token tree in the stream. In `TokenCursor::curr`,
-    /// this can be any token tree. In `TokenCursor::stack`, this is always a
-    /// `TokenTree::Delimited`.
-    index: usize,
-}
-
-impl TokenTreeCursor {
-    #[inline]
-    pub fn new(stream: TokenStream) -> Self {
-        TokenTreeCursor { stream, index: 0 }
-    }
-
-    #[inline]
-    pub fn curr(&self) -> Option<&TokenTree> {
-        self.stream.get(self.index)
-    }
-
-    pub fn look_ahead(&self, n: usize) -> Option<&TokenTree> {
-        self.stream.get(self.index + n)
-    }
-
-    #[inline]
-    pub fn bump(&mut self) {
-        self.index += 1;
-    }
-
-    // For skipping ahead in rare circumstances.
-    #[inline]
-    pub fn bump_to_end(&mut self) {
-        self.index = self.stream.len();
-    }
-}
-
-
 /// One entry of a [`FlatTokenCursor`]'s pre-flattened token buffer.
 ///
 /// The buffer contains every token the tree-walking cursor would synthesize,
@@ -1428,74 +1391,6 @@ pub fn flat_delimited_at(entries: &[FlatEntry], matches: &[u32], open_idx: usize
         delim,
         flat_range_to_stream(entries, matches, open_idx + 1, close_idx),
     )
-}
-
-/// A `TokenStream` cursor that produces `Token`s. It's a bit odd that
-/// we (a) lex tokens into a nice tree structure (`TokenStream`), and then (b)
-/// use this type to emit them as a linear sequence. But a linear sequence is
-/// what the parser expects, for the most part.
-#[derive(Clone, Debug)]
-pub struct TokenCursor {
-    // Cursor for the current (innermost) token stream. The index within the
-    // cursor can point to any token tree in the stream (or one past the end).
-    // The delimiters for this token stream are found in `self.stack.last()`;
-    // if that is `None` we are in the outermost token stream which never has
-    // delimiters.
-    pub curr: TokenTreeCursor,
-
-    // Token streams surrounding the current one. The index within each cursor
-    // always points to a `TokenTree::Delimited`.
-    pub stack: Vec<TokenTreeCursor>,
-}
-
-impl TokenCursor {
-    pub fn next(&mut self) -> (Token, Spacing) {
-        self.inlined_next()
-    }
-
-    /// This always-inlined version should only be used on hot code paths.
-    #[inline(always)]
-    pub fn inlined_next(&mut self) -> (Token, Spacing) {
-        loop {
-            // FIXME: we currently don't return `Delimiter::Invisible` open/close delims. To fix
-            // #67062 we will need to, whereupon the `delim != Delimiter::Invisible` conditions
-            // below can be removed.
-            if let Some(tree) = self.curr.curr() {
-                match tree {
-                    &TokenTree::Token(token, spacing) => {
-                        debug_assert!(!token.kind.is_delim());
-                        let res = (token, spacing);
-                        self.curr.bump();
-                        return res;
-                    }
-                    &TokenTree::Delimited(sp, spacing, delim, ref tts) => {
-                        let trees = TokenTreeCursor::new(tts.clone());
-                        self.stack.push(mem::replace(&mut self.curr, trees));
-                        if !delim.skip() {
-                            return (Token::new(delim.as_open_token_kind(), sp.open), spacing.open);
-                        }
-                        // No open delimiter to return; continue on to the next iteration.
-                    }
-                };
-            } else if let Some(parent) = self.stack.pop() {
-                // We have exhausted this token stream. Move back to its parent token stream.
-                let Some(&TokenTree::Delimited(span, spacing, delim, _)) = parent.curr() else {
-                    panic!("parent should be Delimited")
-                };
-                self.curr = parent;
-                self.curr.bump(); // move past the `Delimited`
-                if !delim.skip() {
-                    return (Token::new(delim.as_close_token_kind(), span.close), spacing.close);
-                }
-                // No close delimiter to return; continue on to the next iteration.
-            } else {
-                // We have exhausted the outermost token stream. The use of
-                // `Spacing::Alone` is arbitrary and immaterial, because the
-                // `Eof` token's spacing is never used.
-                return (Token::new(token::Eof, DUMMY_SP), Spacing::Alone);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
