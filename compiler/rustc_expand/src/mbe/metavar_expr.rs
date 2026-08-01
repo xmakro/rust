@@ -13,7 +13,7 @@ pub(crate) const RAW_IDENT_ERR: &str = "`${concat(..)}` currently does not suppo
 pub(crate) const UNSUPPORTED_CONCAT_ELEM_ERR: &str = "expected identifier or string literal";
 
 /// A meta-variable expression, for expansions based on properties of meta-variables.
-#[derive(Debug, PartialEq, Encodable, Decodable)]
+#[derive(Clone, Debug, PartialEq, Encodable, Decodable)]
 pub(crate) enum MetaVarExpr {
     /// Unification of two or more identifiers.
     Concat(Box<[MetaVarExprConcatElem]>),
@@ -157,7 +157,7 @@ fn iter_span(iter: &TokenStreamIter<'_>) -> Option<Span> {
 
 /// Indicates what is placed in a `concat` parameter. For example, literals
 /// (`${concat("foo", "bar")}`) or adhoc identifiers (`${concat(foo, bar)}`).
-#[derive(Debug, Decodable, Encodable, PartialEq)]
+#[derive(Clone, Debug, Decodable, Encodable, PartialEq)]
 pub(crate) enum MetaVarExprConcatElem {
     /// Identifier WITHOUT a preceding dollar sign, which means that this identifier should be
     /// interpreted as a literal.
