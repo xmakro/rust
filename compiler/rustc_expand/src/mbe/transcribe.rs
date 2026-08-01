@@ -85,6 +85,10 @@ impl<'psess> TranscrCtx<'psess, '_> {
 struct Marker {
     expand_id: LocalExpnId,
     transparency: Transparency,
+    /// One-entry cache in front of `cache`: virtually all tokens in a macro
+    /// body share one syntax context, so this hits on a plain compare without
+    /// hashing.
+    last: Option<(SyntaxContext, SyntaxContext)>,
     cache: FxHashMap<SyntaxContext, SyntaxContext>,
 }
 
@@ -96,10 +100,17 @@ impl Marker {
         // it's some advanced case with macro-generated macros. So if we cache the marked version
         // of that context once, we'll typically have a 100% cache hit rate after that.
         *span = span.map_ctxt(|ctxt| {
-            *self
+            if let Some((from, to)) = self.last
+                && from == ctxt
+            {
+                return to;
+            }
+            let to = *self
                 .cache
                 .entry(ctxt)
-                .or_insert_with(|| ctxt.apply_mark(self.expand_id.to_expn_id(), self.transparency))
+                .or_insert_with(|| ctxt.apply_mark(self.expand_id.to_expn_id(), self.transparency));
+            self.last = Some((ctxt, to));
+            to
         });
     }
 }
@@ -370,7 +381,7 @@ pub(super) fn transcribe<'a>(
     let mut tscx = TranscrCtx {
         psess,
         interp,
-        marker: Marker { expand_id, transparency, cache: Default::default() },
+        marker: Marker { expand_id, transparency, last: None, cache: Default::default() },
         repeats: Vec::new(),
         lookup_cache: SmallVec::new(),
         stack: smallvec![ExecFrame::Root { segs: &template.segs, idx: 0 }],

@@ -447,6 +447,49 @@ pub(crate) struct TtParser {
     empty_matches: Rc<Vec<NamedMatch>>,
 }
 
+
+/// Matches a run of literal-token (and delimiter-marker) matcher locations
+/// directly against the input, advancing `mp` and the parser past every
+/// matched token. Stops at input Eof or at the first location the queue
+/// machinery must handle; a literal mismatch is a definitive failure of the
+/// arm, returned as `Err`. Callers ensure `mp` is the only live position and
+/// that the tracker does not need to observe individual locations.
+fn match_literal_run<'matcher, T: Tracker<'matcher>>(
+    mp: &mut MatcherPos,
+    parser: &mut Cow<'_, Parser<'_>>,
+    matcher: &'matcher [MatcherLoc],
+) -> Result<(), NamedParseResult<T::Failure>> {
+    loop {
+        if parser.token == token::Eof {
+            return Ok(());
+        }
+        match &matcher[mp.idx] {
+            MatcherLoc::Token { token: t } => {
+                // Doc comments in the matcher are skipped, see `parse_tt_inner`.
+                if matches!(t, Token { kind: DocComment(..), .. }) {
+                    mp.idx += 1;
+                } else if token_name_eq(t, &parser.token) {
+                    mp.idx += 1;
+                    parser.to_mut().bump();
+                } else {
+                    // The only position failed on a literal token, so the arm
+                    // cannot match.
+                    return Err(Failure(T::build_failure(
+                        parser.token,
+                        parser.approx_token_stream_pos(),
+                        "no rules expected this token in macro call",
+                    )));
+                }
+            }
+            MatcherLoc::Delimited => {
+                // Entering the delimiter is trivial.
+                mp.idx += 1;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 impl TtParser {
     pub(super) fn new(macro_name: Ident) -> TtParser {
         TtParser {
@@ -635,6 +678,15 @@ impl TtParser {
         self.cur_mps.clear();
         self.cur_mps.push(MatcherPos { idx: 0, matches: Rc::clone(&self.empty_matches) });
 
+        // Match any leading run of literal-token locations directly; matchers
+        // that fail on a leading literal (the common case when a macro tries
+        // its rules in order) never enter the queue machinery at all.
+        if !T::NEEDS_TRACKING
+            && let Err(failure) = match_literal_run::<T>(&mut self.cur_mps[0], parser, matcher)
+        {
+            return failure;
+        }
+
         loop {
             self.next_mps.clear();
             self.bb_mps.clear();
@@ -665,6 +717,20 @@ impl TtParser {
                         parser.approx_token_stream_pos(),
                         "no rules expected this token in macro call",
                     ));
+                }
+
+                (1, 0) if !T::NEEDS_TRACKING => {
+                    // A single next position: advance past the matched token and, if
+                    // the position sits at a run of literal-token (and delimiter-
+                    // marker) locations, match the whole run directly against the
+                    // input without going through the queue machinery. Literal-heavy
+                    // matchers spend most of their steps in this state.
+                    let mut mp = self.next_mps.pop().unwrap();
+                    parser.to_mut().bump();
+                    if let Err(failure) = match_literal_run::<T>(&mut mp, parser, matcher) {
+                        return failure;
+                    }
+                    self.cur_mps.push(mp);
                 }
 
                 (_, 0) => {
