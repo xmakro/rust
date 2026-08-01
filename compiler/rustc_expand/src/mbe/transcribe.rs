@@ -1,9 +1,13 @@
 
+use std::mem;
+use std::sync::OnceLock;
+
 use rustc_ast::token::{
     self, Delimiter, IdentIsRaw, InvisibleOrigin, Lit, LitKind, MetaVarKind, Token, TokenKind,
 };
 use rustc_ast::tokenstream::{
-    DelimSpacing, DelimSpan, FlatSink, FlatTokenCursor, FlatTt, Spacing, TokenStream, TokenTree,
+    DelimSpacing, DelimSpan, FlatEntry, FlatSink, FlatTokenCursor, FlatTt, Spacing, TokenStream,
+    TokenTree,
 };
 use rustc_ast::{ExprKind, StmtKind, TyKind, UnOp};
 use rustc_data_structures::fx::FxHashMap;
@@ -41,10 +45,10 @@ struct TranscrCtx<'psess, 'itp> {
 
     /// The stack of things yet to be completely expanded.
     ///
-    /// We descend into the RHS (`src`), expanding things as we go. This stack contains the things
-    /// we have yet to expand/are still expanding. We start the stack off with the whole RHS. The
-    /// choice of spacing values doesn't matter.
-    stack: SmallVec<[Frame<'itp>; 1]>,
+    /// We descend into the compiled template of the RHS, expanding things as
+    /// we go. This stack contains the things we have yet to expand/are still
+    /// expanding. We start the stack off with the whole template.
+    stack: SmallVec<[ExecFrame<'itp>; 1]>,
 
     /// A stack of where we are in the repeat expansion.
     ///
@@ -100,44 +104,229 @@ impl Marker {
     }
 }
 
-/// An iterator over the token trees in a delimited token tree (`{ ... }`) or a sequence (`$(...)`).
-struct Frame<'a> {
-    tts: &'a [mbe::TokenTree],
-    idx: usize,
-    kind: FrameKind,
+/// A macro rule RHS: the parsed tree plus its transcription template,
+/// compiled on first expansion so definitions that are never invoked don't
+/// pay for compilation.
+pub(crate) struct MacroRhs {
+    pub(crate) tt: mbe::TokenTree,
+    template: OnceLock<Template>,
 }
 
-enum FrameKind {
-    Delimited { delim: Delimiter, span: DelimSpan, spacing: DelimSpacing },
-    Sequence { sep: Option<Token>, kleene_op: KleeneOp },
-}
-
-impl<'a> Frame<'a> {
-    fn new_delimited(src: &'a mbe::Delimited, span: DelimSpan, spacing: DelimSpacing) -> Frame<'a> {
-        Frame {
-            tts: &src.tts,
-            idx: 0,
-            kind: FrameKind::Delimited { delim: src.delim, span, spacing },
-        }
-    }
-
-    fn new_sequence(
-        src: &'a mbe::SequenceRepetition,
-        sep: Option<Token>,
-        kleene_op: KleeneOp,
-    ) -> Frame<'a> {
-        Frame { tts: &src.tts, idx: 0, kind: FrameKind::Sequence { sep, kleene_op } }
+impl MacroRhs {
+    pub(crate) fn new(tt: mbe::TokenTree) -> MacroRhs {
+        MacroRhs { tt, template: OnceLock::new() }
     }
 }
 
-impl<'a> Iterator for Frame<'a> {
-    type Item = &'a mbe::TokenTree;
+/// A compiled transcription template. The RHS tree is lowered once per rule
+/// into a form transcription can execute directly: runs of literal tokens are
+/// pre-encoded as flat entries ready to be copied into the output buffer, and
+/// metavar occurrences carry their normalization precomputed.
+struct Template {
+    segs: Vec<Seg>,
+}
 
-    fn next(&mut self) -> Option<&'a mbe::TokenTree> {
-        let res = self.tts.get(self.idx);
-        self.idx += 1;
+enum Seg {
+    /// A run of fully literal tokens (including whole literal delimited
+    /// groups), pre-encoded as flat entries with def-site spans and
+    /// run-relative depths and match indices. Spliced by copy; the copied
+    /// spans are then marked in place.
+    Run { entries: Vec<FlatEntry>, matches: Vec<u32> },
+    /// A single literal token whose kind embeds a span needing its own
+    /// marking (`NtIdent`/`NtLifetime`), kept out of runs.
+    Token(Token),
+    /// A delimited group containing non-literal segments.
+    Delimited { span: DelimSpan, spacing: DelimSpacing, delim: Delimiter, inner: Vec<Seg> },
+    /// A metavar occurrence.
+    MetaVar { span: Span, orig: Ident, norm: MacroRulesNormalizedIdent },
+    /// A `$(...)` repetition.
+    Sequence(Box<SeqSeg>),
+    /// A `${...}` metavar expression.
+    MetaVarExpr { dspan: DelimSpan, expr: MetaVarExpr },
+}
+
+struct SeqSeg {
+    inner: Vec<Seg>,
+    sep: Option<Token>,
+    kleene_op: KleeneOp,
+    dspan: DelimSpan,
+    /// The normalized metavar occurrences in the whole subtree, in source
+    /// order, for the lockstep size check.
+    lockstep_vars: Vec<MacroRulesNormalizedIdent>,
+    /// The original metavar idents of the subtree (excluding metavar
+    /// expressions), for the no-repeatable-vars diagnostics.
+    error_meta_vars: Vec<Ident>,
+}
+
+/// A frame of the transcription stack: where we are within one nesting level
+/// of the compiled template.
+enum ExecFrame<'itp> {
+    /// The top-level template; its delimiters are not part of the result.
+    Root { segs: &'itp [Seg], idx: usize },
+    /// Inside a `Seg::Delimited`. The close-delimiter parts are precomputed
+    /// (span already marked) for emission when the frame is popped.
+    Delimited { inner: &'itp [Seg], idx: usize, delim: Delimiter, close_span: Span, close_spacing: Spacing },
+    /// One iteration of a `Seg::Sequence`.
+    Sequence { seq: &'itp SeqSeg, idx: usize },
+}
+
+impl<'itp> ExecFrame<'itp> {
+    fn next_seg(&mut self) -> Option<&'itp Seg> {
+        let (segs, idx) = match self {
+            ExecFrame::Root { segs, idx } => (*segs, idx),
+            ExecFrame::Delimited { inner, idx, .. } => (*inner, idx),
+            ExecFrame::Sequence { seq, idx } => (&seq.inner[..], idx),
+        };
+        let res = segs.get(*idx);
+        *idx += 1;
         res
     }
+}
+
+fn compile_template(src: &mbe::Delimited) -> Template {
+    Template { segs: compile_segs(&src.tts) }
+}
+
+fn compile_segs(tts: &[mbe::TokenTree]) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    let mut run = FlatSink::new();
+    for tt in tts {
+        compile_tt(tt, &mut segs, &mut run);
+    }
+    flush_run(&mut segs, &mut run);
+    segs
+}
+
+fn flush_run(segs: &mut Vec<Seg>, run: &mut FlatSink) {
+    if !run.entries.is_empty() {
+        let entries = mem::take(&mut run.entries);
+        let matches = mem::take(&mut run.matches);
+        segs.push(Seg::Run { entries, matches });
+    }
+}
+
+fn compile_tt(tt: &mbe::TokenTree, segs: &mut Vec<Seg>, run: &mut FlatSink) {
+    match tt {
+        mbe::TokenTree::Token(token) => {
+            if matches!(token.kind, token::NtIdent(..) | token::NtLifetime(..)) {
+                flush_run(segs, run);
+                segs.push(Seg::Token(*token));
+            } else {
+                run.push_token(*token, Spacing::Alone);
+            }
+        }
+        mbe::TokenTree::Delimited(span, spacing, delimited) => {
+            if all_literal(&delimited.tts) {
+                emit_literal_delimited(run, *span, *spacing, delimited);
+            } else {
+                flush_run(segs, run);
+                segs.push(Seg::Delimited {
+                    span: *span,
+                    spacing: *spacing,
+                    delim: delimited.delim,
+                    inner: compile_segs(&delimited.tts),
+                });
+            }
+        }
+        &mbe::TokenTree::MetaVar(span, orig) => {
+            flush_run(segs, run);
+            segs.push(Seg::MetaVar { span, orig, norm: MacroRulesNormalizedIdent::new(orig) });
+        }
+        seq_tt @ mbe::TokenTree::Sequence(dspan, seq_rep) => {
+            flush_run(segs, run);
+            let mut lockstep_vars = Vec::new();
+            collect_lockstep_vars(&seq_rep.tts, &mut lockstep_vars);
+            let mut error_meta_vars = Vec::new();
+            seq_tt.meta_vars(&mut error_meta_vars);
+            segs.push(Seg::Sequence(Box::new(SeqSeg {
+                inner: compile_segs(&seq_rep.tts),
+                sep: seq_rep.separator,
+                kleene_op: seq_rep.kleene.op,
+                dspan: *dspan,
+                lockstep_vars,
+                error_meta_vars,
+            })));
+        }
+        mbe::TokenTree::MetaVarExpr(dspan, expr) => {
+            flush_run(segs, run);
+            segs.push(Seg::MetaVarExpr { dspan: *dspan, expr: expr.clone() });
+        }
+        // There should be no meta-var declarations in a macro RHS.
+        mbe::TokenTree::MetaVarDecl { .. } => panic!("unexpected `TokenTree::MetaVarDecl`"),
+    }
+}
+
+/// Whether every tree is a plain token or a delimited group of plain tokens,
+/// i.e. transcribes to the same entries on every expansion (modulo marking).
+fn all_literal(tts: &[mbe::TokenTree]) -> bool {
+    tts.iter().all(|tt| match tt {
+        mbe::TokenTree::Token(token) => {
+            !matches!(token.kind, token::NtIdent(..) | token::NtLifetime(..))
+        }
+        mbe::TokenTree::Delimited(.., delimited) => all_literal(&delimited.tts),
+        _ => false,
+    })
+}
+
+fn emit_literal_delimited(
+    run: &mut FlatSink,
+    span: DelimSpan,
+    spacing: DelimSpacing,
+    delimited: &mbe::Delimited,
+) {
+    run.open_delim(Token::new(delimited.delim.as_open_token_kind(), span.open), spacing.open);
+    for tt in &delimited.tts {
+        match tt {
+            mbe::TokenTree::Token(token) => run.push_token(*token, Spacing::Alone),
+            mbe::TokenTree::Delimited(span, spacing, delimited) => {
+                emit_literal_delimited(run, *span, *spacing, delimited)
+            }
+            _ => unreachable!("non-literal tree in literal delimited group"),
+        }
+    }
+    // Hack to force-insert a space after `]` in certain case.
+    // See discussion of the `hex-literal` crate in #114571.
+    let close_spacing =
+        if delimited.delim == Delimiter::Bracket { Spacing::Alone } else { spacing.close };
+    run.close_delim(Token::new(delimited.delim.as_close_token_kind(), span.close), close_spacing);
+}
+
+/// Collects the normalized idents of every metavar occurrence in the subtree,
+/// in source order, mirroring the leaves the tree-walking lockstep size check
+/// used to visit.
+fn collect_lockstep_vars(tts: &[mbe::TokenTree], out: &mut Vec<MacroRulesNormalizedIdent>) {
+    for tt in tts {
+        match tt {
+            mbe::TokenTree::Token(_) => {}
+            mbe::TokenTree::MetaVar(_, id) | mbe::TokenTree::MetaVarDecl { name: id, .. } => {
+                out.push(MacroRulesNormalizedIdent::new(*id))
+            }
+            mbe::TokenTree::Delimited(.., d) => collect_lockstep_vars(&d.tts, out),
+            mbe::TokenTree::Sequence(_, s) => collect_lockstep_vars(&s.tts, out),
+            mbe::TokenTree::MetaVarExpr(_, expr) => {
+                expr.for_each_metavar((), |(), ident| {
+                    out.push(MacroRulesNormalizedIdent::new(*ident))
+                });
+            }
+        }
+    }
+}
+
+/// Appends a pre-encoded literal run to the sink, rebasing the run-relative
+/// depths and match indices, and marks the copied spans in place.
+fn splice_run(sink: &mut FlatSink, entries: &[FlatEntry], matches: &[u32], marker: &mut Marker) {
+    let dst_start = sink.entries.len();
+    let depth = sink.depth();
+    sink.entries.extend(entries.iter().map(|e| FlatEntry {
+        token: e.token,
+        spacing: e.spacing,
+        depth: e.depth + depth,
+    }));
+    for e in &mut sink.entries[dst_start..] {
+        marker.mark_span(&mut e.token.span);
+    }
+    let idx_delta = dst_start as u32;
+    sink.matches.extend(matches.iter().map(|&m| if m == 0 { 0 } else { m + idx_delta }));
 }
 
 /// This can do Macro-By-Example transcription.
@@ -163,15 +352,20 @@ impl<'a> Iterator for Frame<'a> {
 pub(super) fn transcribe<'a>(
     psess: &'a ParseSess,
     interp: &FxHashMap<MacroRulesNormalizedIdent, NamedMatch>,
-    src: &mbe::Delimited,
-    src_span: DelimSpan,
+    rhs: &MacroRhs,
     transparency: Transparency,
     expand_id: LocalExpnId,
 ) -> PResult<'a, FlatTokenCursor> {
+    let mbe::TokenTree::Delimited(_, _, src) = &rhs.tt else {
+        panic!("malformed macro rhs");
+    };
+
     // Nothing for us to transcribe...
     if src.tts.is_empty() {
         return Ok(FlatTokenCursor::from_parts(Vec::new(), Vec::new()));
     }
+
+    let template = rhs.template.get_or_init(|| compile_template(src));
 
     let mut tscx = TranscrCtx {
         psess,
@@ -179,11 +373,7 @@ pub(super) fn transcribe<'a>(
         marker: Marker { expand_id, transparency, cache: Default::default() },
         repeats: Vec::new(),
         lookup_cache: SmallVec::new(),
-        stack: smallvec![Frame::new_delimited(
-            src,
-            src_span,
-            DelimSpacing::new(Spacing::Alone, Spacing::Alone)
-        )],
+        stack: smallvec![ExecFrame::Root { segs: &template.segs, idx: 0 }],
         // The output typically contains at least one entry per template
         // token tree, so the template length is a cheap capacity estimate
         // that avoids the initial growth ladder of the result buffer.
@@ -192,19 +382,19 @@ pub(super) fn transcribe<'a>(
 
     loop {
         // Look at the last frame on the stack.
-        // If it still has a TokenTree we have not looked at yet, use that tree.
-        let Some(tree) = tscx.stack.last_mut().unwrap().next() else {
-            // This else-case never produces a value for `tree` (it `continue`s or `return`s).
+        // If it still has a segment we have not looked at yet, use that segment.
+        let Some(seg) = tscx.stack.last_mut().unwrap().next_seg() else {
+            // This else-case never produces a value for `seg` (it `continue`s or `return`s).
 
             // Otherwise, if we have just reached the end of a sequence and we can keep repeating,
             // go back to the beginning of the sequence.
             let frame = tscx.stack.last_mut().unwrap();
-            if let FrameKind::Sequence { sep, .. } = &frame.kind {
+            if let ExecFrame::Sequence { seq, idx } = frame {
                 let (repeat_idx, repeat_len) = tscx.repeats.last_mut().unwrap();
                 *repeat_idx += 1;
                 if repeat_idx < repeat_len {
-                    frame.idx = 0;
-                    if let Some(sep) = sep {
+                    *idx = 0;
+                    if let Some(sep) = &seq.sep {
                         tscx.sink.push_token(*sep, Spacing::Alone);
                     }
                     continue;
@@ -212,73 +402,39 @@ pub(super) fn transcribe<'a>(
             }
 
             // We are done with the top of the stack. Pop it. Depending on what it was, we do
-            // different things. Note that the outermost item must be the delimited, wrapped RHS
-            // that was passed in originally to `transcribe`.
-            match tscx.stack.pop().unwrap().kind {
+            // different things. Note that the outermost item must be the root template.
+            match tscx.stack.pop().unwrap() {
                 // Done with a sequence. Pop from repeats.
-                FrameKind::Sequence { .. } => {
+                ExecFrame::Sequence { .. } => {
                     tscx.repeats.pop();
                     tscx.lookup_cache.clear();
                 }
 
-                // We are done processing a Delimited. If this is the top-level delimited, we are
-                // done (its delimiters are not part of the result). Otherwise, emit the close
-                // delimiter entry.
-                FrameKind::Delimited { delim, span, mut spacing, .. } => {
-                    // Hack to force-insert a space after `]` in certain case.
-                    // See discussion of the `hex-literal` crate in #114571.
-                    if delim == Delimiter::Bracket {
-                        spacing.close = Spacing::Alone;
-                    }
-                    if tscx.stack.is_empty() {
-                        // No results left to compute! We are back at the top-level.
-                        return Ok(tscx.sink.finish());
-                    }
+                // No results left to compute! We are back at the top-level.
+                // (The RHS delimiters are not part of the result.)
+                ExecFrame::Root { .. } => {
+                    return Ok(tscx.sink.finish());
+                }
 
-                    // The delimiter spans were already marked when the frame was entered.
+                // We are done processing a Delimited. Emit the close delimiter
+                // entry; its span was marked when the frame was entered.
+                ExecFrame::Delimited { delim, close_span, close_spacing, .. } => {
                     tscx.sink
-                        .close_delim(Token::new(delim.as_close_token_kind(), span.close), spacing.close);
+                        .close_delim(Token::new(delim.as_close_token_kind(), close_span), close_spacing);
                 }
             }
             continue;
         };
 
-        // At this point, we know we are in the middle of a TokenTree (the last one on `stack`).
-        // `tree` contains the next `TokenTree` to be processed.
-        match tree {
-            // Replace the sequence with its expansion.
-            seq @ mbe::TokenTree::Sequence(_, seq_rep) => {
-                transcribe_sequence(&mut tscx, seq, seq_rep, interp)?;
+        match seg {
+            // Copy a pre-encoded run of literal tokens into the output and
+            // mark the copied spans in place.
+            Seg::Run { entries, matches } => {
+                splice_run(&mut tscx.sink, entries, matches, &mut tscx.marker);
             }
 
-            // Replace the meta-var with the matched token tree from the invocation.
-            &mbe::TokenTree::MetaVar(sp, original_ident) => {
-                transcribe_metavar(&mut tscx, sp, original_ident)?;
-            }
-
-            // Replace meta-variable expressions with the result of their expansion.
-            mbe::TokenTree::MetaVarExpr(dspan, expr) => {
-                transcribe_metavar_expr(&mut tscx, *dspan, expr)?;
-            }
-
-            // If we are entering a new delimiter, we push its contents to the `stack` to be
-            // processed, and we push all of the currently produced results to the `result_stack`.
-            // We will produce all of the results of the inside of the `Delimited` and then we will
-            // jump back out of the Delimited, pop the result_stack and add the new results back to
-            // the previous results (from outside the Delimited).
-            &mbe::TokenTree::Delimited(mut span, ref spacing, ref delimited) => {
-                tscx.marker.mark_span(&mut span.open);
-                tscx.marker.mark_span(&mut span.close);
-                tscx.sink.open_delim(
-                    Token::new(delimited.delim.as_open_token_kind(), span.open),
-                    spacing.open,
-                );
-                tscx.stack.push(Frame::new_delimited(delimited, span, *spacing));
-            }
-
-            // Nothing much to do here. Just push the token to the result, being careful to
-            // preserve syntax context.
-            &mbe::TokenTree::Token(mut token) => {
+            // A literal token whose kind embeds an extra span to mark.
+            &Seg::Token(mut token) => {
                 tscx.marker.mark_span(&mut token.span);
                 if let token::NtIdent(ident, _) | token::NtLifetime(ident, _) = &mut token.kind {
                     tscx.marker.mark_span(&mut ident.span);
@@ -286,8 +442,42 @@ pub(super) fn transcribe<'a>(
                 tscx.sink.push_token(token, Spacing::Alone);
             }
 
-            // There should be no meta-var declarations in the invocation of a macro.
-            mbe::TokenTree::MetaVarDecl { .. } => panic!("unexpected `TokenTree::MetaVarDecl`"),
+            // If we are entering a new delimiter, emit its open entry and push
+            // its contents to the `stack` to be processed.
+            Seg::Delimited { span, spacing, delim, inner } => {
+                let mut open_span = span.open;
+                let mut close_span = span.close;
+                tscx.marker.mark_span(&mut open_span);
+                tscx.marker.mark_span(&mut close_span);
+                tscx.sink
+                    .open_delim(Token::new(delim.as_open_token_kind(), open_span), spacing.open);
+                // Hack to force-insert a space after `]` in certain case.
+                // See discussion of the `hex-literal` crate in #114571.
+                let close_spacing =
+                    if *delim == Delimiter::Bracket { Spacing::Alone } else { spacing.close };
+                tscx.stack.push(ExecFrame::Delimited {
+                    inner: &inner[..],
+                    idx: 0,
+                    delim: *delim,
+                    close_span,
+                    close_spacing,
+                });
+            }
+
+            // Replace the meta-var with the matched token tree from the invocation.
+            Seg::MetaVar { span, orig, norm } => {
+                transcribe_metavar(&mut tscx, *span, *orig, *norm)?;
+            }
+
+            // Replace the sequence with its expansion.
+            Seg::Sequence(seq) => {
+                transcribe_sequence(&mut tscx, seq)?;
+            }
+
+            // Replace meta-variable expressions with the result of their expansion.
+            Seg::MetaVarExpr { dspan, expr } => {
+                transcribe_metavar_expr(&mut tscx, *dspan, expr)?;
+            }
         }
     }
 }
@@ -295,10 +485,7 @@ pub(super) fn transcribe<'a>(
 /// Turn `$(...)*` sequences into tokens.
 fn transcribe_sequence<'tx, 'itp>(
     tscx: &mut TranscrCtx<'tx, 'itp>,
-    seq: &mbe::TokenTree,
-    seq_rep: &'itp mbe::SequenceRepetition,
-    // Used only for better diagnostics in the face of typos.
-    interp: &FxHashMap<MacroRulesNormalizedIdent, NamedMatch>,
+    seq: &'itp SeqSeg,
 ) -> PResult<'tx, ()> {
     let dcx = tscx.psess.dcx();
 
@@ -311,7 +498,7 @@ fn transcribe_sequence<'tx, 'itp>(
             let mut non_repeatables = Vec::new();
 
             #[allow(rustc::potential_query_instability)]
-            for (name, matcher) in interp.iter() {
+            for (name, matcher) in tscx.interp.iter() {
                 if matcher.is_repeatable() {
                     repeatables.push(name);
                 } else {
@@ -323,15 +510,14 @@ fn transcribe_sequence<'tx, 'itp>(
                 repeatables.iter().map(|&name| name.symbol()).collect();
             let non_repeatable_names: Vec<Symbol> =
                 non_repeatables.iter().map(|&name| name.symbol()).collect();
-            let mut meta_vars = vec![];
-            seq.meta_vars(&mut meta_vars);
+            let meta_vars = &seq.error_meta_vars;
             let mut typo_repeatable = None;
             let mut typo_unrepeatable = None;
             let mut typo_unrepeatable_label = None;
             let mut var_no_typo = None;
             let mut no_repeatable_var = None;
 
-            for ident in meta_vars {
+            for &ident in meta_vars {
                 if let Some(name) = rustc_span::edit_distance::find_best_match_for_name(
                     &repeatable_names[..],
                     ident.name,
@@ -360,7 +546,7 @@ fn transcribe_sequence<'tx, 'itp>(
                 }
             }
             return Err(dcx.create_err(NoSyntaxVarsExprRepeat {
-                span: seq.span(),
+                span: seq.dspan.entire(),
                 typo_unrepeatable,
                 typo_repeatable,
                 typo_unrepeatable_label,
@@ -374,21 +560,17 @@ fn transcribe_sequence<'tx, 'itp>(
             // happens when two meta-variables are used in the same repetition in a
             // sequence, but they come from different sequence matchers and repeat
             // different amounts.
-            return Err(dcx.create_err(MetaVarsDifSeqMatchers { span: seq.span(), msg }));
+            return Err(dcx.create_err(MetaVarsDifSeqMatchers { span: seq.dspan.entire(), msg }));
         }
 
         LockstepIterSize::Constraint(len, _) => {
-            // We do this to avoid an extra clone above. We know that this is a
-            // sequence already.
-            let mbe::TokenTree::Sequence(sp, seq) = seq else { unreachable!() };
-
             // Is the repetition empty?
             if len == 0 {
-                if seq.kleene.op == KleeneOp::OneOrMore {
+                if seq.kleene_op == KleeneOp::OneOrMore {
                     // FIXME: this really ought to be caught at macro definition
                     // time... It happens when the Kleene operator in the matcher and
                     // the body for the same meta-variable do not match.
-                    return Err(dcx.create_err(MustRepeatOnce { span: sp.entire() }));
+                    return Err(dcx.create_err(MustRepeatOnce { span: seq.dspan.entire() }));
                 }
             } else {
                 // 0 is the initial counter (we have done 0 repetitions so far). `len`
@@ -399,7 +581,7 @@ fn transcribe_sequence<'tx, 'itp>(
                 // The first time we encounter the sequence we push it to the stack. It
                 // then gets reused (see the beginning of the loop) until we are done
                 // repeating.
-                tscx.stack.push(Frame::new_sequence(seq_rep, seq.separator, seq.kleene.op));
+                tscx.stack.push(ExecFrame::Sequence { seq, idx: 0 });
             }
         }
     }
@@ -427,10 +609,10 @@ fn transcribe_metavar<'tx>(
     tscx: &mut TranscrCtx<'tx, '_>,
     mut sp: Span,
     mut original_ident: Ident,
+    ident: MacroRulesNormalizedIdent,
 ) -> PResult<'tx, ()> {
     let dcx = tscx.psess.dcx();
 
-    let ident = MacroRulesNormalizedIdent::new(original_ident);
     let Some(cur_matched) = lookup_cur_matched_cached(tscx, ident) else {
         // If we aren't able to match the meta-var, we push it back into the result but
         // with modified syntax context. (I believe this supports nested macros).
@@ -686,15 +868,15 @@ fn transcribe_flat_tt(tscx: &mut TranscrCtx<'_, '_>, metavar_span: Span, ftt: &F
     let mut metavar_span = metavar_span;
     let undelimited_seq = matches!(
         tscx.stack.last(),
-        Some(Frame {
-            tts: [_],
-            kind: FrameKind::Sequence {
+        Some(ExecFrame::Sequence {
+            seq: SeqSeg {
+                inner,
                 sep: None,
                 kleene_op: KleeneOp::ZeroOrMore | KleeneOp::OneOrMore,
                 ..
             },
             ..
-        })
+        }) if inner.len() == 1
     );
     if undelimited_seq {
         // Do not record metavar spans for tokens from undelimited sequences, for perf reasons.
@@ -898,8 +1080,8 @@ impl LockstepIterSize {
     }
 }
 
-/// Given a `tree`, make sure that all sequences have the same length as the matches for the
-/// appropriate meta-vars in `interpolations`.
+/// Given a sequence, make sure that all of its metavar occurrences have the same length as the
+/// matches for the appropriate meta-vars in `interpolations`.
 ///
 /// Note that if `repeats` does not match the exact correct depth of a meta-var,
 /// `lookup_cur_matched` will return `None`, which is why this still works even in the presence of
@@ -911,43 +1093,19 @@ impl LockstepIterSize {
 /// the outer sequence and 4 repetitions of the inner sequence for `x`, we should have the same for
 /// `y`; otherwise, we can't transcribe them both at the given depth.
 fn lockstep_iter_size(
-    tree: &mbe::TokenTree,
+    seq: &SeqSeg,
     interpolations: &FxHashMap<MacroRulesNormalizedIdent, NamedMatch>,
     repeats: &[(usize, usize)],
 ) -> LockstepIterSize {
-    use mbe::TokenTree;
-    match tree {
-        TokenTree::Delimited(.., delimited) => {
-            delimited.tts.iter().fold(LockstepIterSize::Unconstrained, |size, tt| {
-                size.with(lockstep_iter_size(tt, interpolations, repeats))
-            })
-        }
-        TokenTree::Sequence(_, seq) => {
-            seq.tts.iter().fold(LockstepIterSize::Unconstrained, |size, tt| {
-                size.with(lockstep_iter_size(tt, interpolations, repeats))
-            })
-        }
-        TokenTree::MetaVar(_, name) | TokenTree::MetaVarDecl { name, .. } => {
-            let name = MacroRulesNormalizedIdent::new(*name);
-            match lookup_cur_matched(name, interpolations, repeats) {
-                Some(matched) => match matched {
-                    MatchedSingle(_) => LockstepIterSize::Unconstrained,
-                    MatchedSeq(ads) => LockstepIterSize::Constraint(ads.len(), name),
-                },
-                _ => LockstepIterSize::Unconstrained,
-            }
-        }
-        TokenTree::MetaVarExpr(_, expr) => {
-            expr.for_each_metavar(LockstepIterSize::Unconstrained, |lis, ident| {
-                lis.with(lockstep_iter_size(
-                    &TokenTree::MetaVar(ident.span, *ident),
-                    interpolations,
-                    repeats,
-                ))
-            })
-        }
-        TokenTree::Token(..) => LockstepIterSize::Unconstrained,
+    let mut size = LockstepIterSize::Unconstrained;
+    for &name in &seq.lockstep_vars {
+        let var_size = match lookup_cur_matched(name, interpolations, repeats) {
+            Some(MatchedSeq(ads)) => LockstepIterSize::Constraint(ads.len(), name),
+            _ => LockstepIterSize::Unconstrained,
+        };
+        size = size.with(var_size);
     }
+    size
 }
 
 /// Used solely by the `count` meta-variable expression, counts the outermost repetitions at a

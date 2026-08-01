@@ -42,7 +42,7 @@ use crate::expand::{AstFragment, AstFragmentKind, ensure_complete_parse, parse_a
 use crate::mbe::macro_check::check_meta_variables;
 use crate::mbe::macro_parser::{Error, ErrorReported, Failure, MatcherLoc, Success, TtParser};
 use crate::mbe::quoted::{RulePart, parse_one_tt};
-use crate::mbe::transcribe::transcribe;
+use crate::mbe::transcribe::{MacroRhs, transcribe};
 use crate::mbe::{self, KleeneOp};
 
 pub(crate) struct ParserAnyMacro<'a, 'b> {
@@ -148,7 +148,7 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
 
 pub(crate) enum MacroRule {
     /// A function-style rule, for use with `m!()`
-    Func { lhs: Vec<MatcherLoc>, lhs_span: Span, rhs: mbe::TokenTree },
+    Func { lhs: Vec<MatcherLoc>, lhs_span: Span, rhs: MacroRhs },
     /// An attr rule, for use with `#[m]`
     Attr {
         unsafe_rule: bool,
@@ -156,10 +156,10 @@ pub(crate) enum MacroRule {
         args_span: Span,
         body: Vec<MatcherLoc>,
         body_span: Span,
-        rhs: mbe::TokenTree,
+        rhs: MacroRhs,
     },
     /// A derive rule, for use with `#[m]`
-    Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: mbe::TokenTree },
+    Derive { body: Vec<MatcherLoc>, body_span: Span, rhs: MacroRhs },
 }
 
 pub struct MacroRulesMacroExpander {
@@ -183,7 +183,7 @@ impl MacroRulesMacroExpander {
             }
             MacroRule::Derive { body_span, ref rhs, .. } => (MultiSpan::from_span(body_span), rhs),
         };
-        if has_compile_error_macro(rhs) { None } else { Some((&self.name, span)) }
+        if has_compile_error_macro(&rhs.tt) { None } else { Some((&self.name, span)) }
     }
 
     pub fn kinds(&self) -> MacroKinds {
@@ -220,12 +220,9 @@ impl MacroRulesMacroExpander {
                 let MacroRule::Derive { rhs, .. } = rule else {
                     panic!("try_match_macro_derive returned non-derive rule");
                 };
-                let mbe::TokenTree::Delimited(rhs_span, _, rhs) = rhs else {
-                    cx.dcx().span_bug(sp, "malformed macro derive rhs");
-                };
 
                 let id = cx.current_expansion.id;
-                let tts = transcribe(psess, &named_matches, rhs, *rhs_span, self.transparency, id)
+                let tts = transcribe(psess, &named_matches, rhs, self.transparency, id)
                     .map_err(|e| e.emit())?
                     .to_token_stream();
 
@@ -399,14 +396,11 @@ fn expand_macro<'cx, 'a: 'cx>(
             let MacroRule::Func { lhs, rhs, .. } = rule else {
                 panic!("try_match_macro returned non-func rule");
             };
-            let mbe::TokenTree::Delimited(rhs_span, _, rhs) = rhs else {
-                cx.dcx().span_bug(sp, "malformed macro rhs");
-            };
-            let arm_span = rhs_span.entire();
+            let arm_span = rhs.tt.span();
 
             // rhs has holes ( `$id` and `$(...)` that need filled)
             let id = cx.current_expansion.id;
-            let flat = match transcribe(psess, &named_matches, rhs, *rhs_span, transparency, id) {
+            let flat = match transcribe(psess, &named_matches, rhs, transparency, id) {
                 Ok(flat) => flat,
                 Err(err) => {
                     let guar = err.emit();
@@ -484,9 +478,6 @@ fn expand_macro_attr(
             let MacroRule::Attr { rhs, unsafe_rule, .. } = rule else {
                 panic!("try_macro_match_attr returned non-attr rule");
             };
-            let mbe::TokenTree::Delimited(rhs_span, _, rhs) = rhs else {
-                cx.dcx().span_bug(sp, "malformed macro rhs");
-            };
 
             match (safety, unsafe_rule) {
                 (Safety::Default, false) | (Safety::Unsafe(_), true) => {}
@@ -502,7 +493,7 @@ fn expand_macro_attr(
             }
 
             let id = cx.current_expansion.id;
-            let tts = transcribe(psess, &named_matches, rhs, *rhs_span, transparency, id)
+            let tts = transcribe(psess, &named_matches, rhs, transparency, id)
                 .map_err(|e| e.emit())?
                 .to_token_stream();
 
@@ -838,11 +829,12 @@ pub fn compile_declarative_macro(
             };
             let args = mbe::macro_parser::compute_locs(&delimited.tts);
             let body_span = lhs_span;
+            let rhs = MacroRhs::new(rhs);
             rules.push(MacroRule::Attr { unsafe_rule, args, args_span, body: lhs, body_span, rhs });
         } else if is_derive {
-            rules.push(MacroRule::Derive { body: lhs, body_span: lhs_span, rhs });
+            rules.push(MacroRule::Derive { body: lhs, body_span: lhs_span, rhs: MacroRhs::new(rhs) });
         } else {
-            rules.push(MacroRule::Func { lhs, lhs_span, rhs });
+            rules.push(MacroRule::Func { lhs, lhs_span, rhs: MacroRhs::new(rhs) });
         }
         if p.token == token::Eof {
             break;
