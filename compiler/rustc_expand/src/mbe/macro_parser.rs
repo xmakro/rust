@@ -74,15 +74,18 @@ use std::borrow::Cow;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::fmt::Display;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) use NamedMatch::*;
 pub(crate) use ParseResult::*;
 use rustc_ast::token::{self, DocComment, NonterminalKind, Token, TokenKind};
+use rustc_ast::tokenstream::{FlatEntry, FlatTokenCursor, FlatTokenSlice, FlatTt, Spacing};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_lint_defs::pluralize;
 use rustc_parse::parser::{ParseNtResult, Parser, token_descr};
-use rustc_span::{Ident, MacroRulesNormalizedIdent, Span};
+use rustc_span::hygiene::SyntaxContext;
+use rustc_span::{Ident, MacroRulesNormalizedIdent, Span, kw};
 
 use crate::mbe::macro_rules::Tracker;
 use crate::mbe::{KleeneOp, TokenTree};
@@ -448,6 +451,160 @@ pub(crate) struct TtParser {
 }
 
 
+/// Whether an arm's matcher is within the flat matcher's supported subset:
+/// every capture works straight off the token entries, with no black-box AST
+/// fragment parse. Computed once per rule at definition time; materializing
+/// parsers for AST fragments from the flat path measured as a net loss on
+/// fragment-heavy crates.
+pub(crate) fn flat_matchable(matcher: &[MatcherLoc]) -> bool {
+    !matcher.iter().any(|loc| {
+        matches!(loc, MatcherLoc::MetaVarDecl { kind, .. }
+            if !matches!(kind, NonterminalKind::TT | NonterminalKind::Ident | NonterminalKind::Lifetime))
+    })
+}
+
+/// The matcher's input when no tracker observes the process and the arm
+/// captures nothing that needs a black-box parse: a lightweight stepper over
+/// the invocation's flat token entries, standing in for the full `Parser`.
+/// Token matching and `tt`/`ident`/`lifetime` captures work directly on the
+/// entries.
+pub(crate) struct FlatMatchInput {
+    entries: Arc<Vec<FlatEntry>>,
+    matches: Arc<Vec<u32>>,
+    /// Entry index of `token`; equals `end` at Eof.
+    cur: u32,
+    /// Exclusive end of the entry range being matched.
+    end: u32,
+    /// The current (not yet matched) token.
+    token: Token,
+    spacing: Spacing,
+    /// The loaded start state, precomputed so that rewinding for the next
+    /// arm attempt is three copies rather than a rescan. Matching arms is
+    /// hot enough that a per-arm rescan showed up as a whole-crate
+    /// regression on many-arm macros.
+    start: (u32, Token, Spacing),
+}
+
+impl FlatMatchInput {
+    pub(crate) fn new(cursor: &FlatTokenCursor) -> FlatMatchInput {
+        let mut input = FlatMatchInput {
+            entries: Arc::clone(&cursor.entries),
+            matches: Arc::clone(&cursor.matches),
+            cur: cursor.index,
+            end: cursor.end,
+            token: Token::dummy(),
+            spacing: Spacing::Alone,
+            start: (cursor.index, Token::dummy(), Spacing::Alone),
+        };
+        input.load(cursor.index);
+        input.start = (input.cur, input.token, input.spacing);
+        input
+    }
+
+    /// Rewinds to the start of the invocation's entries, for the next arm.
+    #[inline]
+    pub(crate) fn reset(&mut self) {
+        (self.cur, self.token, self.spacing) = self.start;
+    }
+
+    /// Loads the first non-skipped token at or after entry `from`, mirroring
+    /// `FlatTokenCursor::inlined_next` filtering and `Parser::bump`'s
+    /// dummy-span tweak for Eof.
+    fn load(&mut self, from: u32) {
+        let mut i = from;
+        while i < self.end {
+            let entry = &self.entries[i as usize];
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                i += 1;
+                continue;
+            }
+            self.cur = i;
+            self.token = entry.token;
+            self.spacing = entry.spacing;
+            return;
+        }
+        // Give Eof the location of the last token, like `Parser::bump` does.
+        let fallback_span = self.token.span;
+        self.cur = self.end;
+        self.token = Token::new(token::Eof, fallback_span.with_ctxt(SyntaxContext::root()));
+        self.spacing = Spacing::Alone;
+    }
+
+    fn advance(&mut self) {
+        if self.cur < self.end {
+            self.load(self.cur + 1);
+        }
+    }
+
+    /// The approximate input position, for failure ordering.
+    fn pos(&self) -> u32 {
+        self.cur
+    }
+
+    /// Captures a `tt` fragment at the current position, exactly as
+    /// `Parser::parse_token_tree_flat` would: a delimited group becomes a
+    /// slice of the buffer, a single token is kept by value.
+    fn capture_tt(&mut self) -> FlatTt {
+        if self.token.kind.open_delim().is_some() {
+            let open = self.cur;
+            let close = self.matches[open as usize];
+            let slice = FlatTokenSlice {
+                entries: Arc::clone(&self.entries),
+                matches: Arc::clone(&self.matches),
+                start: open,
+                end: close + 1,
+            };
+            self.load(close + 1);
+            FlatTt::Slice(slice)
+        } else {
+            let tt = FlatTt::Token(self.token, self.spacing);
+            self.advance();
+            tt
+        }
+    }
+
+}
+
+/// Twin of `match_literal_run` over the flat input.
+#[inline(never)]
+fn match_literal_run_flat<'matcher, T: Tracker<'matcher>>(
+    mp: &mut MatcherPos,
+    input: &mut FlatMatchInput,
+    matcher: &'matcher [MatcherLoc],
+) -> Result<(), NamedParseResult<T::Failure>> {
+    loop {
+        if input.token == token::Eof {
+            return Ok(());
+        }
+        match &matcher[mp.idx] {
+            MatcherLoc::Token { token: t } => {
+                // Doc comments in the matcher are skipped, see `parse_tt_inner`.
+                if matches!(t, Token { kind: DocComment(..), .. }) {
+                    mp.idx += 1;
+                } else if token_name_eq(t, &input.token) {
+                    mp.idx += 1;
+                    input.advance();
+                } else {
+                    // The only position failed on a literal token, so the arm
+                    // cannot match.
+                    return Err(Failure(T::build_failure(
+                        input.token,
+                        input.pos(),
+                        "no rules expected this token in macro call",
+                    )));
+                }
+            }
+            MatcherLoc::Delimited => {
+                // Entering the delimiter is trivial.
+                mp.idx += 1;
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 /// Matches a run of literal-token (and delimiter-marker) matcher locations
 /// directly against the input, advancing `mp` and the parser past every
 /// matched token. Stops at input Eof or at the first location the queue
@@ -512,6 +669,9 @@ impl TtParser {
     ///
     /// `Some(result)` if everything is finished, `None` otherwise. Note that matches are kept
     /// track of through the mps generated.
+    /// Always inlined: it has two hot callers (`parse_tt` and
+    /// `parse_tt_flat`) and outlining it costs the legacy path measurably.
+    #[inline(always)]
     fn parse_tt_inner<'matcher, T: Tracker<'matcher>>(
         &mut self,
         matcher: &'matcher [MatcherLoc],
@@ -774,6 +934,117 @@ impl TtParser {
                 (_, _) => {
                     // Too many possibilities!
                     return self.ambiguity_error(matcher, parser.token.span);
+                }
+            }
+
+            assert!(!self.cur_mps.is_empty());
+        }
+    }
+
+    /// Match the invocation's flat token entries against `matcher`, which the
+    /// caller has checked to be `flat_matchable`, without a parser driving
+    /// the input. Always inlined into its single caller: the per-arm call
+    /// overhead is measurable on many-arm macros.
+    #[inline(always)]
+    pub(super) fn parse_tt_flat<'matcher, T: Tracker<'matcher>>(
+        &mut self,
+        input: &mut FlatMatchInput,
+        matcher: &'matcher [MatcherLoc],
+        track: &mut T,
+    ) -> NamedParseResult<T::Failure> {
+        debug_assert!(flat_matchable(matcher));
+
+        self.cur_mps.clear();
+        self.cur_mps.push(MatcherPos { idx: 0, matches: Rc::clone(&self.empty_matches) });
+
+        // Match any leading run of literal-token locations directly; arms
+        // that fail on a leading literal never enter the queue machinery.
+        if let Err(failure) = match_literal_run_flat::<T>(&mut self.cur_mps[0], input, matcher) {
+            return failure;
+        }
+
+        loop {
+            self.next_mps.clear();
+            self.bb_mps.clear();
+
+            let res = self.parse_tt_inner(matcher, &input.token, input.pos(), track);
+            if let Some(res) = res {
+                return res;
+            }
+
+            // `parse_tt_inner` handled all of `cur_mps`, so it's empty.
+            assert!(self.cur_mps.is_empty());
+
+            match (self.next_mps.len(), self.bb_mps.len()) {
+                (0, 0) => {
+                    // There are no possible next positions AND we aren't waiting for the black-box
+                    // parser: syntax error.
+                    return Failure(T::build_failure(
+                        input.token,
+                        input.pos(),
+                        "no rules expected this token in macro call",
+                    ));
+                }
+
+                (1, 0) => {
+                    // A single next position: advance past the matched token
+                    // and match any following literal run directly.
+                    let mut mp = self.next_mps.pop().unwrap();
+                    input.advance();
+                    if let Err(failure) = match_literal_run_flat::<T>(&mut mp, input, matcher) {
+                        return failure;
+                    }
+                    self.cur_mps.push(mp);
+                }
+
+                (_, 0) => {
+                    // Dump all possible `next_mps` into `cur_mps` for the next iteration. Then
+                    // process the next token.
+                    self.cur_mps.append(&mut self.next_mps);
+                    input.advance();
+                }
+
+                (0, 1) => {
+                    // We need to get some nonterminal. The trivial kinds are
+                    // captured straight off the entries; the rest go through a
+                    // black-box parser materialized at the current position.
+                    let mut mp = self.bb_mps.pop().unwrap();
+                    let loc = &matcher[mp.idx];
+                    let &MatcherLoc::MetaVarDecl { kind, next_metavar, seq_depth, .. } = loc
+                    else {
+                        unreachable!()
+                    };
+                    let nt = match kind {
+                        NonterminalKind::TT => ParseNtResult::Tt(input.capture_tt()),
+                        // Single-token captures, mirroring `parse_nonterminal`.
+                        // `nonterminal_may_begin_with` vetted the current token
+                        // with the same predicate the capture uses, so these
+                        // cannot fail here.
+                        NonterminalKind::Ident => {
+                            let (ident, is_raw) = input
+                                .token
+                                .ident()
+                                .filter(|(ident, _)| ident.name != kw::Underscore)
+                                .unwrap();
+                            input.advance();
+                            ParseNtResult::Ident(ident, is_raw)
+                        }
+                        NonterminalKind::Lifetime => {
+                            let (ident, is_raw) = input.token.lifetime().unwrap();
+                            input.advance();
+                            ParseNtResult::Lifetime(ident, is_raw)
+                        }
+                        // Excluded by the supported-subset check above.
+                        _ => unreachable!(),
+                    };
+                    mp.push_match(next_metavar, seq_depth, MatchedSingle(nt));
+                    mp.idx += 1;
+                    self.cur_mps.push(mp);
+                }
+
+                (_, _) => {
+                    // Too many possibilities!
+                    return self.ambiguity_error(matcher, input.token.span);
                 }
             }
 
