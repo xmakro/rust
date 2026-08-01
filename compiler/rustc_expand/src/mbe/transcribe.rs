@@ -53,6 +53,14 @@ struct TranscrCtx<'psess, 'itp> {
     /// being the most deeply nested sequence. This is used as a stack.
     repeats: Vec<(usize, usize)>,
 
+    /// Cache of metavar resolutions through every repetition level except the
+    /// innermost, whose index is applied per call. That prefix is invariant
+    /// for the lifetime of the innermost repetition frame, while the metavar
+    /// occurrences inside it are resolved once per iteration, so caching it
+    /// saves a map lookup and a level walk per occurrence. Cleared whenever
+    /// `repeats` changes depth.
+    lookup_cache: SmallVec<[(MacroRulesNormalizedIdent, Option<&'itp NamedMatch>); 4]>,
+
     /// The transcription result, built directly in the parser's flat form.
     /// Entering a nested `Delimited` emits an open-delimiter entry and
     /// leaving it emits the close entry, so no result stack is needed — the
@@ -170,6 +178,7 @@ pub(super) fn transcribe<'a>(
         interp,
         marker: Marker { expand_id, transparency, cache: Default::default() },
         repeats: Vec::new(),
+        lookup_cache: SmallVec::new(),
         stack: smallvec![Frame::new_delimited(
             src,
             src_span,
@@ -209,6 +218,7 @@ pub(super) fn transcribe<'a>(
                 // Done with a sequence. Pop from repeats.
                 FrameKind::Sequence { .. } => {
                     tscx.repeats.pop();
+                    tscx.lookup_cache.clear();
                 }
 
                 // We are done processing a Delimited. If this is the top-level delimited, we are
@@ -384,6 +394,7 @@ fn transcribe_sequence<'tx, 'itp>(
                 // 0 is the initial counter (we have done 0 repetitions so far). `len`
                 // is the total number of repetitions we should generate.
                 tscx.repeats.push((0, len));
+                tscx.lookup_cache.clear();
 
                 // The first time we encounter the sequence we push it to the stack. It
                 // then gets reused (see the beginning of the loop) until we are done
@@ -420,7 +431,7 @@ fn transcribe_metavar<'tx>(
     let dcx = tscx.psess.dcx();
 
     let ident = MacroRulesNormalizedIdent::new(original_ident);
-    let Some(cur_matched) = lookup_cur_matched(ident, tscx.interp, &tscx.repeats) else {
+    let Some(cur_matched) = lookup_cur_matched_cached(tscx, ident) else {
         // If we aren't able to match the meta-var, we push it back into the result but
         // with modified syntax context. (I believe this supports nested macros).
         tscx.marker.mark_span(&mut sp);
@@ -802,6 +813,41 @@ fn lookup_cur_matched<'a>(
 
         matched
     })
+}
+
+/// Cached variant of [`lookup_cur_matched`] for the per-occurrence hot path.
+/// Resolves through every repetition level but the innermost via
+/// `TranscrCtx::lookup_cache`, then applies the innermost index, which is the
+/// only part that changes between iterations of the innermost frame.
+fn lookup_cur_matched_cached<'itp>(
+    tscx: &mut TranscrCtx<'_, 'itp>,
+    ident: MacroRulesNormalizedIdent,
+) -> Option<&'itp NamedMatch> {
+    let base = match tscx.lookup_cache.iter().find(|(id, _)| *id == ident) {
+        Some(&(_, base)) => base,
+        None => {
+            let outer = &tscx.repeats[..tscx.repeats.len().saturating_sub(1)];
+            let base = tscx.interp.get(&ident).map(|mut matched| {
+                for &(idx, _) in outer {
+                    match matched {
+                        MatchedSingle(_) => break,
+                        MatchedSeq(ads) => matched = ads.get(idx).unwrap(),
+                    }
+                }
+                matched
+            });
+            // A pathological rule body could reference many distinct metavars
+            // in one frame; cap the cache so lookups stay a short linear scan.
+            if tscx.lookup_cache.len() < 8 {
+                tscx.lookup_cache.push((ident, base));
+            }
+            base
+        }
+    };
+    match (base, tscx.repeats.last()) {
+        (Some(MatchedSeq(ads)), Some(&(idx, _))) => Some(ads.get(idx).unwrap()),
+        _ => base,
+    }
 }
 
 /// An accumulator over a TokenTree to be used with `fold`. During transcription, we need to make
