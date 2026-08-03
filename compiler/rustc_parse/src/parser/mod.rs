@@ -524,7 +524,7 @@ impl<'a> Parser<'a> {
         // walking forward at the current depth, then look at the token just
         // after it, provided it is a normal token (matching the tree-level
         // behavior of the old cursor, which only matched `TokenTree::Token`).
-        let entries = &self.token_cursor.entries;
+        let entries = &self.token_cursor.buf.entries;
         let end = self.token_cursor.end as usize;
         let mut i = self.token_cursor.next_entry_index();
         let mut rel = 0usize;
@@ -1207,8 +1207,8 @@ impl<'a> Parser<'a> {
         // group the looker receives a `Delimited` with an *empty* inner
         // stream: current callers only inspect the delimiter and token
         // kinds. Returns `None` when the current level ends first.
-        let entries = &self.token_cursor.entries;
-        let matches = &self.token_cursor.matches;
+        let entries = &self.token_cursor.buf.entries;
+        let matches = &self.token_cursor.buf.matches;
         let end = self.token_cursor.end as usize;
         let mut i = self.token_cursor.next_entry_index();
         let mut remaining = dist - 1;
@@ -1443,8 +1443,7 @@ impl<'a> Parser<'a> {
             let dspan = DelimSpan::from_pair(open.token.span, close.token.span);
             let delim = open.token.kind.open_delim().unwrap();
             let inner = FlatTokenSlice {
-                entries: Arc::clone(&slice.entries),
-                matches: Arc::clone(&slice.matches),
+                buf: Arc::clone(&slice.buf),
                 start: slice.start + 1,
                 end: slice.end - 1,
             };
@@ -1460,21 +1459,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parses a single token tree from the input, in flat form: a delimited
-    /// group is captured as a slice of the token buffer (two refcount bumps)
+    /// group is captured as a slice of the token buffer (a refcount bump)
     /// rather than rebuilt as a tree. Used for `tt` metavariable capture.
     pub fn parse_token_tree_flat(&mut self) -> FlatTt {
         if self.token.kind.open_delim().is_some() {
             // The current token is the open delimiter, so the entry that
             // produced it is the one just before the cursor position.
             let open_idx = self.token_cursor.index as usize - 1;
-            let close_idx = self.token_cursor.matches[open_idx] as usize;
-            debug_assert_eq!(self.token_cursor.entries[open_idx].token, self.token);
+            let close_idx = self.token_cursor.buf.matches[open_idx] as usize;
+            debug_assert_eq!(self.token_cursor.buf.entries[open_idx].token, self.token);
 
             // The delimited group we are currently within is what we are
             // going to return.
             let slice = FlatTokenSlice {
-                entries: Arc::clone(&self.token_cursor.entries),
-                matches: Arc::clone(&self.token_cursor.matches),
+                buf: Arc::clone(&self.token_cursor.buf),
                 start: open_idx as u32,
                 end: close_idx as u32 + 1,
             };

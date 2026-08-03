@@ -1009,17 +1009,27 @@ pub struct FlatEntry {
     pub depth: u32,
 }
 
-/// A linear cursor over a pre-flattened token stream, replacing the
-/// tree-walking `TokenCursor`: advancing is an index increment, lookahead is
-/// direct indexing, and cloning (for parser snapshots and lazy token stream
-/// replay) is two reference-count bumps.
-#[derive(Clone, Debug)]
-pub struct FlatTokenCursor {
-    pub entries: Arc<Vec<FlatEntry>>,
+/// The backing store of a flat token buffer: the entry sequence plus the
+/// open-to-close match table, behind a single `Arc` so that cursors and
+/// slices clone with one reference-count bump. The match table is kept out
+/// of [`FlatEntry`] deliberately: it is consulted only at open-delimiter
+/// entries, and inlining it would widen every entry of the sequentially
+/// scanned buffer.
+pub struct FlatBuffer {
+    pub entries: Vec<FlatEntry>,
     /// For every open-delimiter entry, the index of its matching
     /// close-delimiter entry (zero for other entries). Lets the parser skip
     /// a whole delimited sequence in one step.
-    pub matches: Arc<Vec<u32>>,
+    pub matches: Vec<u32>,
+}
+
+/// A linear cursor over a pre-flattened token stream, replacing the
+/// tree-walking `TokenCursor`: advancing is an index increment, lookahead is
+/// direct indexing, and cloning (for parser snapshots and lazy token stream
+/// replay) is one reference-count bump.
+#[derive(Clone)]
+pub struct FlatTokenCursor {
+    pub buf: Arc<FlatBuffer>,
     /// Index of the next entry to consume.
     pub index: u32,
     /// Exclusive end of the entry range this cursor may consume. Equal to
@@ -1028,14 +1038,28 @@ pub struct FlatTokenCursor {
     pub end: u32,
 }
 
+// Manual impl: the derived one would print the whole underlying buffer
+// (which can be an entire crate's tokens).
+impl fmt::Debug for FlatTokenCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatTokenCursor")
+            .field("index", &self.index)
+            .field("end", &self.end)
+            .field(
+                "entries",
+                &&self.buf.entries[self.index.min(self.end) as usize..self.end as usize],
+            )
+            .finish()
+    }
+}
+
 /// A view of one contiguous entry range of a flat token buffer — either a
 /// whole delimited group (open and close entries included) or a run of
-/// entries at one nesting level. Cloning is two reference-count bumps; this
+/// entries at one nesting level. Cloning is one reference-count bump; this
 /// is the flat analog of an `Arc`-shared subtree.
 #[derive(Clone)]
 pub struct FlatTokenSlice {
-    pub entries: Arc<Vec<FlatEntry>>,
-    pub matches: Arc<Vec<u32>>,
+    pub buf: Arc<FlatBuffer>,
     pub start: u32,
     pub end: u32,
 }
@@ -1058,24 +1082,34 @@ impl FlatTokenSlice {
     }
 
     pub fn entries(&self) -> &[FlatEntry] {
-        &self.entries[self.start as usize..self.end as usize]
+        &self.buf.entries[self.start as usize..self.end as usize]
     }
 
     /// Rebuilds this slice as a token tree. Requires the slice to be a whole
     /// delimited group (as produced by tt-fragment capture).
     pub fn to_token_tree(&self) -> TokenTree {
-        debug_assert!(self.entries[self.start as usize].token.kind.open_delim().is_some());
-        flat_delimited_at(&self.entries, &self.matches, self.start as usize)
+        debug_assert!(self.buf.entries[self.start as usize].token.kind.open_delim().is_some());
+        flat_delimited_at(&self.buf.entries, &self.buf.matches, self.start as usize)
     }
 
     pub fn to_token_stream(&self) -> TokenStream {
-        flat_range_to_stream(&self.entries, &self.matches, self.start as usize, self.end as usize)
+        flat_range_to_stream(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.start as usize,
+            self.end as usize,
+        )
     }
 
     /// Materializes the token trees of this slice, which must cover one
     /// whole nesting level.
     pub fn to_tree_vec(&self) -> Vec<TokenTree> {
-        flat_range_to_trees(&self.entries, &self.matches, self.start as usize, self.end as usize)
+        flat_range_to_trees(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.start as usize,
+            self.end as usize,
+        )
     }
 }
 
@@ -1166,8 +1200,8 @@ impl FlatSink {
     /// this sink. Returns the entry index range the slice landed at.
     pub fn splice_slice(&mut self, slice: &FlatTokenSlice) -> (usize, usize) {
         let dst_start = self.entries.len();
-        let src = &slice.entries[slice.start as usize..slice.end as usize];
-        let src_matches = &slice.matches[slice.start as usize..slice.end as usize];
+        let src = &slice.buf.entries[slice.start as usize..slice.end as usize];
+        let src_matches = &slice.buf.matches[slice.start as usize..slice.end as usize];
         // The first entry's depth is the slice's base depth: for a whole
         // delimited group that is the open entry, which carries the parent
         // depth in the source buffer.
@@ -1259,25 +1293,25 @@ impl FlatTokenCursor {
     /// the lexer.
     pub fn from_parts(entries: Vec<FlatEntry>, matches: Vec<u32>) -> FlatTokenCursor {
         let end = entries.len() as u32;
-        FlatTokenCursor { entries: Arc::new(entries), matches: Arc::new(matches), index: 0, end }
+        FlatTokenCursor { buf: Arc::new(FlatBuffer { entries, matches }), index: 0, end }
     }
 
     /// A cursor over the sub-range of a buffer covered by `view`, sharing
     /// the backing buffer. The cursor yields `Eof` at the range end.
     pub fn from_view(view: &FlatTokenSlice) -> FlatTokenCursor {
-        FlatTokenCursor {
-            entries: Arc::clone(&view.entries),
-            matches: Arc::clone(&view.matches),
-            index: view.start,
-            end: view.end,
-        }
+        FlatTokenCursor { buf: Arc::clone(&view.buf), index: view.start, end: view.end }
     }
 
     /// Rebuilds the token *tree* for the remaining (unconsumed) range, for
     /// the few consumers that need a `TokenStream` rather than a parser
     /// (e.g. the proc-macro server's `from_str`).
     pub fn to_token_stream(&self) -> TokenStream {
-        flat_range_to_stream(&self.entries, &self.matches, self.index as usize, self.end as usize)
+        flat_range_to_stream(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.index as usize,
+            self.end as usize,
+        )
     }
 
     pub fn next(&mut self) -> (Token, Spacing) {
@@ -1288,7 +1322,7 @@ impl FlatTokenCursor {
     #[inline(always)]
     pub fn inlined_next(&mut self) -> (Token, Spacing) {
         while let Some(entry) =
-            self.entries.get(self.index as usize).filter(|_| self.index < self.end)
+            self.buf.entries.get(self.index as usize).filter(|_| self.index < self.end)
         {
             self.index += 1;
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
@@ -1308,7 +1342,7 @@ impl FlatTokenCursor {
     /// `stack.len()` of the old tree-walking cursor.
     pub fn depth(&self) -> usize {
         if self.index < self.end {
-            self.entries.get(self.index as usize).map_or(0, |e| e.depth as usize)
+            self.buf.entries.get(self.index as usize).map_or(0, |e| e.depth as usize)
         } else {
             0
         }
@@ -1320,7 +1354,7 @@ impl FlatTokenCursor {
     pub fn peek(&self, dist: usize) -> Token {
         debug_assert!(dist >= 1);
         let mut remaining = dist;
-        for entry in self.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
+        for entry in self.buf.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
                 && origin.skip()
             {
@@ -1338,7 +1372,7 @@ impl FlatTokenCursor {
     /// current position, or `None` in the outermost stream.
     pub fn enclosing_delimiter(&self) -> Option<Delimiter> {
         let mut rel = 0usize;
-        for entry in self.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
+        for entry in self.buf.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
             if entry.token.kind.open_delim().is_some() {
                 rel += 1;
             } else if let Some(delim) = entry.token.kind.close_delim() {
@@ -1356,7 +1390,7 @@ impl FlatTokenCursor {
     /// would yield. Returns the buffer length at the end of the stream.
     pub fn next_entry_index(&self) -> usize {
         let mut i = self.index as usize;
-        while let Some(entry) = self.entries.get(i).filter(|_| i < self.end as usize) {
+        while let Some(entry) = self.buf.entries.get(i).filter(|_| i < self.end as usize) {
             if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
                 && origin.skip()
             {
@@ -1463,7 +1497,7 @@ mod size_asserts {
     static_assert_size!(AttrTokenStream, 8);
     static_assert_size!(AttrTokenTree, 32);
     static_assert_size!(LazyAttrTokenStream, 8);
-    static_assert_size!(LazyAttrTokenStreamInner, 72);
+    static_assert_size!(LazyAttrTokenStreamInner, 64);
     static_assert_size!(Option<LazyAttrTokenStream>, 8); // must be small, used in many AST nodes
     static_assert_size!(TokenStream, 8);
     static_assert_size!(TokenTree, 32);
