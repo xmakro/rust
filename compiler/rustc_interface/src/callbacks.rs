@@ -20,10 +20,15 @@ fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
     tls::with_context_opt(|icx| {
         if let Some(icx) = icx {
             // `track_span_parent` gets called a lot from HIR lowering code.
-            // Skip doing anything if we aren't tracking dependencies.
+            // Skip doing anything if we aren't tracking dependencies. Queries running under
+            // `AllowIgnoringSpanParents` have opted out of `source_span` dependencies because
+            // their results only embed spans (see `TaskDepsRef` for the soundness argument).
             let tracks_deps = match icx.task_deps {
                 TaskDepsRef::Allow(..) => true,
-                TaskDepsRef::EvalAlways | TaskDepsRef::Ignore | TaskDepsRef::Forbid => false,
+                TaskDepsRef::AllowIgnoringSpanParents(..)
+                | TaskDepsRef::EvalAlways
+                | TaskDepsRef::Ignore
+                | TaskDepsRef::Forbid => false,
             };
             if tracks_deps {
                 let _span = icx.tcx.source_span(def_id);

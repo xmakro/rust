@@ -386,7 +386,12 @@ impl DepGraphData {
                 Some(dep_node),
                 0,
             ));
-            (with_deps(TaskDepsRef::Allow(&task_deps), op), task_deps.into_inner().reads)
+            let task_deps_ref = if suppresses_span_parent_deps(dep_node.kind) {
+                TaskDepsRef::AllowIgnoringSpanParents(&task_deps)
+            } else {
+                TaskDepsRef::Allow(&task_deps)
+            };
+            (with_deps(task_deps_ref, op), task_deps.into_inner().reads)
         };
 
         let dep_node_index =
@@ -498,7 +503,8 @@ impl DepGraph {
         if let Some(ref data) = self.data {
             read_deps(|task_deps| {
                 let mut task_deps = match task_deps {
-                    TaskDepsRef::Allow(deps) => deps.lock(),
+                    TaskDepsRef::Allow(deps)
+                    | TaskDepsRef::AllowIgnoringSpanParents(deps) => deps.lock(),
                     TaskDepsRef::EvalAlways => {
                         // We don't need to record dependencies of eval_always
                         // queries. They are re-evaluated unconditionally anyway.
@@ -555,7 +561,9 @@ impl DepGraph {
         if let Some(ref data) = self.data {
             read_deps(|task_deps| match task_deps {
                 TaskDepsRef::EvalAlways | TaskDepsRef::Ignore => return,
-                TaskDepsRef::Forbid | TaskDepsRef::Allow(..) => {
+                TaskDepsRef::Forbid
+                | TaskDepsRef::Allow(..)
+                | TaskDepsRef::AllowIgnoringSpanParents(..) => {
                     let dep_node_index = data
                         .encode_side_effect(tcx, QuerySideEffect::Diagnostic(diagnostic.clone()));
                     self.read_index(dep_node_index);
@@ -642,7 +650,9 @@ impl DepGraph {
 
             let mut edges = EdgesVec::new();
             read_deps(|task_deps| match task_deps {
-                TaskDepsRef::Allow(deps) => edges.extend(deps.lock().reads.iter().copied()),
+                TaskDepsRef::Allow(deps) | TaskDepsRef::AllowIgnoringSpanParents(deps) => {
+                    edges.extend(deps.lock().reads.iter().copied())
+                }
                 TaskDepsRef::EvalAlways => {
                     edges.push(DepNodeIndex::FOREVER_RED_NODE);
                 }
@@ -1268,12 +1278,60 @@ impl CurrentDepGraph {
     }
 }
 
+/// Whether this query executes under [`TaskDepsRef::AllowIgnoringSpanParents`]: reads of
+/// parented spans do not register a dependency on the parent's `source_span`.
+///
+/// A query qualifies when its result only *embeds* spans (they are rebased relative to their
+/// parent when the cached result or a recorded diagnostic is reused) and derives nothing from
+/// their absolute positions. This matters most for `no_hash` queries like `thir_body`: they have
+/// no result fingerprint to firewall with, so a red `source_span` dependency makes them — and
+/// every downstream consumer — unconditionally red on any edit that shifts source positions.
+#[inline]
+fn suppresses_span_parent_deps(kind: DepKind) -> bool {
+    // Note that suppression only affects span reads made directly inside the listed query's own
+    // task: any sub-query it invokes records its own dependencies under its own task, so e.g. a
+    // const-eval query called from typeck still tracks `source_span` normally.
+    match kind {
+        // THIR embeds HIR spans verbatim and derives nothing from their positions; positions in
+        // diagnostics emitted by THIR consumers rebase on replay.
+        DepKind::thir_body
+        // Typeck results (types, adjustments, coercions) are keyed by `HirId` and embed spans
+        // without deriving anything from their absolute positions.
+        | DepKind::typeck_root
+        // MIR building copies THIR/HIR spans into `SourceInfo` verbatim; the result is hashed,
+        // and all position-derived data (debuginfo line tables, caller location) is produced by
+        // downstream consumers that track their own span reads.
+        | DepKind::mir_built
+        // Pure diagnostic passes with `()` results; their recorded diagnostics replay with
+        // rebased spans.
+        | DepKind::check_unsafety
+        | DepKind::check_match
+        // The scope tree embeds spans for later diagnostic use only.
+        | DepKind::region_scope_tree => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TaskDepsRef<'a> {
     /// New dependencies can be added to the
     /// `TaskDeps`. This is used when executing a 'normal' query
     /// (no `eval_always` modifier)
     Allow(&'a Lock<TaskDeps>),
+    /// Like `Allow`, except that reads of parented spans do not register a dependency on the
+    /// parent definition's `source_span` (see `track_span_parent` in `rustc_interface`).
+    ///
+    /// That implicit dependency exists because a query may derive data from the *absolute*
+    /// position of a span (render a location into a string, compute debuginfo line numbers,
+    /// ...), which rebasing on reuse cannot fix, so any span inspection conservatively pulls in
+    /// the position of the span's anchor. For queries whose results only *embed* spans (span
+    /// values are rebased relative to their parent when a cached result is reused, and replayed
+    /// diagnostics rebase the same way), that dependency is unnecessarily conservative: it
+    /// re-executes the query on every edit that only shifts source positions.
+    ///
+    /// Queries opted into this mode (see `DepGraphData::with_task`) must not derive
+    /// non-rebasable data from absolute span positions.
+    AllowIgnoringSpanParents(&'a Lock<TaskDeps>),
     /// This is used when executing an `eval_always` query. We don't
     /// need to track dependencies for a query that's always
     /// re-executed -- but we need to know that this is an `eval_always`
