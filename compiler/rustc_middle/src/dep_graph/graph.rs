@@ -191,12 +191,9 @@ impl DepGraph {
 
         // Instantiate a node with zero dependencies only once for anonymous queries.
         //
-        // Color the previous session's node at this index green right away. If it were
-        // left uncolored, the marking walk could promote it, and the file would then hold
-        // two records for this index: the promoted one and the one just written. Green is
-        // correct because an anonymous node with no dependencies never changes. The new
-        // node's key contains a fresh session seed, but that does not matter, because
-        // nothing looks an anon node up by key.
+        // The previous node can be green: an anonymous node with no dependencies never
+        // changes. Its key differs from the new node's key, which contains a fresh
+        // session seed, but nothing looks an anon node up by key.
         current.alloc_singleton_node(
             DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
@@ -210,9 +207,9 @@ impl DepGraph {
         // Other nodes can use the always-red node as a fake dependency, to
         // ensure that their dependency list will never be all-green.
         //
-        // Color the previous session's node at this index red right away. The node has no
-        // dependencies, so the marking walk would otherwise mark it green, and everything
-        // that depends on it could then wrongly stay green as well.
+        // The previous node must be red for the same reason: if the marking walk saw it
+        // as green (it has no dependencies, so nothing would stop that), every node using
+        // it as a fake dependency could wrongly be marked green too.
         current.alloc_singleton_node(
             DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
@@ -1274,8 +1271,9 @@ impl CurrentDepGraph {
 
     /// Writes one of the singleton nodes, which sit at the same reserved index in every
     /// session. If a previous session left a node at that index, it is colored
-    /// `prev_color` so that the marking walk leaves it alone. Each call site explains its
-    /// choice of color.
+    /// `prev_color` right away, which keeps the marking walk from promoting it: promotion
+    /// would write a second record for the index, next to the one written here. Each call
+    /// site explains why its color is correct.
     #[inline(always)]
     fn alloc_singleton_node(
         &self,
