@@ -1,6 +1,7 @@
+use std::hash::{Hash, Hasher};
 use std::iter;
 
-use rustc_data_structures::fx::FxIndexMap;
+use rustc_data_structures::fx::{FxHashMap, FxHasher, FxIndexMap};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -13,7 +14,7 @@ use crate::query::LocalCrate;
 use crate::traits::specialization_graph;
 use crate::ty::fast_reject::{self, SimplifiedType, TreatParams};
 use crate::ty::print::{with_crate_prefix, with_no_trimmed_paths};
-use crate::ty::{Ident, Ty, TyCtxt};
+use crate::ty::{Ident, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
 
 /// A trait's definition with type information.
 #[derive(StableHash, Encodable, Decodable)]
@@ -152,7 +153,71 @@ pub struct TraitImpls {
     blanket_impls: Vec<DefId>,
     /// Impls indexed by their simplified self type, for fast lookup.
     non_blanket_impls: FxIndexMap<SimplifiedType, Vec<DefId>>,
+    /// A refinement of `non_blanket_impls` for the simplified self types that have enough
+    /// impls for the extra indirection to pay off. Simplifying only looks at the outermost
+    /// layer of a type, so a trait implemented for many instances of the same generic type
+    /// puts all of them in one entry, and every lookup then has to walk all of them.
+    ///
+    /// See [`RefinedImpls`] for what the refinement is.
+    #[stable_hash(ignore)] // Derived from `non_blanket_impls`.
+    refined_impls: FxHashMap<SimplifiedType, RefinedImpls>,
 }
+
+/// The impls of one simplified self type, split by how precisely their self type is known.
+///
+/// A self type is *rigid* if it contains nothing that could still be inferred or normalized.
+/// Such a type unifies only with a type equal to it (up to regions), so an impl for such a
+/// type is relevant only to lookups of that very type. Those impls are indexed by their self
+/// type; the rest have to be considered by every lookup.
+///
+/// Impls carry their position in the unrefined list so that lookups can yield them in the
+/// original order.
+#[derive(Debug, Default)]
+struct RefinedImpls {
+    rigid: FxHashMap<RigidSelfTy, Vec<(u32, DefId)>>,
+    rest: Vec<(u32, DefId)>,
+}
+
+/// Identifies a rigid self type up to regions. See [`RefinedImpls`].
+///
+/// Types are interned and hash by address, so erasing the regions of two types that unify
+/// gives the same hash. That makes the key cheap to build, but only meaningful within one
+/// compilation session, which is why the index is not part of the stable hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct RigidSelfTy(u64);
+
+impl RigidSelfTy {
+    /// Everything that could still turn a type into some other type. Regions are deliberately
+    /// not in here: two types that differ only in their regions do unify, which is why the key
+    /// is built from the region-erased type.
+    const NOT_RIGID: TypeFlags = TypeFlags::HAS_TY_PARAM
+        .union(TypeFlags::HAS_CT_PARAM)
+        .union(TypeFlags::HAS_TY_INFER)
+        .union(TypeFlags::HAS_CT_INFER)
+        .union(TypeFlags::HAS_TY_PLACEHOLDER)
+        .union(TypeFlags::HAS_CT_PLACEHOLDER)
+        .union(TypeFlags::HAS_TY_FRESH)
+        .union(TypeFlags::HAS_CT_FRESH)
+        .union(TypeFlags::HAS_ALIAS)
+        .union(TypeFlags::HAS_ERROR);
+
+    /// Returns the key for `ty`, or `None` if `ty` is not rigid, i.e. if it could still unify
+    /// with a type other than itself.
+    fn new<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<RigidSelfTy> {
+        if ty.has_type_flags(RigidSelfTy::NOT_RIGID) || ty.has_escaping_bound_vars() {
+            return None;
+        }
+        // Erasing regions also anonymizes the bound ones, so types that differ only in the
+        // names of their higher-ranked regions get the same key.
+        let mut hasher = FxHasher::default();
+        tcx.erase_and_anonymize_regions(ty).hash(&mut hasher);
+        Some(RigidSelfTy(hasher.finish()))
+    }
+}
+
+/// Below this many impls for one simplified self type, walking all of them is cheaper than
+/// building and consulting the refined index.
+const REFINE_THRESHOLD: usize = 16;
 
 impl TraitImpls {
     pub fn is_empty(&self) -> bool {
@@ -206,7 +271,31 @@ impl<'tcx> TyCtxt<'tcx> {
         // Note that we're using `TreatParams::AsRigid` to query `non_blanket_impls` while using
         // `TreatParams::InstantiateWithInfer` while actually adding them.
         if let Some(simp) = fast_reject::simplify_type(self, self_ty, TreatParams::AsRigid) {
-            if let Some(impls) = impls.non_blanket_impls.get(&simp) {
+            if let Some(refined) = impls.refined_impls.get(&simp)
+                && let Some(key) = RigidSelfTy::new(self, self_ty)
+            {
+                // Only the impls for this very self type can apply, plus the ones whose self
+                // type is not pinned down. Both lists are sorted by position, so merging them
+                // yields the impls in the same order as the unrefined list would.
+                let rigid = refined.rigid.get(&key).map_or(&[][..], |impls| impls.as_slice());
+                let mut rigid = rigid.iter().peekable();
+                let mut rest = refined.rest.iter().peekable();
+                loop {
+                    let next = match (rigid.peek(), rest.peek()) {
+                        (Some(&&(a, _)), Some(&&(b, _))) => {
+                            if a < b {
+                                rigid.next()
+                            } else {
+                                rest.next()
+                            }
+                        }
+                        (Some(_), None) => rigid.next(),
+                        (None, Some(_)) => rest.next(),
+                        (None, None) => break,
+                    };
+                    f(next.unwrap().1);
+                }
+            } else if let Some(impls) = impls.non_blanket_impls.get(&simp) {
                 for &impl_def_id in impls {
                     f(impl_def_id);
                 }
@@ -240,7 +329,7 @@ impl<'tcx> TyCtxt<'tcx> {
     ///
     /// `trait_def_id` MUST BE the `DefId` of a trait.
     pub fn all_impls(self, trait_def_id: DefId) -> impl Iterator<Item = DefId> {
-        let TraitImpls { blanket_impls, non_blanket_impls } = self.trait_impls_of(trait_def_id);
+        let TraitImpls { blanket_impls, non_blanket_impls, .. } = self.trait_impls_of(trait_def_id);
 
         blanket_impls.iter().chain(non_blanket_impls.iter().flat_map(|(_, v)| v)).cloned()
     }
@@ -283,6 +372,24 @@ pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> Trait
             impls.blanket_impls.push(impl_def_id);
         }
     }
+
+    let mut refined_impls = FxHashMap::default();
+    for (&simplified_self_ty, impl_def_ids) in &impls.non_blanket_impls {
+        if impl_def_ids.len() < REFINE_THRESHOLD {
+            continue;
+        }
+        let mut refined = RefinedImpls::default();
+        for (position, &impl_def_id) in impl_def_ids.iter().enumerate() {
+            let position = position as u32;
+            let self_ty = tcx.type_of(impl_def_id).instantiate_identity().skip_norm_wip();
+            match RigidSelfTy::new(tcx, self_ty) {
+                Some(key) => refined.rigid.entry(key).or_default().push((position, impl_def_id)),
+                None => refined.rest.push((position, impl_def_id)),
+            }
+        }
+        refined_impls.insert(simplified_self_ty, refined);
+    }
+    impls.refined_impls = refined_impls;
 
     impls
 }
