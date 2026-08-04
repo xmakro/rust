@@ -4,7 +4,7 @@ use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::LocalDefId;
 use rustc_infer::traits::PredicateObligations;
 use rustc_middle::traits::query::NoSolution;
-use rustc_middle::ty::{ParamEnvAnd, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{self, ParamEnvAnd, TyCtxt, TypeFoldable, TypeVisitable, TypeVisitableExt};
 use rustc_span::Span;
 
 use crate::infer::canonical::{
@@ -24,6 +24,32 @@ pub mod prove_predicate;
 pub use rustc_middle::traits::query::type_op::*;
 
 use self::custom::scrape_region_constraints;
+
+/// Replaces the param env of a type op goal with the empty one when no caller bound can apply,
+/// so that bodies with unrelated where-clauses share one canonical query key.
+///
+/// A bound is reached only by unifying it with the goal. Type and const parameters are rigid, so
+/// a bound naming one cannot unify with a goal that `is_global` says has none. Lifetimes are not
+/// enough: `is_global` admits `'static` and unification relates regions freely, so
+/// `Foo<'a>: Trait` does apply to `Foo<'static>: Trait`. Outlives clauses are never assembled as
+/// candidates for any goal.
+fn erase_irrelevant_param_env<'tcx, Q: TypeVisitable<TyCtxt<'tcx>>>(
+    query_key: ParamEnvAnd<'tcx, Q>,
+) -> ParamEnvAnd<'tcx, Q> {
+    if query_key.value.is_global()
+        && query_key.param_env.caller_bounds().iter().all(|bound| {
+            bound.has_type_flags(ty::TypeFlags::HAS_TY_PARAM | ty::TypeFlags::HAS_CT_PARAM)
+                || matches!(
+                    bound.kind().skip_binder(),
+                    ty::ClauseKind::RegionOutlives(_) | ty::ClauseKind::TypeOutlives(_)
+                )
+        })
+    {
+        ParamEnvAnd { param_env: ty::ParamEnv::empty(), value: query_key.value }
+    } else {
+        query_key
+    }
+}
 
 /// "Type ops" are used in NLL to perform some particular action and
 /// extract out the resulting region constraints (or an error if it
@@ -118,7 +144,8 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 't
 
         let mut canonical_var_values = OriginalQueryValues::default();
         let old_param_env = query_key.param_env;
-        let canonical_self = infcx.canonicalize_query(query_key, &mut canonical_var_values);
+        let canonical_self = infcx
+            .canonicalize_query(erase_irrelevant_param_env(query_key), &mut canonical_var_values);
         let canonical_result = Self::perform_query(infcx.tcx, canonical_self)?;
 
         let InferOk { value, obligations } = infcx
