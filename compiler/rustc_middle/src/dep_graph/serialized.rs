@@ -137,10 +137,10 @@ pub struct SerializedDepGraph {
     /// The number of nodes actually encoded, which is below [`Self::index_space_len`]
     /// whenever a thread left part of its batch of indices unused.
     live_node_count: usize,
-    /// Indices that hold no node, in decreasing order. Nothing on disk references them: a
-    /// promoted record's edges point only at nodes that were live when the file was
-    /// written, and the query caches only store data for nodes that were green or executed.
-    /// So a new node can take one over.
+    /// Indices that hold no node. Nothing on disk references them: a promoted record's
+    /// edges point only at nodes that were live when the file was written, and the query
+    /// caches only store data for nodes that were green or executed. So a new node can
+    /// take one over.
     unoccupied_indices: Vec<SerializedDepNodeIndex>,
     /// The number of previous compilation sessions. This is used to generate
     /// unique anon dep nodes per session.
@@ -475,10 +475,6 @@ impl SerializedDepGraph {
         }
         // Each kind's range was filled exactly to its end.
         debug_assert!(kinds.iter().zip(&fill).all(|(k, &f)| f == k.start + k.len));
-        // The free indices are served from the back of the vector, so reverse it: the
-        // lowest indices go out first, packing new nodes into the low end of the index
-        // space. Lower indices also take fewer bytes to encode in edge lists.
-        unoccupied_indices.reverse();
         let reverse_index = LazyNodeIndex { nodes_by_kind, kinds };
 
         Arc::new(SerializedDepGraph {
