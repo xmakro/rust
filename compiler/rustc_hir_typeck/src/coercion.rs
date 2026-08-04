@@ -54,7 +54,7 @@ use rustc_middle::ty::adjustment::{
     PointerCoercion,
 };
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt, Unnormalized};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeFlags, TypeVisitableExt, Unnormalized};
 use rustc_span::{BytePos, DUMMY_SP, Span};
 use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::solve::inspect::{self, InferCtxtProofTreeExt, ProofTreeVisitor};
@@ -264,6 +264,27 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
         // ultimately fall back to some form of subtyping.
         if a.is_ty_var() {
             return self.coerce_from_inference_variable(a, b);
+        }
+
+        // Coercing a type to itself records no adjustments, except for:
+        // references, where the coercion inserts a reborrow that borrow
+        // checking depends on; `dyn Trait`, which unsizes to itself; type
+        // parameters, which can do the same through a `CoerceUnsized` bound;
+        // and opaque types, whose hidden type is registered by the relation
+        // machinery below.
+        if a == b
+            && !matches!(a.kind(), ty::Ref(..))
+            && !a.has_type_flags(
+                TypeFlags::HAS_TY_DYN | TypeFlags::HAS_TY_PARAM | TypeFlags::HAS_TY_OPAQUE,
+            )
+        {
+            // `feature(pin_ergonomics)` reborrows `Pin<&mut T>` to itself and
+            // `feature(reborrow)` reborrows any ADT implementing `Reborrow`;
+            // both are ADTs, which the checks above cannot see.
+            let features = self.tcx.features();
+            if !features.pin_ergonomics() && !features.reborrow() {
+                return success(vec![], b, PredicateObligations::new());
+            }
         }
 
         // Consider coercing the subtype to a DST

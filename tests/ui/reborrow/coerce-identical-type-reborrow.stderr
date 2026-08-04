@@ -1,0 +1,33 @@
+error[E0597]: `a` does not live long enough
+  --> $DIR/coerce-identical-type-reborrow.rs:15:18
+   |
+LL | fn use_twice<'a>(a: CustomMarker<'a>) {
+   |              --  - binding `a` declared here
+   |              |
+   |              lifetime `'a` defined here
+LL |     method::<'a>(a);
+   |     -------------^-
+   |     |            |
+   |     |            borrowed value does not live long enough
+   |     argument requires that `a` is borrowed for `'a`
+LL |     method::<'a>(a);
+LL | }
+   |  - `a` dropped here while still borrowed
+
+error[E0499]: cannot borrow `a` as mutable more than once at a time
+  --> $DIR/coerce-identical-type-reborrow.rs:16:18
+   |
+LL | fn use_twice<'a>(a: CustomMarker<'a>) {
+   |              -- lifetime `'a` defined here
+LL |     method::<'a>(a);
+   |     ---------------
+   |     |            |
+   |     |            first mutable borrow occurs here
+   |     argument requires that `a` is borrowed for `'a`
+LL |     method::<'a>(a);
+   |                  ^ second mutable borrow occurs here
+
+error: aborting due to 2 previous errors
+
+Some errors have detailed explanations: E0499, E0597.
+For more information about an error, try `rustc --explain E0499`.
