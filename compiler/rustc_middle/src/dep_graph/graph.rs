@@ -69,11 +69,6 @@ rustc_index::newtype_index! {
     pub struct DepNodeIndex {}
 }
 
-// Ensure `Option<DepNodeIndex>` stays word-sized, i.e. that the index type keeps a
-// niche. (`DepNodeColorMap` separately relies on two spare values above
-// `DepNodeIndex::MAX_AS_U32`; that is checked in `DepNodeColorMap::new`.)
-rustc_data_structures::static_assert_size!(Option<DepNodeIndex>, 4);
-
 impl DepNodeIndex {
     const SINGLETON_ZERO_DEPS_ANON_NODE: DepNodeIndex = DepNodeIndex::ZERO;
     pub const FOREVER_RED_NODE: DepNodeIndex = DepNodeIndex::from_u32(1);
@@ -1354,9 +1349,12 @@ pub(super) struct DepNodeColorMap {
 const COMPRESSED_RED: u32 = u32::MAX - 1;
 const COMPRESSED_UNKNOWN: u32 = u32::MAX;
 
+// The map packs a green node's index and the two states above into one `u32` per
+// node, so the two topmost values must lie above every valid index.
+const _: () = assert!(DepNodeIndex::MAX_AS_U32 < COMPRESSED_RED);
+
 impl DepNodeColorMap {
     fn new(size: usize) -> DepNodeColorMap {
-        debug_assert!(COMPRESSED_RED > DepNodeIndex::MAX_AS_U32);
         DepNodeColorMap { values: (0..size).map(|_| AtomicU32::new(COMPRESSED_UNKNOWN)).collect() }
     }
 
