@@ -143,6 +143,14 @@ rustc_queries! {
     query derive_macro_expansion(key: (LocalExpnId, &'tcx TokenStream)) -> Result<&'tcx TokenStream, ()> {
         desc { "expanding a derive (proc) macro" }
         cache_on_disk
+        // The cache key (see the `DepNodeKey` impl for this key type) is span-agnostic, so a
+        // cached expansion is reused across edits that only shift source positions. The output
+        // token stream still carries the previous session's spans, so re-hashing it (as
+        // `incremental_verify_ich` does on a fraction of cache loads) would spuriously differ.
+        // `no_hash` makes the value fingerprint constant, encoding the deliberate contract that
+        // span-only differences in the reused output are treated as no-change; hygiene is decoded
+        // correctly on load, so this is sound and only affects diagnostic/debuginfo positions.
+        no_hash
     }
 
     /// This exists purely for testing the interactions between delayed bugs and incremental.
