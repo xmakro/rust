@@ -184,11 +184,9 @@ impl DepGraph {
 
         let colors = DepNodeColorMap::new(prev_index_space_len);
 
-        // Instantiate a node with zero dependencies only once for anonymous queries.
-        //
-        // The previous node can be green: an anonymous node with no dependencies never
-        // changes. Its key differs from the new node's key, which contains a fresh
-        // session seed, but nothing looks an anon node up by key.
+        // Instantiate a node with zero dependencies only once for anonymous queries. The
+        // previous node can be green: it never changes, and its outdated key does not
+        // matter, since nothing looks an anon node up by key.
         current.alloc_singleton_node(
             DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE,
             DepNode { kind: DepKind::AnonZeroDeps, key_fingerprint: current.anon_id_seed.into() },
@@ -198,13 +196,10 @@ impl DepGraph {
             DesiredColor::Green,
         );
 
-        // Create a single always-red node, with no dependencies of its own.
-        // Other nodes can use the always-red node as a fake dependency, to
-        // ensure that their dependency list will never be all-green.
-        //
-        // The previous node must be red for the same reason: if the marking walk saw it
-        // as green (it has no dependencies, so nothing would stop that), every node using
-        // it as a fake dependency could wrongly be marked green too.
+        // Create a single always-red node with no dependencies. Other nodes use it as a
+        // fake dependency to keep their dependency list from ever being all-green. The
+        // previous node must be red too, or the marking walk would mark it green, and
+        // its dependents with it.
         current.alloc_singleton_node(
             DepNodeIndex::FOREVER_RED_NODE,
             DepNode { kind: DepKind::Red, key_fingerprint: Fingerprint::ZERO.into() },
