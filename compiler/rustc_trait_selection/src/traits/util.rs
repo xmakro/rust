@@ -229,10 +229,16 @@ pub fn sizedness_fast_path<'tcx>(
         predicate.kind().skip_binder()
         && trait_pred.polarity == ty::PredicatePolarity::Positive
     {
-        let sizedness = match tcx.as_lang_item(trait_pred.def_id()) {
-            Some(LangItem::Sized) => SizedTraitKind::Sized,
-            Some(LangItem::MetaSized) => SizedTraitKind::MetaSized,
-            _ => return false,
+        // `sized_did` stays resolved so the `caller_bounds` loop below compares `DefId`s
+        // instead of re-entering the `lang_items` query for every bound.
+        let lang_items = tcx.lang_items();
+        let sized_did = lang_items.get(LangItem::Sized);
+        let sizedness = if sized_did == Some(trait_pred.def_id()) {
+            SizedTraitKind::Sized
+        } else if lang_items.get(LangItem::MetaSized) == Some(trait_pred.def_id()) {
+            SizedTraitKind::MetaSized
+        } else {
+            return false;
         };
 
         if trait_pred.self_ty().has_trivial_sizedness(tcx, sizedness) {
@@ -247,7 +253,7 @@ pub fn sizedness_fast_path<'tcx>(
                     && clause_pred.self_ty() == trait_pred.self_ty()
                     && (clause_pred.def_id() == trait_pred.def_id()
                         || (sizedness == SizedTraitKind::MetaSized
-                            && tcx.is_lang_item(clause_pred.def_id(), LangItem::Sized)))
+                            && sized_did == Some(clause_pred.def_id())))
                 {
                     return true;
                 }
