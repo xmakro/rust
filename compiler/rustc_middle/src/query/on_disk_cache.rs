@@ -18,8 +18,8 @@ use rustc_span::hygiene::{
     ExpnId, HygieneDecodeContext, HygieneEncodeContext, SyntaxContext, SyntaxContextKey,
 };
 use rustc_span::{
-    BlobDecoder, BytePos, ByteSymbol, CachingSourceMapView, ExpnData, ExpnHash, RelativeBytePos,
-    SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
+    BlobDecoder, BytePos, ByteSymbol, ExpnData, ExpnHash, RelativeBytePos, SourceFile, Span,
+    SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
 };
 
 use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
@@ -231,7 +231,7 @@ impl OnDiskCache {
                 type_shorthands: Default::default(),
                 predicate_shorthands: Default::default(),
                 interpret_allocs: Default::default(),
-                caching_source_map_view: CachingSourceMapView::new(tcx.sess.source_map()),
+                last_source_file: None,
                 file_to_file_index,
                 hygiene_context: &hygiene_encode_context,
                 symbol_index_table: Default::default(),
@@ -619,13 +619,11 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
             }
             TAG_FULL_SPAN => {
                 let file_lo_index = SourceFileIndex::decode(self);
-                let line_lo = usize::decode(self);
-                let col_lo = RelativeBytePos::decode(self);
+                let offset_lo = RelativeBytePos::decode(self);
                 let len = BytePos::decode(self);
 
                 let file_lo = self.file_index_to_file(file_lo_index);
-                let lo = file_lo.lines()[line_lo - 1] + col_lo;
-                let lo = file_lo.absolute_position(lo);
+                let lo = file_lo.absolute_position(offset_lo);
                 let hi = lo + len;
                 (lo, hi)
             }
@@ -783,7 +781,9 @@ pub struct CacheEncoder<'a, 'tcx> {
     type_shorthands: FxHashMap<Ty<'tcx>, usize>,
     predicate_shorthands: FxHashMap<ty::PredicateKind<'tcx>, usize>,
     interpret_allocs: FxIndexSet<interpret::AllocId>,
-    caching_source_map_view: CachingSourceMapView<'tcx>,
+    /// One-entry cache for `SourceMap::lookup_source_file`: consecutive encoded spans
+    /// overwhelmingly belong to the same file.
+    last_source_file: Option<Arc<SourceFile>>,
     file_to_file_index: FxHashMap<*const SourceFile, SourceFileIndex>,
     hygiene_context: &'a HygieneEncodeContext,
     // Used for both `Symbol`s and `ByteSymbol`s.
@@ -899,11 +899,17 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
             return;
         }
 
-        let Some((file_lo, line_lo, col_lo)) =
-            self.caching_source_map_view.byte_pos_to_line_and_col(span_data.lo)
-        else {
-            return TAG_PARTIAL_SPAN.encode(self);
-        };
+        // Full spans are encoded as (file, offset within file, length), mirroring the stable
+        // hash of a span (see `stable_hash_span`): a reloaded span must re-hash to the
+        // fingerprint its containing value was stored under.
+        if !matches!(&self.last_source_file, Some(file) if file.contains(span_data.lo)) {
+            let file = self.tcx.sess.source_map().lookup_source_file(span_data.lo);
+            if !file.contains(span_data.lo) {
+                return TAG_PARTIAL_SPAN.encode(self);
+            }
+            self.last_source_file = Some(file);
+        }
+        let file_lo = self.last_source_file.clone().unwrap();
 
         if let Some(parent) = parent
             && file_lo.contains(parent.lo)
@@ -914,13 +920,13 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
             return;
         }
 
+        let offset_lo = file_lo.relative_position(span_data.lo);
         let len = span_data.hi - span_data.lo;
         let source_file_index = self.source_file_index(file_lo);
 
         TAG_FULL_SPAN.encode(self);
         source_file_index.encode(self);
-        line_lo.encode(self);
-        col_lo.encode(self);
+        offset_lo.encode(self);
         len.encode(self);
     }
 

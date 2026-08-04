@@ -1,4 +1,5 @@
 use std::hash::Hash;
+use std::sync::Arc;
 
 use rustc_data_structures::stable_hash::{
     RawDefId, RawDefPathHash, RawSpan, StableHash, StableHashControls, StableHashCtxt, StableHasher,
@@ -7,14 +8,7 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_session::Session;
 use rustc_session::cstore::Untracked;
 use rustc_span::source_map::SourceMap;
-use rustc_span::{CachingSourceMapView, DUMMY_SP, Pos, Span};
-
-// Very often, we are hashing something that does not need the `CachingSourceMapView`, so we
-// initialize it lazily.
-enum CachingSourceMap<'a> {
-    Unused(&'a SourceMap),
-    InUse(CachingSourceMapView<'a>),
-}
+use rustc_span::{DUMMY_SP, Pos, SourceFile, Span};
 
 /// This is the context state available during incr. comp. hashing. It contains
 /// enough information to transform `DefId`s and `HirId`s into stable `DefPath`s (i.e.,
@@ -25,7 +19,10 @@ pub struct StableHashState<'a> {
     // The value of `-Z incremental-ignore-spans`.
     // This field should only be used by `unstable_opts_incremental_ignore_span`
     incremental_ignore_spans: bool,
-    caching_source_map: CachingSourceMap<'a>,
+    source_map: &'a SourceMap,
+    /// One-entry cache for [`SourceMap::lookup_source_file`]: consecutive hashed spans
+    /// overwhelmingly belong to the same file, so this skips most binary searches.
+    file_cache: Option<Arc<SourceFile>>,
     stable_hash_controls: StableHashControls,
 }
 
@@ -37,7 +34,8 @@ impl<'a> StableHashState<'a> {
         StableHashState {
             untracked,
             incremental_ignore_spans: sess.opts.unstable_opts.incremental_ignore_spans,
-            caching_source_map: CachingSourceMap::Unused(sess.source_map()),
+            source_map: sess.source_map(),
+            file_cache: None,
             stable_hash_controls: StableHashControls { hash_spans: hash_spans_initial },
         }
     }
@@ -50,15 +48,17 @@ impl<'a> StableHashState<'a> {
         self.stable_hash_controls.hash_spans = prev_hash_spans;
     }
 
+    /// Returns the file containing `pos`, or `None` if no file contains it.
     #[inline]
-    fn source_map(&mut self) -> &mut CachingSourceMapView<'a> {
-        match self.caching_source_map {
-            CachingSourceMap::InUse(ref mut sm) => sm,
-            CachingSourceMap::Unused(sm) => {
-                self.caching_source_map = CachingSourceMap::InUse(CachingSourceMapView::new(sm));
-                self.source_map() // this recursive call will hit the `InUse` case
+    fn source_file_for_pos(&mut self, pos: rustc_span::BytePos) -> Option<&Arc<SourceFile>> {
+        if !matches!(&self.file_cache, Some(file) if file.contains(pos)) {
+            let file = self.source_map.lookup_source_file(pos);
+            if !file.contains(pos) {
+                return None;
             }
+            self.file_cache = Some(file);
         }
+        self.file_cache.as_ref()
     }
 
     #[inline]
@@ -75,15 +75,24 @@ impl<'a> StableHashState<'a> {
 impl<'a> StableHashCtxt for StableHashState<'a> {
     /// Hashes a span in a stable way. We can't directly hash the span's `BytePos` fields (that
     /// would be similar to hashing pointers, since those are just offsets into the `SourceMap`).
-    /// Instead, we hash the (file name, line, column) triple, which stays the same even if the
-    /// containing `SourceFile` has moved within the `SourceMap`.
+    /// Instead, we hash the (file, offset within file, length) triple, which stays the same even
+    /// if the containing `SourceFile` has moved within the `SourceMap`.
     ///
-    /// Also note that we are hashing byte offsets for the column, not unicode codepoint offsets.
-    /// For the purpose of the hash that's sufficient. Also, hashing filenames is expensive so we
-    /// avoid doing it twice when the span starts and ends in the same file, which is almost always
-    /// the case.
+    /// This deliberately hashes byte offsets rather than line/column numbers: the two change
+    /// under exactly the same class of edits that move the span's rendered position (any change
+    /// to the length of the content before it in the file changes the offset; note that a
+    /// same-length edit that alters line structure changes line numbers but also changes the
+    /// file's content hash, which invalidates the affected items directly). Offsets avoid the
+    /// far more expensive line-table lookups.
     ///
-    /// IMPORTANT: changes to this method should be reflected in implementations of `SpanEncoder`.
+    /// Hashing both the start offset and the length ensures that two otherwise equal spans with
+    /// different end positions hash differently (see issue #74890 for why the end position must
+    /// contribute to the hash).
+    ///
+    /// IMPORTANT: changes to this method should be reflected in implementations of `SpanEncoder`
+    /// (in particular the `TAG_FULL_SPAN` encoding of the incremental on-disk cache, which must
+    /// agree with this hash about which spans are equivalent: a cached span must re-hash to the
+    /// fingerprint it was stored under).
     #[inline]
     fn stable_hash_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
         const TAG_VALID_SPAN: u8 = 0;
@@ -108,23 +117,25 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
         if let Some(parent) = parent
             && parent.contains(span)
         {
-            // This span is enclosed in a definition: only hash the relative position. This catches
-            // a subset of the cases from the `file.contains(parent.lo)`. But we can do this check
-            // cheaply without the expensive `span_data_to_lines_and_cols` query.
+            // This span is enclosed in a definition: only hash the relative position. This
+            // catches a subset of the cases from the `file.contains(parent.lo)` below, without
+            // any `SourceMap` lookup at all.
             Hash::hash(&TAG_RELATIVE_SPAN, hasher);
             (span.lo - parent.lo).to_u32().stable_hash(self, hasher);
             (span.hi - parent.lo).to_u32().stable_hash(self, hasher);
             return;
         }
 
-        // If this is not an empty or invalid span, we want to hash the last position that belongs
-        // to it, as opposed to hashing the first position past it.
-        let Some((file, line_lo, col_lo, line_hi, col_hi)) =
-            self.source_map().span_data_to_lines_and_cols(&span)
-        else {
+        let Some(file) = self.source_file_for_pos(span.lo) else {
             Hash::hash(&TAG_INVALID_SPAN, hasher);
             return;
         };
+
+        if span.hi > file.end_position() {
+            // The span crosses a file boundary; treat it like an invalid span.
+            Hash::hash(&TAG_INVALID_SPAN, hasher);
+            return;
+        }
 
         if let Some(parent) = parent
             && file.contains(parent.lo)
@@ -139,23 +150,8 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
 
         Hash::hash(&TAG_VALID_SPAN, hasher);
         Hash::hash(&file.stable_id, hasher);
-
-        // Hash both the length and the end location (line/column) of a span. If we hash only the
-        // length, for example, then two otherwise equal spans with different end locations will
-        // have the same hash. This can cause a problem during incremental compilation wherein a
-        // previous result for a query that depends on the end location of a span will be
-        // incorrectly reused when the end location of the span it depends on has changed (see
-        // issue #74890). A similar analysis applies if some query depends specifically on the
-        // length of the span, but we only hash the end location. So hash both.
-
-        let col_lo_trunc = (col_lo.0 as u64) & 0xFF;
-        let line_lo_trunc = ((line_lo as u64) & 0xFF_FF_FF) << 8;
-        let col_hi_trunc = (col_hi.0 as u64) & 0xFF << 32;
-        let line_hi_trunc = ((line_hi as u64) & 0xFF_FF_FF) << 40;
-        let col_line = col_lo_trunc | line_lo_trunc | col_hi_trunc | line_hi_trunc;
-        let len = (span.hi - span.lo).0;
-        Hash::hash(&col_line, hasher);
-        Hash::hash(&len, hasher);
+        Hash::hash(&file.relative_position(span.lo).to_u32(), hasher);
+        Hash::hash(&(span.hi - span.lo).0, hasher);
     }
 
     #[inline]

@@ -1983,8 +1983,10 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         self.normalized_source_len.encode(s);
         self.unnormalized_source_len.encode(s);
 
-        // We are always in `Lines` form by the time we reach here.
-        assert!(self.lines.read().is_lines());
+        // This forces the conversion from `Diffs` form if necessary. (Historically the file was
+        // guaranteed to be in `Lines` form here as a side effect of span hashing computing
+        // line/column numbers, but span hashing is offset-based and no longer touches the line
+        // table.)
         let lines = self.lines();
         // Store the length.
         s.emit_u32(lines.len() as u32);
