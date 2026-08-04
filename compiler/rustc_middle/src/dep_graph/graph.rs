@@ -1267,8 +1267,7 @@ impl CurrentDepGraph {
     /// Writes one of the singleton nodes, which sit at the same reserved index in every
     /// session. If a previous session left a node at that index, it is colored
     /// `prev_color` right away, which keeps the marking walk from promoting it: promotion
-    /// would write a second record for the index, next to the one written here. Each call
-    /// site explains why its color is correct.
+    /// would write a second record for the index, next to the one written here.
     #[inline(always)]
     fn alloc_singleton_node(
         &self,
