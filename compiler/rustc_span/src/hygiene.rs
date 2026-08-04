@@ -966,8 +966,7 @@ impl Span {
 /// A subset of properties from both macro definition and macro call available through global data.
 /// Avoid using this if you have access to the original definition or call structures.
 ///
-/// Note: `StableHash` is implemented manually (see the impl next to `update_disambiguator`) so
-/// that the source *positions* of `call_site`/`def_site` do not enter the `ExpnHash`.
+/// `StableHash` is implemented manually, next to `update_disambiguator`.
 #[derive(Clone, Debug, Encodable, Decodable)]
 pub struct ExpnData {
     // --- The part unique to each expansion.
@@ -1482,22 +1481,14 @@ pub fn raw_encode_syntax_context(
 /// such that the `Fingerprint` of the `ExpnData` does not collide with
 /// any other `ExpnIds`.
 ///
-/// The `ExpnHash` of an expansion is position-independent: the source *positions* of `call_site`
-/// and `def_site` are deliberately excluded (only their hygiene contexts are hashed). Spans in
-/// macro-expanded code hash their `SyntaxContext` — and through it, this `ExpnHash` — so if the
-/// positions were included here, an edit that merely shifts source locations (e.g. inserting a
-/// line at the top of a file) would change the hash of every expansion below it and thereby
-/// invalidate all incremental results for macro-generated code.
+/// Hashes everything except the source positions of `call_site` and `def_site`; only their
+/// hygiene contexts enter the hash. Every macro-expanded span hashes its `SyntaxContext` and,
+/// through it, this hash, so a position here would propagate a source shift into the fingerprint
+/// of every downstream result for macro-generated code.
 ///
-/// This does not make expansion identity ambiguous or positions stale:
-/// - Uniqueness of `ExpnHash` is guaranteed by `update_disambiguator` below: two otherwise
-///   identical expansions (e.g. the same derive on two identical-token items, or the same bang
-///   macro called twice with the same arguments in one body) collide on this hash and receive
-///   sequential disambiguators in expansion order, which is itself stable across position-only
-///   edits.
-/// - `ExpnData` *values* still carry the real spans. Expansion re-runs from source every session
-///   and cached query results refer to expansions by hash, so a reused (green) result decodes to
-///   the new session's expansion with up-to-date positions rather than stale ones.
+/// Expansions that differ only in call-site position therefore collide here;
+/// `update_disambiguator` below keeps `ExpnHash` unique by numbering collisions in expansion
+/// order.
 impl StableHash for ExpnData {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         // Destructure so that adding a field to `ExpnData` forces a decision here.
@@ -1519,7 +1510,7 @@ impl StableHash for ExpnData {
 
         kind.stable_hash(hcx, hasher);
         parent.stable_hash(hcx, hasher);
-        // Hash only the hygiene context of the call/def sites, not their positions (see above).
+        // Only the hygiene context of the two sites, not their positions (see above).
         call_site.ctxt().stable_hash(hcx, hasher);
         def_site.ctxt().stable_hash(hcx, hasher);
         disambiguator.stable_hash(hcx, hasher);
