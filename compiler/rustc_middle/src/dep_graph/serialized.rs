@@ -1110,14 +1110,14 @@ impl GraphEncoder {
         let mut local = self.status.local.borrow_mut();
 
         let index = DepNodeIndex::from_u32(prev_index.as_u32());
-        let color = if is_green { DesiredColor::Green { index } } else { DesiredColor::Red };
+        let color = if is_green { DesiredColor::Green } else { DesiredColor::Red };
 
         // Use `try_set_color` to avoid racing when `send_promoted` is called concurrently
         // on the same index.
         match colors.try_set_color(prev_index, color) {
             TrySetColorResult::Success => {}
             TrySetColorResult::AlreadyRed => panic!("dep node {prev_index:?} is unexpectedly red"),
-            TrySetColorResult::AlreadyGreen { index } => return index,
+            TrySetColorResult::AlreadyGreen => return index,
         }
 
         self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
@@ -1144,7 +1144,7 @@ impl GraphEncoder {
 
         // Use `try_set_color` to avoid racing when `send_promoted` or `send_and_color`
         // is called concurrently on the same index.
-        match colors.try_set_color(prev_index, DesiredColor::Green { index }) {
+        match colors.try_set_color(prev_index, DesiredColor::Green) {
             TrySetColorResult::Success => {
                 debug_assert!(
                     self.status
@@ -1163,7 +1163,7 @@ impl GraphEncoder {
             // changed. So this only happens for `no_hash` queries: they have no value
             // fingerprint to compare, and re-execution always colors them red.
             TrySetColorResult::AlreadyRed => None,
-            TrySetColorResult::AlreadyGreen { index } => Some(index),
+            TrySetColorResult::AlreadyGreen => Some(index),
         }
     }
 
