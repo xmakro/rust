@@ -713,6 +713,7 @@ use std::fmt;
 #[cfg(feature = "rustc")]
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_index::Idx;
 use rustc_index::bit_set::DenseBitSet;
 use smallvec::{SmallVec, smallvec};
 use tracing::{debug, instrument};
@@ -1204,6 +1205,87 @@ impl<'p, Cx: PatCx> fmt::Debug for MatrixRow<'p, Cx> {
     }
 }
 
+/// The rows of a matrix, grouped by the discriminant of their head constructor. See
+/// [`Matrix::head_ctor_index`] and [`ctor_discriminant`].
+#[derive(Default)]
+struct HeadCtorIndex {
+    /// Rows whose head constructor has a discriminant, keyed by it.
+    keyed: FxHashMap<u64, Vec<u32>>,
+    /// Rows whose head constructor has none, so they have to be considered every time.
+    unkeyed: Vec<u32>,
+}
+
+/// A discriminant such that a constructor is covered by a head constructor with a
+/// discriminant only if the two are equal, or `None` if the constructor is one whose
+/// coverage is not decided by equality (wildcards, ranges, slices and the like).
+fn ctor_discriminant<Cx: PatCx>(ctor: &Constructor<Cx>) -> Option<u64> {
+    // The tag keeps the discriminants of the different constructors apart.
+    match ctor {
+        Constructor::Struct => Some(0),
+        Constructor::Ref => Some(1),
+        Constructor::UnionField => Some(2),
+        Constructor::Bool(b) => Some(3 | ((*b as u64) << 8)),
+        Constructor::Variant(idx) => Some(4 | ((idx.index() as u64) << 8)),
+        _ => None,
+    }
+}
+
+/// Walks the rows of a matrix that a constructor could be covered by, in their original order.
+struct CandidateRows<'a> {
+    keyed: &'a [u32],
+    unkeyed: &'a [u32],
+    /// Used when there is no index to consult, in which case every row is a candidate.
+    all: std::ops::Range<u32>,
+}
+
+impl<'a> CandidateRows<'a> {
+    fn new<Cx: PatCx>(
+        rows: usize,
+        ctor: &Constructor<Cx>,
+        head_index: Option<&'a HeadCtorIndex>,
+    ) -> Self {
+        let indexed = head_index.zip(ctor_discriminant(ctor));
+        match indexed {
+            Some((index, key)) => CandidateRows {
+                keyed: index.keyed.get(&key).map_or(&[][..], |rows| rows.as_slice()),
+                unkeyed: &index.unkeyed,
+                all: 0..0,
+            },
+            None => CandidateRows { keyed: &[], unkeyed: &[], all: 0..rows as u32 },
+        }
+    }
+
+    fn next(&mut self) -> Option<usize> {
+        if let Some(i) = self.all.next() {
+            return Some(i as usize);
+        }
+        // Both lists are sorted, so merging them keeps the rows in their original order.
+        let next = match (self.keyed.first(), self.unkeyed.first()) {
+            (Some(&a), Some(&b)) if a < b => {
+                self.keyed = &self.keyed[1..];
+                a
+            }
+            (Some(_), Some(&b)) => {
+                self.unkeyed = &self.unkeyed[1..];
+                b
+            }
+            (Some(&a), None) => {
+                self.keyed = &self.keyed[1..];
+                a
+            }
+            (None, Some(&b)) => {
+                self.unkeyed = &self.unkeyed[1..];
+                b
+            }
+            (None, None) => return None,
+        };
+        Some(next as usize)
+    }
+}
+
+/// Below this many rows, walking all of them is cheaper than building the index.
+const HEAD_CTOR_INDEX_THRESHOLD: usize = 8;
+
 /// A 2D matrix. Represents a list of pattern-tuples under investigation.
 ///
 /// Invariant: each row must have the same length, and each column must have the same type.
@@ -1279,12 +1361,29 @@ impl<'p, Cx: PatCx> Matrix<'p, Cx> {
         self.rows().map(|r| r.head())
     }
 
+    /// Groups the rows by the discriminant of their head constructor, so that specializing
+    /// with a constructor only looks at the rows it can possibly be covered by instead of at
+    /// every row. A match on an enum with `V` variants and one arm per variant otherwise walks
+    /// all `V` rows `V` times.
+    fn head_ctor_index(&self) -> HeadCtorIndex {
+        let mut index = HeadCtorIndex::default();
+        for (i, row) in self.rows().enumerate() {
+            let i = i as u32;
+            match ctor_discriminant(row.head().ctor()) {
+                Some(key) => index.keyed.entry(key).or_default().push(i),
+                None => index.unkeyed.push(i),
+            }
+        }
+        index
+    }
+
     /// This computes `specialize(ctor, self)`. See top of the file for explanations.
     fn specialize_constructor(
         &self,
         pcx: &PlaceCtxt<'_, Cx>,
         ctor: &Constructor<Cx>,
         ctor_is_relevant: bool,
+        head_index: Option<&HeadCtorIndex>,
     ) -> Result<Matrix<'p, Cx>, Cx::Error> {
         if matches!(ctor, Constructor::Or) {
             // Specializing with `Or` means expanding rows with or-patterns.
@@ -1309,7 +1408,11 @@ impl<'p, Cx: PatCx> Matrix<'p, Cx> {
                 place_info: specialized_place_info,
                 wildcard_row_is_relevant: self.wildcard_row_is_relevant && ctor_is_relevant,
             };
-            for (i, row) in self.rows().enumerate() {
+            // Rows that the index cannot rule out, in their original order. `is_covered_by`
+            // still decides, the index only says which rows are worth asking about.
+            let mut candidates = CandidateRows::new(self.rows.len(), ctor, head_index);
+            while let Some(i) = candidates.next() {
+                let row = &self.rows[i];
                 if ctor.is_covered_by(pcx.cx, row.head().ctor())? {
                     let new_row =
                         row.pop_head_constructor(pcx.cx, ctor, arity, ctor_is_relevant, i)?;
@@ -1742,6 +1845,10 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
     let ty = &place.ty.clone(); // Clone it out so we can mutate `matrix` later.
     let pcx = &PlaceCtxt { cx: mcx.tycx, ty };
     let mut ret = WitnessMatrix::empty();
+    // Specializing with every constructor in turn is quadratic in the number of rows, unless
+    // each constructor can find the rows it applies to.
+    let head_index = (split_ctors.len() > 1 && matrix.rows.len() >= HEAD_CTOR_INDEX_THRESHOLD)
+        .then(|| matrix.head_ctor_index());
     for ctor in split_ctors {
         // Dig into rows that match `ctor`.
         debug!("specialize({:?})", ctor);
@@ -1751,7 +1858,8 @@ fn compute_exhaustiveness_and_usefulness<'a, 'p, Cx: PatCx>(
         let ctor_is_relevant = matches!(ctor, Constructor::Missing)
             || missing_ctors.is_empty()
             || mcx.tycx.exhaustive_witnesses();
-        let mut spec_matrix = matrix.specialize_constructor(pcx, &ctor, ctor_is_relevant)?;
+        let mut spec_matrix =
+            matrix.specialize_constructor(pcx, &ctor, ctor_is_relevant, head_index.as_ref())?;
         let mut witnesses = ensure_sufficient_stack(|| {
             compute_exhaustiveness_and_usefulness(mcx, &mut spec_matrix)
         })?;
