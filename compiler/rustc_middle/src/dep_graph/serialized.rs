@@ -1156,12 +1156,10 @@ impl GraphEncoder {
                 self.status.promote_node(prev_index, &self.retained_graph, &mut *local, edges);
                 Some(index)
             }
-            // The query was already re-executed and encoded red via `send_and_color`.
-            // That can be the work of another thread, or of this one: forcing a
-            // dependency during the marking walk can end up executing this very query.
-            // Since every dependency was green, the re-executed result cannot have
-            // changed. So this only happens for `no_hash` queries: they have no value
-            // fingerprint to compare, and re-execution always colors them red.
+            // The query was re-executed in the meantime, by another thread or while
+            // forcing a dependency, and encoded red. Since all dependencies were green,
+            // that only happens for `no_hash` queries: with no fingerprint to compare,
+            // re-execution always colors them red.
             TrySetColorResult::AlreadyRed => None,
             TrySetColorResult::AlreadyGreen => Some(index),
         }
