@@ -113,6 +113,8 @@ impl MultiItemModifier for DeriveProcMacro {
         let res = if ecx.sess.opts.incremental.is_some()
             && ecx.sess.opts.unstable_opts.cache_proc_macros
         {
+            let file_start = ecx.sess.source_map().lookup_source_file(span.lo()).start_pos;
+            let anchor = Span::with_root_ctxt(file_start, file_start);
             ty::tls::with(|tcx| {
                 let input = &*tcx.arena.alloc(input);
                 let key: (LocalExpnId, &TokenStream) = (invoc_id, input);
@@ -121,6 +123,26 @@ impl MultiItemModifier for DeriveProcMacro {
                     tcx.derive_macro_expansion(key).cloned()
                 })
             })
+            // Normalize the output token positions to a position-stable anchor (an empty span
+            // at the start of the call site's file), keeping each token's hygiene context. The
+            // query's key and value are span-agnostic (a cached expansion is reused even when
+            // source positions have shifted), so on a cache hit the loaded spans carry the
+            // previous session's positions — worse, decoding them against the edited file
+            // drifts them unpredictably (the cached line/col may no longer exist).
+            //
+            // Anchoring at the file start (rather than e.g. the call site) matters because the
+            // `source_span` of each definition the expansion produces is derived from these
+            // token spans, and every query that so much as inspects a span parented to such a
+            // definition records a dependency on its `source_span` (see `track_span_parent`).
+            // With a call-site anchor those spans move with every position-shifting edit,
+            // keeping typeck/THIR/MIR building for all generated code red; with a file-start
+            // anchor they are identical across such edits and the whole chain can be reused.
+            //
+            // The cost is diagnostic precision inside the expansion: errors in generated code
+            // lose their exact position (the expansion note still identifies the derive and its
+            // call site, whose `ExpnData` carries up-to-date positions). Hygiene (name
+            // resolution) is unaffected since each token's `SyntaxContext` is preserved.
+            .map(|output| output.map_spans(|sp| anchor.with_ctxt(sp.ctxt())))
         } else {
             expand_derive_macro(invoc_id, input, ecx, self.client)
         };

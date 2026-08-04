@@ -342,6 +342,20 @@ impl<'sess> AttributeParser<'sess> {
                         }
                     };
 
+                    // Apply `lower_span` to the spans inside the argument tokens before parsing,
+                    // so that every span the attribute parsers extract into `AttributeKind` values
+                    // is parented to the attribute's HIR owner. Otherwise those spans are hashed
+                    // (and cached) with absolute positions, and the attribute hash of the owner
+                    // changes on every edit that shifts source positions. Only do this when it can
+                    // have an effect (`lower_span` is the identity outside incremental mode).
+                    let lowered_args;
+                    let args = if self.sess.opts.incremental.is_some() {
+                        lowered_args = Self::lower_attr_args_spans(args, lower_span);
+                        &lowered_args
+                    } else {
+                        args
+                    };
+
                     let parts =
                         n.item.path.segments.iter().map(|seg| seg.ident.name).collect::<Vec<_>>();
                     let inner_span = lower_span(n.item.span());
@@ -517,10 +531,42 @@ impl<'sess> AttributeParser<'sess> {
             || SPECIAL_ATTRIBUTES.contains(&path)
     }
 
+    /// Returns a copy of `args` with `lower_span` applied to every span, including the spans
+    /// inside the delimited argument tokens. See `parse_attribute_list` for why this matters
+    /// for incremental compilation.
+    fn lower_attr_args_spans(
+        args: &ast::AttrArgs,
+        lower_span: impl Copy + Fn(Span) -> Span,
+    ) -> ast::AttrArgs {
+        match args {
+            ast::AttrArgs::Empty => ast::AttrArgs::Empty,
+            ast::AttrArgs::Delimited(args) => ast::AttrArgs::Delimited(ast::DelimArgs {
+                dspan: rustc_ast::tokenstream::DelimSpan {
+                    open: lower_span(args.dspan.open),
+                    close: lower_span(args.dspan.close),
+                },
+                delim: args.delim,
+                tokens: args.tokens.map_spans(lower_span),
+            }),
+            ast::AttrArgs::Eq { eq_span, expr } => {
+                let mut expr = expr.clone();
+                expr.span = lower_span(expr.span);
+                ast::AttrArgs::Eq { eq_span: lower_span(*eq_span), expr }
+            }
+        }
+    }
+
     fn lower_attr_args(&self, args: &ast::AttrArgs, lower_span: impl Fn(Span) -> Span) -> AttrArgs {
         match args {
             ast::AttrArgs::Empty => AttrArgs::Empty,
-            ast::AttrArgs::Delimited(args) => AttrArgs::Delimited(args.clone()),
+            ast::AttrArgs::Delimited(args) => AttrArgs::Delimited(ast::DelimArgs {
+                dspan: rustc_ast::tokenstream::DelimSpan {
+                    open: lower_span(args.dspan.open),
+                    close: lower_span(args.dspan.close),
+                },
+                delim: args.delim,
+                tokens: args.tokens.map_spans(&lower_span),
+            }),
             // This is an inert key-value attribute - it will never be visible to macros
             // after it gets lowered to HIR. Therefore, we can extract literals to handle
             // nonterminals in `#[doc]` (e.g. `#[doc = $e]`).
