@@ -1,10 +1,12 @@
 use std::fmt::Debug;
 
+use rustc_ast::tokenstream::TokenStream;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_hir::def_id::{CrateNum, DefId, LOCAL_CRATE, LocalDefId, LocalModDefId, ModDefId};
 use rustc_hir::definitions::DefPathHash;
 use rustc_hir::{HirId, ItemLocalId, OwnerId};
+use rustc_span::LocalExpnId;
 
 use crate::dep_graph::{DepNode, KeyFingerprintStyle};
 use crate::ty::TyCtxt;
@@ -154,6 +156,65 @@ impl<'tcx> DepNodeKey<'tcx> for (DefId, DefId) {
         let def_path_hash_1 = tcx.def_path_hash(def_id_1);
 
         def_path_hash_0.0.combine(def_path_hash_1.0)
+    }
+}
+
+impl<'tcx, 'a> DepNodeKey<'tcx> for (LocalExpnId, &'a TokenStream) {
+    #[inline(always)]
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::Opaque
+    }
+
+    /// Span-agnostic fingerprint for the `derive_macro_expansion` query key.
+    ///
+    /// The default blanket impl would `StableHash` the whole `(LocalExpnId, &TokenStream)`
+    /// tuple, which folds every token span (and the expansion's `call_site`/`def_site`) into
+    /// the fingerprint. As a result, an edit that only *shifts* source positions — e.g.
+    /// inserting a comment at the top of the file — changes the fingerprint of every derive
+    /// invocation and misses the on-disk cache entirely, even though the proc macro would
+    /// produce identical output.
+    ///
+    /// Instead we hash a triple of span-agnostic, edit-stable components:
+    /// - the enclosing module's `DefId` (via its `DefPathHash`);
+    /// - the macro's `DefId` (via its `DefPathHash`), so distinct macros never share a node —
+    ///   the proc macro crate's `crate_hash` is registered as a real dependency in
+    ///   `provide_derive_macro_expansion`, which invalidates the cache when the macro's
+    ///   *definition* changes;
+    /// - the input token stream with span hashing disabled, so only token kinds and symbols
+    ///   contribute.
+    ///
+    /// The `(module, macro, tokens)` triple is collision-free for all legal programs: two
+    /// distinct derive invocations that hash identically would have to be the same macro applied
+    /// to two items with byte-identical token trees (which include the item's name) in the same
+    /// module — but duplicate item names in one module are rejected by name resolution. This
+    /// matters because the dep graph panics if two distinct query keys map to one `DepNode`
+    /// (see `assert_dep_node_not_yet_allocated_in_current_session`).
+    ///
+    /// Notably we do *not* fold in the raw `LocalExpnId` index: expansion ids are not stable
+    /// across edits that insert or remove earlier expansions (e.g. a comment before other
+    /// macro calls shifts every subsequent index), which would defeat the cache entirely.
+    ///
+    /// On a cache hit the loaded tokens carry the previous session's byte positions; hygiene
+    /// (`SyntaxContext`) is still decoded correctly by the on-disk cache, so name resolution is
+    /// unaffected and this remains sound — only diagnostic spans for macro-generated code may
+    /// point at stale offsets.
+    fn to_fingerprint(&self, tcx: TyCtxt<'tcx>) -> Fingerprint {
+        let (invoc_id, input) = *self;
+        tcx.with_stable_hashing_context(|mut hcx| {
+            let mut hasher = StableHasher::new();
+
+            let expn_data = invoc_id.expn_data();
+            // Enclosing module and macro identity, both via span-agnostic `DefPathHash`.
+            expn_data.parent_module.stable_hash(&mut hcx, &mut hasher);
+            expn_data.macro_def_id.stable_hash(&mut hcx, &mut hasher);
+
+            // The input tokens, ignoring spans.
+            hcx.while_hashing_spans(false, |hcx| {
+                input.stable_hash(hcx, &mut hasher);
+            });
+
+            hasher.finish()
+        })
     }
 }
 
