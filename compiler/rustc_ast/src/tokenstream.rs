@@ -824,6 +824,42 @@ impl FromIterator<TokenTree> for TokenStream {
     }
 }
 
+impl TokenStream {
+    /// Returns a copy of this stream with every span (including delimiter spans and the
+    /// spans nested in `NtIdent`/`NtLifetime` tokens) replaced by `f(span)`.
+    ///
+    /// Used by incremental compilation to re-anchor token spans, e.g. to parent attribute
+    /// argument spans to their HIR owner, or to normalize the positions of cached proc macro
+    /// expansions.
+    pub fn map_spans(&self, f: impl Fn(Span) -> Span + Copy) -> TokenStream {
+        TokenStream::new(self.iter().map(|tt| tt.map_spans(f)).collect())
+    }
+}
+
+impl TokenTree {
+    /// See [`TokenStream::map_spans`].
+    pub fn map_spans(&self, f: impl Fn(Span) -> Span + Copy) -> TokenTree {
+        match self.clone() {
+            TokenTree::Token(mut token, spacing) => {
+                token.span = f(token.span);
+                match &mut token.kind {
+                    token::NtIdent(ident, _) | token::NtLifetime(ident, _) => {
+                        ident.span = f(ident.span)
+                    }
+                    _ => {}
+                }
+                TokenTree::Token(token, spacing)
+            }
+            TokenTree::Delimited(dspan, dspacing, delim, tts) => TokenTree::Delimited(
+                DelimSpan { open: f(dspan.open), close: f(dspan.close) },
+                dspacing,
+                delim,
+                tts.map_spans(f),
+            ),
+        }
+    }
+}
+
 impl StableHash for TokenStream {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         for sub_tt in self.iter() {
