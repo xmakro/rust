@@ -1405,7 +1405,7 @@ impl FlatTokenCursor {
 
 /// Rebuilds the token tree for the buffer range `start..end`, which must lie
 /// entirely at one nesting level (delimited sequences fully contained).
-pub fn flat_range_to_stream(
+fn flat_range_to_stream(
     entries: &[FlatEntry],
     matches: &[u32],
     start: usize,
@@ -1414,7 +1414,7 @@ pub fn flat_range_to_stream(
     TokenStream::new(flat_range_to_trees(entries, matches, start, end))
 }
 
-pub fn flat_range_to_trees(
+fn flat_range_to_trees(
     entries: &[FlatEntry],
     matches: &[u32],
     start: usize,
@@ -1437,7 +1437,7 @@ pub fn flat_range_to_trees(
 
 /// Rebuilds the `TokenTree::Delimited` whose open delimiter lives at
 /// `open_idx` in the flat token buffer.
-pub fn flat_delimited_at(entries: &[FlatEntry], matches: &[u32], open_idx: usize) -> TokenTree {
+fn flat_delimited_at(entries: &[FlatEntry], matches: &[u32], open_idx: usize) -> TokenTree {
     let open = &entries[open_idx];
     let close_idx = matches[open_idx] as usize;
     let close = &entries[close_idx];
