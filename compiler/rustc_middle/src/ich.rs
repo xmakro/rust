@@ -161,6 +161,44 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
         Hash::hash(&(span.hi - span.lo).0, hasher);
     }
 
+    /// Hashes a definition's span used as an anchor: (file, length), deliberately excluding
+    /// the offset so that a definition which merely moves keeps its fingerprint. Everything
+    /// position-observable is covered elsewhere: relative spans re-anchor on decode, line
+    /// renderings depend on `def_position` and `file_lines_prefix_hash`, and cross-file moves
+    /// change the hashed `stable_id`. See `rustc_span::AnchorSpan`.
+    fn stable_hash_anchor_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
+        const TAG_VALID_SPAN: u8 = 0;
+        const TAG_INVALID_SPAN: u8 = 1;
+
+        if !self.stable_hash_controls().hash_spans {
+            return;
+        }
+
+        let span = Span::from_raw_span(raw_span);
+        let span = span.data_untracked();
+        span.ctxt.stable_hash(self, hasher);
+        debug_assert_eq!(span.parent, None, "anchor spans must be absolute");
+
+        if span.is_dummy() {
+            Hash::hash(&TAG_INVALID_SPAN, hasher);
+            return;
+        }
+
+        let Some(file) = self.source_file_for_pos(span.lo) else {
+            Hash::hash(&TAG_INVALID_SPAN, hasher);
+            return;
+        };
+
+        if span.hi > file.end_position() {
+            Hash::hash(&TAG_INVALID_SPAN, hasher);
+            return;
+        }
+
+        Hash::hash(&TAG_VALID_SPAN, hasher);
+        Hash::hash(&file.stable_id, hasher);
+        Hash::hash(&(span.hi - span.lo).0, hasher);
+    }
+
     #[inline]
     fn def_path_hash(&self, raw_def_id: RawDefId) -> RawDefPathHash {
         let def_id = DefId::from_raw_def_id(raw_def_id);

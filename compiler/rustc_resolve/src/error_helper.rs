@@ -3834,7 +3834,7 @@ fn show_candidates(
                 accessible_path_strings.push((
                     pprust::path_to_string(&c.path),
                     c.descr,
-                    c.did.and_then(|did| Some(tcx.source_span(did.as_local()?))),
+                    c.did.and_then(|did| Some(tcx.source_span(did.as_local()?).0)),
                     &c.note,
                     c.via_import,
                 ))
@@ -3843,7 +3843,7 @@ fn show_candidates(
             inaccessible_path_strings.push((
                 pprust::path_to_string(&c.path),
                 c.descr,
-                c.did.and_then(|did| Some(tcx.source_span(did.as_local()?))),
+                c.did.and_then(|did| Some(tcx.source_span(did.as_local()?).0)),
                 &c.note,
                 c.via_import,
             ))

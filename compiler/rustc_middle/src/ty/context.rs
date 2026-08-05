@@ -1539,9 +1539,9 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.target.llvm_target.starts_with("nvptx")
     }
 
-    /// Returns the source file containing `pos` and the 0-based index of its line (`None` if
+    /// Returns the source file containing the span's start and the 0-based index of its line (`None` if
     /// the file has no lines), recording a dependency on the prefix of the file's line table
-    /// that line/column derivation for `pos` reads. Line/column data stored into a query
+    /// that line/column derivation for that position reads. Line/column data stored into a query
     /// result or codegen artifact (`#[track_caller]` locations, debuginfo line tables) must
     /// be derived from the file and line returned here, never from the untracked `SourceMap`
     /// lookups: the recorded dependency is what invalidates such data when an edit moves line
@@ -1554,14 +1554,23 @@ impl<'tcx> TyCtxt<'tcx> {
     /// rendered line's text (`char_width`), which no fingerprint covers. An edit replacing a
     /// tab with a space, say, changes display columns without invalidating anything; the old
     /// line/column span hashing had the same limitation for byte-identical layouts.
-    pub fn lookup_line_tracked(self, pos: rustc_span::BytePos) -> (Arc<SourceFile>, Option<usize>) {
-        let file = self.sess.source_map().lookup_source_file(pos);
-        let line = file.lookup_line(file.relative_position(pos));
-        // The dependency only exists to drive invalidation, so skip the query entirely when
-        // there is no dep graph to record it in.
+    pub fn lookup_line_tracked(self, span: Span) -> (Arc<SourceFile>, Option<usize>) {
+        let data = span.data_untracked();
+        let file = self.sess.source_map().lookup_source_file(data.lo);
+        let line = file.lookup_line(file.relative_position(data.lo));
+        // The dependencies only exist to drive invalidation, so skip the queries entirely
+        // when there is no dep graph to record them in.
         if self.dep_graph.is_fully_enabled() {
             let key = LineTablePrefixKey::new(file.stable_id, line.unwrap_or(0));
             let _ = self.file_lines_prefix_hash(key);
+            // The absolute position decomposes into anchor position plus relative offset.
+            // The relative part is covered by the span's own fingerprint; this records the
+            // anchor, whose `source_span` fingerprint deliberately ignores position.
+            // Parentless spans carry their absolute offset in their fingerprint already and
+            // need no extra dependency.
+            if let Some(parent) = data.parent {
+                let _ = self.def_position(parent);
+            }
         }
         (file, line)
     }
@@ -1603,8 +1612,10 @@ impl<'tcx> TyCtxt<'tcx> {
         if self.sess.source_map().files().is_empty() || span.is_dummy() {
             return;
         }
-        let _ = self.lookup_line_tracked(span.lo());
-        let _ = self.lookup_line_tracked(span.hi());
+        // Both endpoints are rendered; `shrink_to_hi` keeps the parent, so the anchor
+        // dependency for parented spans is recorded either way.
+        let _ = self.lookup_line_tracked(span);
+        let _ = self.lookup_line_tracked(span.shrink_to_hi());
     }
 
     /// Returns `&'static core::panic::Location<'static>`.
@@ -2893,7 +2904,31 @@ pub fn provide(providers: &mut Providers) {
         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
     };
     providers.file_lines_prefix_hash = file_lines_prefix_hash;
-    providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
+    providers.source_span = |tcx, def_id| {
+        rustc_span::AnchorSpan(tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP))
+    };
+    providers.def_position = |tcx, def_id| {
+        // An opaque witness of the definition's position: (file, offset within file), folded
+        // to 64 bits. Deliberately NOT the raw absolute `BytePos`: that is a `SourceMap`
+        // global coordinate which shifts for every later file when an earlier file grows,
+        // which would spuriously invalidate every position observer in those files.
+        let span = tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP).data_untracked();
+        if span.is_dummy() {
+            return 0;
+        }
+        let source_map = tcx.sess.source_map();
+        if source_map.files().is_empty() {
+            return 0;
+        }
+        let file = source_map.lookup_source_file(span.lo);
+        if !file.contains(span.lo) {
+            return 0;
+        }
+        let mut hasher = rustc_data_structures::stable_hash::StableHasher::new();
+        std::hash::Hash::hash(&file.stable_id, &mut hasher);
+        std::hash::Hash::hash(&file.relative_position(span.lo).0, &mut hasher);
+        hasher.finish::<rustc_hashes::Hash64>().as_u64()
+    };
 }
 
 fn file_lines_prefix_hash(

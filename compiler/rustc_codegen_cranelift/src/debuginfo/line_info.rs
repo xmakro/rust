@@ -81,7 +81,7 @@ impl DebugContext {
         let span = hygiene::walk_chain_collapsed(span, function_span);
         // The line/column derived here end up in the object file's line tables, so they must
         // come from the tracked lookup, which records the dependency that invalidates them.
-        let (file, line_index) = tcx.lookup_line_tracked(span.lo());
+        let (file, line_index) = tcx.lookup_line_tracked(span);
         let file_id = self.add_source_file(tcx, &file);
         match line_index {
             Some(line) => {

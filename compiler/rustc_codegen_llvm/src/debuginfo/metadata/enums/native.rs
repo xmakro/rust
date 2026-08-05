@@ -199,7 +199,7 @@ pub(super) fn build_coroutine_di_node<'ll, 'tcx>(
 
                     let span = coroutine_layout.variant_source_info[variant_index].span;
                     let source_info = if !span.is_dummy() {
-                        let loc = cx.lookup_debug_loc(span.lo());
+                        let loc = cx.lookup_debug_loc(span);
                         Some((file_metadata(cx, &loc.file), loc.line))
                     } else {
                         None

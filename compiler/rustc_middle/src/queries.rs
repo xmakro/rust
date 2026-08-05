@@ -209,10 +209,27 @@ rustc_queries! {
     /// Contrary to `def_span` below, this query returns the full absolute span of the definition.
     /// This span is meant for dep-tracking rather than diagnostics. It should not be used outside
     /// of rustc_middle::hir::source_map.
-    query source_span(key: LocalDefId) -> Span {
+    ///
+    /// The result is wrapped in [`rustc_span::AnchorSpan`] so that its fingerprint excludes
+    /// the definition's position: a definition that merely moves within its file keeps a
+    /// green anchor. Position renderings must depend on `def_position` instead.
+    query source_span(key: LocalDefId) -> rustc_span::AnchorSpan {
         // Accesses untracked data
         eval_always
         desc { "getting the source span" }
+    }
+
+    /// The absolute start position of a definition's span, as a raw `SourceMap` offset.
+    ///
+    /// This exists solely as a dependency for consumers that render a definition's absolute
+    /// position (line numbers derived from its spans) into cached artifacts: `source_span`'s
+    /// fingerprint deliberately ignores position, so such consumers read this query for the
+    /// spans' parent definitions to be invalidated when the definition moves. See
+    /// [`TyCtxt::lookup_line_tracked`].
+    query def_position(key: LocalDefId) -> u64 {
+        // Accesses untracked data
+        eval_always
+        desc { "getting the source position of a definition" }
     }
 
     /// Hash of a prefix of a source file's line-start table (plus its multibyte-character and

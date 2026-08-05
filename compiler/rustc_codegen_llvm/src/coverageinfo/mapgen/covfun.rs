@@ -136,8 +136,25 @@ fn fill_region_tables<'tcx>(
     };
     // Coverage mappings store line/column coordinates derived from the file's line table, so
     // the file must come from the tracked lookup, which records the dependency that
-    // invalidates them.
+    // invalidates them. The coordinates also depend on the absolute position of the
+    // function's spans, whose anchor is tracked separately; see
+    // `TyCtxt::lookup_line_tracked`.
     let source_file = tcx.source_file_tracked(first_span.lo());
+    // Record the position dependency for the parent of the parented mapping spans; the
+    // parentless ones cover their own position through the MIR fingerprint's absolute
+    // offsets. Lowering parents all of a body's spans to one owner, so recording the first
+    // parent found suffices; the debug assertion guards that invariant.
+    let mapping_parent = fn_cov_info.mappings.iter().find_map(|m| m.span.data_untracked().parent);
+    if let Some(parent) = mapping_parent {
+        let _ = tcx.def_position(parent);
+    }
+    debug_assert!(
+        fn_cov_info.mappings.iter().all(|m| {
+            let parent = m.span.data_untracked().parent;
+            parent.is_none() || parent == mapping_parent
+        }),
+        "coverage mappings with mixed span parents: {covfun:?}",
+    );
 
     let local_file_id = covfun.virtual_file_mapping.push_file(&source_file);
 
