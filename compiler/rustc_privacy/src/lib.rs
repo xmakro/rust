@@ -8,7 +8,7 @@ mod diagnostics;
 
 use std::marker::PhantomData;
 use std::ops::ControlFlow;
-use std::{debug_assert_matches, fmt};
+use std::{debug_assert_matches, fmt, mem};
 
 use diagnostics::{
     FieldIsPrivate, FieldIsPrivateLabel, FromPrivateDependencyInPublicInterface, InPublicInterface,
@@ -73,31 +73,73 @@ pub trait DefIdVisitor<'tcx> {
     fn visit_def_id(&mut self, def_id: DefId, kind: &str, descr: &dyn fmt::Display)
     -> Self::Result;
 
+    /// Whether the skeleton memoizes types whose subtree walk completed without breaking,
+    /// via `ty_cached_clean`/`cache_clean_ty`. Only sound to enable when `visit_def_id`'s
+    /// verdict for a given def-id cannot change during the visitor's lifetime and clean
+    /// walks have no side effects the visitor relies on.
+    const CACHE_CLEAN_TYS: bool = false;
+    /// Returns true if a full walk of `ty` is already known to complete without breaking,
+    /// letting the skeleton skip its subtree.
+    fn ty_cached_clean(&self, _ty: Ty<'tcx>) -> bool {
+        false
+    }
+    /// Called for each type whose subtree walk completed without breaking, once the whole
+    /// root walk also completed without breaking. Committing early would be wrong: an alias
+    /// occurrence pruned by `visited_tys` is only proven clean by the completion of the
+    /// outermost walk, where its first occurrence is fully visited.
+    fn cache_clean_ty(&mut self, _ty: Ty<'tcx>) {}
+
     /// Not overridden, but used to actually visit types and traits.
     fn skeleton(&mut self) -> DefIdVisitorSkeleton<'_, 'tcx, Self> {
         DefIdVisitorSkeleton {
             def_id_visitor: self,
             visited_tys: Default::default(),
+            pending_clean_tys: Vec::new(),
             dummy: Default::default(),
         }
     }
+    /// Runs one root walk and, if it completed without breaking, commits the types the
+    /// walk proved clean.
+    fn run_skeleton(
+        &mut self,
+        f: impl FnOnce(&mut DefIdVisitorSkeleton<'_, 'tcx, Self>) -> Self::Result,
+    ) -> Self::Result {
+        let mut skeleton = self.skeleton();
+        let result = f(&mut skeleton);
+        if !Self::CACHE_CLEAN_TYS {
+            return result;
+        }
+        let pending = mem::take(&mut skeleton.pending_clean_tys);
+        match result.branch() {
+            ControlFlow::Continue(()) => {
+                for ty in pending {
+                    self.cache_clean_ty(ty);
+                }
+                Self::Result::output()
+            }
+            ControlFlow::Break(residual) => Self::Result::from_residual(residual),
+        }
+    }
     fn visit(&mut self, ty_fragment: impl TypeVisitable<TyCtxt<'tcx>>) -> Self::Result {
-        ty_fragment.visit_with(&mut self.skeleton())
+        self.run_skeleton(|skeleton| ty_fragment.visit_with(skeleton))
     }
     fn visit_trait(&mut self, trait_ref: TraitRef<'tcx>) -> Self::Result {
-        self.skeleton().visit_trait(trait_ref)
+        self.run_skeleton(|skeleton| skeleton.visit_trait(trait_ref))
     }
     fn visit_gen_clauses(&mut self, gen_clauses: ty::GenericClauses<'tcx>) -> Self::Result {
-        self.skeleton().visit_clauses(gen_clauses.clauses)
+        self.run_skeleton(|skeleton| skeleton.visit_clauses(gen_clauses.clauses))
     }
     fn visit_clauses(&mut self, clauses: &[(ty::Clause<'tcx>, Span)]) -> Self::Result {
-        self.skeleton().visit_clauses(clauses)
+        self.run_skeleton(|skeleton| skeleton.visit_clauses(clauses))
     }
 }
 
 pub struct DefIdVisitorSkeleton<'v, 'tcx, V: ?Sized> {
     def_id_visitor: &'v mut V,
     visited_tys: FxHashSet<Ty<'tcx>>,
+    /// Types whose subtree walk completed without breaking, in walk order. Committed to the
+    /// visitor by `DefIdVisitor::run_skeleton` only if the whole walk completes.
+    pending_clean_tys: Vec<Ty<'tcx>>,
     dummy: PhantomData<TyCtxt<'tcx>>,
 }
 
@@ -162,19 +204,8 @@ where
         }
         V::Result::output()
     }
-}
 
-impl<'tcx, V> TypeVisitor<TyCtxt<'tcx>> for DefIdVisitorSkeleton<'_, 'tcx, V>
-where
-    V: DefIdVisitor<'tcx> + ?Sized,
-{
-    type Result = V::Result;
-
-    fn visit_predicate(&mut self, p: ty::Predicate<'tcx>) -> Self::Result {
-        self.visit_clause(p.as_clause().unwrap())
-    }
-
-    fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+    fn visit_ty_uncached(&mut self, ty: Ty<'tcx>) -> V::Result {
         let tcx = self.def_id_visitor.tcx();
         // GenericArgs are not visited here because they are visited below
         // in `super_visit_with`.
@@ -315,6 +346,33 @@ where
         }
 
         if V::SHALLOW { V::Result::output() } else { ty.super_visit_with(self) }
+    }
+}
+
+impl<'tcx, V> TypeVisitor<TyCtxt<'tcx>> for DefIdVisitorSkeleton<'_, 'tcx, V>
+where
+    V: DefIdVisitor<'tcx> + ?Sized,
+{
+    type Result = V::Result;
+
+    fn visit_predicate(&mut self, p: ty::Predicate<'tcx>) -> Self::Result {
+        self.visit_clause(p.as_clause().unwrap())
+    }
+
+    fn visit_ty(&mut self, ty: Ty<'tcx>) -> Self::Result {
+        if !V::CACHE_CLEAN_TYS {
+            return self.visit_ty_uncached(ty);
+        }
+        if self.def_id_visitor.ty_cached_clean(ty) {
+            return V::Result::output();
+        }
+        match self.visit_ty_uncached(ty).branch() {
+            ControlFlow::Continue(()) => {
+                self.pending_clean_tys.push(ty);
+                V::Result::output()
+            }
+            ControlFlow::Break(residual) => V::Result::from_residual(residual),
+        }
     }
 
     fn visit_const(&mut self, c: Const<'tcx>) -> Self::Result {
@@ -1129,10 +1187,11 @@ struct TypePrivacyVisitor<'tcx> {
     mod_id: LocalModId,
     maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     span: Span,
-    /// Types already walked clean (no privacy error). A walk's result depends only on the
-    /// interned type and `mod_id`, which is fixed for the whole visit, so a type that walks
-    /// clean once walks clean everywhere and we can skip it. Errored walks are never cached,
-    /// so their error still fires at every span.
+    /// Types whose subtree already walked clean (no privacy error), including types reached
+    /// in the middle of a larger walk. A walk's result depends only on the interned type and
+    /// `mod_id`, which is fixed for the whole visit, so a type that walks clean once walks
+    /// clean everywhere and we can skip it. Errored walks are never cached, so their error
+    /// still fires at every span.
     accessible_tys: FxHashSet<Ty<'tcx>>,
 }
 
@@ -1142,12 +1201,12 @@ impl<'tcx> TypePrivacyVisitor<'tcx> {
     }
 
     fn check_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<()> {
+        // The skeleton consults and fills `accessible_tys` on its own; checking here too
+        // just skips building a skeleton for the common already-clean case.
         if self.accessible_tys.contains(&ty) {
             return ControlFlow::Continue(());
         }
-        self.visit(ty)?;
-        self.accessible_tys.insert(ty);
-        ControlFlow::Continue(())
+        self.visit(ty)
     }
 
     // Take node-id of an expression or pattern and check its type for privacy.
@@ -1179,7 +1238,7 @@ impl<'tcx> rustc_ty_utils::sig_types::SpannedTypeVisitor<'tcx> for TypePrivacyVi
     type Result = ControlFlow<()>;
     fn visit(&mut self, span: Span, value: impl TypeVisitable<TyCtxt<'tcx>>) -> Self::Result {
         self.span = span;
-        value.visit_with(&mut self.skeleton())
+        DefIdVisitor::visit(self, value)
     }
 }
 
@@ -1342,6 +1401,15 @@ impl<'tcx> DefIdVisitor<'tcx> for TypePrivacyVisitor<'tcx> {
     type Result = ControlFlow<()>;
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
+    }
+    // Sound because a walk's verdict depends only on the interned type and `mod_id`,
+    // which is fixed for the visitor's lifetime, and clean walks emit no diagnostics.
+    const CACHE_CLEAN_TYS: bool = true;
+    fn ty_cached_clean(&self, ty: Ty<'tcx>) -> bool {
+        self.accessible_tys.contains(&ty)
+    }
+    fn cache_clean_ty(&mut self, ty: Ty<'tcx>) {
+        self.accessible_tys.insert(ty);
     }
     fn visit_def_id(
         &mut self,
