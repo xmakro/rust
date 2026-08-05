@@ -885,23 +885,33 @@ impl EncoderState {
     /// as is, instead of being rebuilt.
     ///
     /// The node and its edge targets keep their previous indices, so the record on disk is
-    /// still the right one. `edges` holds the same targets as that record, gathered by the
-    /// marking walk; only the retained graph reads it.
+    /// still the right one and the edge list is never needed in memory. The retained graph
+    /// is the one reader that wants it, and it can be read back off the previous graph.
     #[inline]
     fn promote_node(
         &self,
         prev_index: SerializedDepNodeIndex,
         retained_graph: &Option<Lock<RetainedDepGraph>>,
         local: &mut LocalEncoderState,
-        edges: &[DepNodeIndex],
     ) {
         let edge_count = self.previous.re_emit_record(prev_index, local.encoder());
-        debug_assert_eq!(edge_count, edges.len());
         self.flush_mem_encoder(&mut *local);
         self.count_node(&mut *local);
         let node = self.previous.index_to_node(prev_index);
         let index = DepNodeIndex::from_u32(prev_index.as_u32());
-        self.record(node, index, edge_count, edges, retained_graph, &mut *local);
+
+        // Every target of a promoted node is green and so keeps its previous index, which
+        // makes the current edge list the previous one unchanged.
+        let edges: Vec<DepNodeIndex> = if retained_graph.is_some() {
+            self.previous
+                .edge_targets_from(prev_index)
+                .map(|target| DepNodeIndex::from_u32(target.as_u32()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        self.record(node, index, edge_count, &edges, retained_graph, &mut *local);
     }
 
     fn finish(&self, profiler: &SelfProfilerRef, current: &CurrentDepGraph) -> FileEncodeResult {
@@ -1124,9 +1134,8 @@ impl GraphEncoder {
         index
     }
 
-    /// Encodes a node that was promoted from the previous graph. It reads the information directly
-    /// from the previous dep graph and expects all edges to already have a new dep node index
-    /// assigned.
+    /// Encodes a node that was promoted from the previous graph. It reads the information
+    /// directly from the previous dep graph and expects all of its edge targets to be green.
     ///
     /// Tries to mark the dep node green, and returns Some if it is now green,
     /// or None if had already been concurrently marked red.
@@ -1135,7 +1144,6 @@ impl GraphEncoder {
         &self,
         prev_index: SerializedDepNodeIndex,
         colors: &DepNodeColorMap,
-        edges: &[DepNodeIndex],
     ) -> Option<DepNodeIndex> {
         let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph");
 
@@ -1153,7 +1161,7 @@ impl GraphEncoder {
                         .all(|target| matches!(colors.get(target), DepNodeColor::Green(_))),
                     "promoted node {prev_index:?} names a target that is not green",
                 );
-                self.status.promote_node(prev_index, &self.retained_graph, &mut *local, edges);
+                self.status.promote_node(prev_index, &self.retained_graph, &mut *local);
                 Some(index)
             }
             // The query was re-executed in the meantime, by another thread or while
