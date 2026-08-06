@@ -178,6 +178,7 @@ impl_erasable_for_types_with_no_type_params! {
     Option<(rustc_span::def_id::DefId, rustc_session::config::EntryFnType)>,
     Option<rustc_abi::Align>,
     Option<rustc_ast::expand::allocator::AllocatorKind>,
+    Option<rustc_data_structures::fingerprint::Fingerprint>,
     Option<rustc_data_structures::svh::Svh>,
     Option<rustc_hir::ConstStability>,
     Option<rustc_hir::CoroutineKind>,

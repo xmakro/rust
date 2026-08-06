@@ -172,6 +172,10 @@ impl FileLoader for RealFileLoader {
 struct SourceMapFiles {
     source_files: monotonic::MonotonicVec<Arc<SourceFile>>,
     stable_id_to_source_file: UnhashMap<StableSourceFileId, Arc<SourceFile>>,
+    /// Indexed by [`StableSourceFileId::truncate64`]; lets the `file_lines_prefix_hash`
+    /// query resolve a file from the 64-bit id stored in its dep-node key. Only maintained
+    /// when incremental compilation is enabled, which is the only consumer.
+    truncated_id_to_source_file: UnhashMap<u64, Arc<SourceFile>>,
 }
 
 /// Used to construct a `SourceMap` with `SourceMap::with_inputs`.
@@ -180,6 +184,9 @@ pub struct SourceMapInputs {
     pub path_mapping: FilePathMapping,
     pub hash_kind: SourceFileHashAlgorithm,
     pub checksum_hash_kind: Option<SourceFileHashAlgorithm>,
+    /// Whether incremental compilation is enabled, i.e. whether line-table dep nodes
+    /// (`file_lines_prefix_hash`) may need to resolve files from truncated ids.
+    pub incremental: bool,
 }
 
 pub struct SourceMap {
@@ -201,6 +208,9 @@ pub struct SourceMap {
     ///
     /// If this is equal to `hash_kind` then the checksum won't be computed twice.
     checksum_hash_kind: Option<SourceFileHashAlgorithm>,
+
+    /// See [`SourceMapInputs::incremental`].
+    incremental: bool,
 }
 
 impl SourceMap {
@@ -210,11 +220,18 @@ impl SourceMap {
             path_mapping,
             hash_kind: SourceFileHashAlgorithm::Md5,
             checksum_hash_kind: None,
+            incremental: false,
         })
     }
 
     pub fn with_inputs(
-        SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind }: SourceMapInputs,
+        SourceMapInputs {
+            file_loader,
+            path_mapping,
+            hash_kind,
+            checksum_hash_kind,
+            incremental,
+        }: SourceMapInputs,
     ) -> SourceMap {
         let cwd = file_loader
             .current_directory()
@@ -228,6 +245,7 @@ impl SourceMap {
             path_mapping,
             hash_kind,
             checksum_hash_kind,
+            incremental,
         }
     }
 
@@ -288,6 +306,13 @@ impl SourceMap {
         self.files.borrow().stable_id_to_source_file.get(&stable_id).cloned()
     }
 
+    /// Resolves a [`StableSourceFileId::truncate64`] value back to its file; see
+    /// [`LineTablePrefixKey`](crate::LineTablePrefixKey). Always `None` in
+    /// non-incremental sessions, where the index is not maintained.
+    pub fn source_file_by_truncated_id(&self, id: u64) -> Option<Arc<SourceFile>> {
+        self.files.borrow().truncated_id_to_source_file.get(&id).cloned()
+    }
+
     fn register_source_file(
         &self,
         file_id: StableSourceFileId,
@@ -306,6 +331,22 @@ impl SourceMap {
         let file = Arc::new(file);
         files.source_files.push(Arc::clone(&file));
         files.stable_id_to_source_file.insert(file_id, Arc::clone(&file));
+        if self.incremental {
+            let truncated = file_id.truncate64();
+            let evicted = files.truncated_id_to_source_file.insert(truncated, Arc::clone(&file));
+            if let Some(old) = evicted
+                && old.stable_id != file_id
+            {
+                // The index must map each truncated id to exactly one file, or
+                // `file_lines_prefix_hash` would serve the wrong file's line-table hash
+                // and dependents would be marked green incorrectly.
+                panic!(
+                    "truncated source-file id collision ({truncated:#x}) between distinct \
+                     source files {:?} and {:?}",
+                    old.name, file.name
+                );
+            }
+        }
 
         Ok(file)
     }
@@ -383,6 +424,7 @@ impl SourceMap {
             lines: file_local_lines,
             multibyte_chars,
             normalized_pos,
+            line_bucket_hashes: OnceLock::new(),
             stable_id,
             cnum,
         };
@@ -412,6 +454,11 @@ impl SourceMap {
     }
 
     /// Looks up source information about a `BytePos`.
+    ///
+    /// This is an untracked lookup: the incremental system does not see it. If the line or
+    /// column ends up in a query result or codegen artifact, derive it from
+    /// `TyCtxt::lookup_line_tracked` instead, which records the dependency that
+    /// invalidates it. Diagnostics and other side-channel output may use this freely.
     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {
         let sf = self.lookup_source_file(pos);
         let (line, col, col_display) = sf.lookup_file_pos_with_col_display(pos);
@@ -419,6 +466,8 @@ impl SourceMap {
     }
 
     /// If the corresponding `SourceFile` is empty, does not return a line number.
+    ///
+    /// This is an untracked lookup; see `lookup_char_pos` for when it must not be used.
     pub fn lookup_line(&self, pos: BytePos) -> Result<SourceFileAndLine, Arc<SourceFile>> {
         let f = self.lookup_source_file(pos);
 

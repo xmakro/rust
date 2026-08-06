@@ -40,11 +40,9 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use tracing::debug;
 pub use unicode_width::UNICODE_VERSION;
 
-mod caching_source_map_view;
 pub mod source_map;
 use source_map::{SourceMap, SourceMapInputs};
 
-pub use self::caching_source_map_view::CachingSourceMapView;
 use crate::fatal_error::FatalError;
 
 pub mod edition;
@@ -78,10 +76,11 @@ use std::io::{self, Read};
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, iter};
 
 use md5::{Digest, Md5};
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
 use rustc_data_structures::unord::UnordMap;
@@ -1946,6 +1945,9 @@ pub struct SourceFile {
     pub multibyte_chars: Vec<MultiByteChar>,
     /// Locations of characters removed during normalization.
     pub normalized_pos: Vec<NormalizedPos>,
+    /// Running hashes of the line table at each [`LINE_TABLE_BUCKET`] boundary, computed
+    /// lazily in one pass for the `file_lines_prefix_hash` query; see [`LineTablePrefixKey`].
+    pub line_bucket_hashes: OnceLock<Vec<Fingerprint>>,
     /// A hash of the filename & crate-id, used for uniquely identifying source
     /// files within the crate graph and for speeding up hashing in incremental
     /// compilation.
@@ -1968,6 +1970,9 @@ impl Clone for SourceFile {
             lines: self.lines.clone(),
             multibyte_chars: self.multibyte_chars.clone(),
             normalized_pos: self.normalized_pos.clone(),
+            // Start with an empty cache: a clone site that adjusts the tables (clones today
+            // only rename/renumber the file) must not inherit hashes of the originals.
+            line_bucket_hashes: OnceLock::new(),
             stable_id: self.stable_id,
             cnum: self.cnum,
         }
@@ -1983,8 +1988,8 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         self.normalized_source_len.encode(s);
         self.unnormalized_source_len.encode(s);
 
-        // We are always in `Lines` form by the time we reach here.
-        assert!(self.lines.read().is_lines());
+        // The line table may still be in its compressed on-disk form: span hashing works on
+        // offsets and never materializes it. `lines()` does.
         let lines = self.lines();
         // Store the length.
         s.emit_u32(lines.len() as u32);
@@ -2088,6 +2093,7 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
             lines: FreezeLock::new(lines),
             multibyte_chars,
             normalized_pos,
+            line_bucket_hashes: OnceLock::new(),
             stable_id,
             cnum,
         }
@@ -2128,6 +2134,12 @@ impl fmt::Debug for SourceFile {
 pub struct StableSourceFileId(Hash128);
 
 impl StableSourceFileId {
+    /// Truncates the id to 64 bits, for use in [`LineTablePrefixKey`]. The id is already a
+    /// uniformly distributed hash, so truncation preserves the distribution.
+    pub fn truncate64(self) -> u64 {
+        self.0.truncate().as_u64()
+    }
+
     fn from_filename_in_current_crate(filename: &FileName) -> Self {
         Self::from_filename_and_stable_crate_id(filename, None)
     }
@@ -2147,6 +2159,51 @@ impl StableSourceFileId {
         filename.hash(&mut hasher);
         stable_crate_id.hash(&mut hasher);
         StableSourceFileId(hasher.finish())
+    }
+}
+
+/// Number of line starts covered by one [`LineTablePrefixKey`] bucket. The bucket size
+/// trades invalidation granularity against dep-node count: whole-file dependencies made an
+/// edit anywhere in a file invalidate every line-observing node of that file (inlined
+/// `#[track_caller]` generics spread those across many CGUs), while per-line dependencies
+/// would create a dep node per observed line.
+pub const LINE_TABLE_BUCKET: usize = 64;
+
+/// Dep-node key for the `file_lines_prefix_hash` query: identifies the prefix of a file's
+/// line table through the end of `bucket`, i.e. the first `(bucket + 1) * LINE_TABLE_BUCKET`
+/// line starts. Line lookup for a position on line `L` is a partition point over the table:
+/// it reads line starts up to `L` *and* the following entry `L + 1`, which bounds the line
+/// from above. A dependency on the prefix through `L + 1`'s bucket therefore stays clean
+/// exactly when an edit moves line breaks strictly after that prefix.
+///
+/// The file is identified by [`StableSourceFileId::truncate64`] rather than the full id so
+/// that the whole key round-trips through a 128-bit dep-node fingerprint (see the
+/// `DepNodeKey` impl in `rustc_middle`); [`SourceMap::source_file_by_truncated_id`]
+/// resolves it back.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, StableHash)]
+pub struct LineTablePrefixKey {
+    pub file_id64: u64,
+    pub bucket: u32,
+}
+
+impl LineTablePrefixKey {
+    pub fn new(file: StableSourceFileId, line_index: usize) -> Self {
+        // `line_index + 1`, not `line_index`: the lookup's answer also depends on the next
+        // line start being *past* the position, so the covered prefix must include entry
+        // `line_index + 1`. When the observed line is the last one, this selects a bucket
+        // past the end of the table, which `line_bucket_hash` clamps to the full-table
+        // hash; that is required for soundness there (a line start appended after the last
+        // recorded entry can still change the answer) and conservative otherwise.
+        LineTablePrefixKey {
+            file_id64: file.truncate64(),
+            bucket: ((line_index + 1) / LINE_TABLE_BUCKET) as u32,
+        }
+    }
+
+    /// Covers the file's entire line table, for consumers that derive line/column data for
+    /// positions throughout the file (coverage mappings).
+    pub fn whole_file(file: &SourceFile) -> Self {
+        Self::new(file.stable_id, file.count_lines().saturating_sub(1))
     }
 }
 
@@ -2196,6 +2253,7 @@ impl SourceFile {
             lines: FreezeLock::frozen(SourceFileLines::Lines(lines)),
             multibyte_chars,
             normalized_pos,
+            line_bucket_hashes: OnceLock::new(),
             stable_id,
             cnum: LOCAL_CRATE,
         })
@@ -2271,6 +2329,41 @@ impl SourceFile {
             }
             unreachable!()
         })
+    }
+
+    /// Hash of this file's line-table prefix through the end of `bucket`; the value backing
+    /// the `file_lines_prefix_hash` query, see [`LineTablePrefixKey`]. All buckets are
+    /// computed in a single pass over the table on first use, so each call is O(1). Buckets
+    /// past the end of the table share the full-table hash.
+    pub fn line_bucket_hash(&self, bucket: u32) -> Fingerprint {
+        let hashes = self.line_bucket_hashes.get_or_init(|| {
+            let mut hasher = StableHasher::new();
+            // The multibyte and normalization tables are almost always empty or tiny, so
+            // they are folded into every bucket rather than sliced to the prefix; an edit
+            // to them invalidates every observed bucket of the file.
+            for mbc in &self.multibyte_chars {
+                Hash::hash(&mbc.pos.0, &mut hasher);
+                Hash::hash(&mbc.bytes, &mut hasher);
+            }
+            for np in &self.normalized_pos {
+                Hash::hash(&np.pos.0, &mut hasher);
+                Hash::hash(&np.diff, &mut hasher);
+            }
+            let lines = self.lines();
+            let mut hashes = Vec::with_capacity(lines.len() / LINE_TABLE_BUCKET + 1);
+            for chunk in lines.chunks(LINE_TABLE_BUCKET) {
+                for pos in chunk {
+                    Hash::hash(&pos.0, &mut hasher);
+                }
+                hashes.push(hasher.clone().finish());
+            }
+            if hashes.is_empty() {
+                // An empty table still gets one snapshot, so growing a first line changes it.
+                hashes.push(hasher.finish());
+            }
+            hashes
+        });
+        hashes[(bucket as usize).min(hashes.len() - 1)]
     }
 
     /// Returns the `BytePos` of the beginning of the current line.

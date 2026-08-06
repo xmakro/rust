@@ -47,6 +47,14 @@ pub(crate) fn make_coords(source_map: &SourceMap, file: &SourceFile, span: Span)
     let lo = span.lo();
     let hi = span.hi();
 
+    // The coords are rendered against `file`'s line table, and the caller's line-table
+    // dependency (see `fill_region_tables`) covers only that file, so a span reaching into
+    // another file must be dropped rather than mis-rendered.
+    if !file.contains(lo) || !file.contains(hi) {
+        debug_assert!(false, "span {span:?} not fully within the mapped file {:?}", file.name);
+        return None;
+    }
+
     // Column numbers need to be in bytes, so we can't use the more convenient
     // `SourceMap` methods for looking up file coordinates.
     let line_and_byte_column = |pos: BytePos| -> Option<(usize, usize)> {

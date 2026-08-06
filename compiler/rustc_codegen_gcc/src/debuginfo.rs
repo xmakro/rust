@@ -6,7 +6,7 @@ use rustc_abi::Size;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
 use rustc_codegen_ssa::traits::{DebugInfoBuilderMethods, DebugInfoCodegenMethods};
 use rustc_middle::ty::{ExistentialTraitRef, Instance, Ty};
-use rustc_span::{BytePos, Pos, SourceFile, SourceFileAndLine, Span, Symbol};
+use rustc_span::{BytePos, Pos, SourceFile, Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
 use crate::builder::Builder;
@@ -141,17 +141,20 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     // `lookup_char_pos` return the right information instead.
     // Source of Origin: cg_llvm
     pub fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
-        let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
-            Ok(SourceFileAndLine { sf: file, line }) => {
-                let line_pos = file.lines()[line];
+        // The line/column derived here end up in the object file's line tables, so they must
+        // come from the tracked lookup, which records the dependency that invalidates them.
+        let (file, line_index) = self.tcx.lookup_line_tracked(pos);
+        let (line, col) = match line_index {
+            Some(line_index) => {
+                let line_pos = file.lines()[line_index];
 
                 // Use 1-based indexing.
-                let line = (line + 1) as u32;
+                let line = (line_index + 1) as u32;
                 let col = (file.relative_position(pos) - line_pos).to_u32() + 1;
 
-                (file, line, col)
+                (line, col)
             }
-            Err(file) => (file, UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
+            None => (UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
         };
 
         // For MSVC, omit the column number.

@@ -43,7 +43,7 @@ use rustc_session::config::CrateType;
 use rustc_session::cstore::{CrateStoreDyn, Untracked};
 use rustc_session::lint::Lint;
 use rustc_span::def_id::{CRATE_DEF_ID, DefPathHash, StableCrateId};
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, LineTablePrefixKey, SourceFile, Span, Symbol, kw, sym};
 use rustc_type_ir::TyKind::*;
 pub use rustc_type_ir::lift::Lift;
 use rustc_type_ir::{CollectAndApply, WithCachedTypeInfo, elaborate, search_graph};
@@ -1539,6 +1539,74 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.target.llvm_target.starts_with("nvptx")
     }
 
+    /// Returns the source file containing `pos` and the 0-based index of its line (`None` if
+    /// the file has no lines), recording a dependency on the prefix of the file's line table
+    /// that line/column derivation for `pos` reads. Line/column data stored into a query
+    /// result or codegen artifact (`#[track_caller]` locations, debuginfo line tables) must
+    /// be derived from the file and line returned here, never from the untracked `SourceMap`
+    /// lookups: the recorded dependency is what invalidates such data when an edit moves line
+    /// breaks without changing byte offsets, which span fingerprints alone do not cover (see
+    /// `stable_hash_span`). Edits that only move line breaks after the observed line's bucket
+    /// leave the dependency clean.
+    ///
+    /// The dependency covers line indices and character columns (the line-start, multibyte
+    /// and normalization tables), but not *display* columns: those additionally depend on the
+    /// rendered line's text (`char_width`), which no fingerprint covers. An edit replacing a
+    /// tab with a space, say, changes display columns without invalidating anything; the old
+    /// line/column span hashing had the same limitation for byte-identical layouts.
+    pub fn lookup_line_tracked(self, pos: rustc_span::BytePos) -> (Arc<SourceFile>, Option<usize>) {
+        let file = self.sess.source_map().lookup_source_file(pos);
+        let line = file.lookup_line(file.relative_position(pos));
+        // The dependency only exists to drive invalidation, so skip the query entirely when
+        // there is no dep graph to record it in.
+        if self.dep_graph.is_fully_enabled() {
+            let key = LineTablePrefixKey::new(file.stable_id, line.unwrap_or(0));
+            let _ = self.file_lines_prefix_hash(key);
+        }
+        (file, line)
+    }
+
+    /// Like [`Self::lookup_line_tracked`], but records a dependency on the file's
+    /// entire line table, for consumers that derive line/column data for positions
+    /// throughout the file (coverage mappings).
+    pub fn source_file_tracked(self, pos: rustc_span::BytePos) -> Arc<SourceFile> {
+        let file = self.sess.source_map().lookup_source_file(pos);
+        if self.dep_graph.is_fully_enabled() {
+            let _ = self.file_lines_prefix_hash(LineTablePrefixKey::whole_file(&file));
+        }
+        file
+    }
+
+    /// Like [`SourceMap::span_to_diagnostic_string`], but records the line-table
+    /// dependencies covering both endpoints of `span`. Required whenever the rendered
+    /// string can outlive the session: pretty-printed types (`{closure@file:line:col}`)
+    /// become diagnostic arguments, and warnings emitted inside queries are cached and
+    /// replayed verbatim when the query is green, so an embedded line/column must be
+    /// invalidated like any other cached line observation.
+    pub fn span_to_diagnostic_string_tracked(self, span: Span) -> String {
+        self.track_span_line_tables(span);
+        self.sess.source_map().span_to_diagnostic_string(span)
+    }
+
+    /// See [`Self::span_to_diagnostic_string_tracked`].
+    pub fn span_to_short_string_tracked(
+        self,
+        span: Span,
+        display_scope: rustc_span::RemapPathScopeComponents,
+    ) -> String {
+        self.track_span_line_tables(span);
+        self.sess.source_map().span_to_short_string(span, display_scope)
+    }
+
+    fn track_span_line_tables(self, span: Span) {
+        // Mirror the conditions under which `span_to_location_info` renders no location.
+        if self.sess.source_map().files().is_empty() || span.is_dummy() {
+            return;
+        }
+        let _ = self.lookup_line_tracked(span.lo());
+        let _ = self.lookup_line_tracked(span.hi());
+    }
+
     /// Returns `&'static core::panic::Location<'static>`.
     pub fn caller_location_ty(self) -> Ty<'tcx> {
         Ty::new_imm_ref(
@@ -2824,5 +2892,27 @@ pub fn provide(providers: &mut Providers) {
         // We want to check if the panic handler was defined in this crate
         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
     };
+    providers.file_lines_prefix_hash = file_lines_prefix_hash;
     providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
+}
+
+fn file_lines_prefix_hash(
+    tcx: TyCtxt<'_>,
+    key: LineTablePrefixKey,
+) -> Option<rustc_data_structures::fingerprint::Fingerprint> {
+    let file = tcx.sess.source_map().source_file_by_truncated_id(key.file_id64).or_else(|| {
+        // Foreign source files are imported into the source map lazily, when a span pointing
+        // into them is decoded. This query is forced with a key recovered from a previous
+        // session's dep node, which can happen before any such decode: debuginfo for
+        // monomorphized upstream code records these nodes for upstream files. Import all
+        // upstream file tables and retry, otherwise every such dep node would spuriously
+        // count as changed.
+        for &cnum in tcx.crates(()) {
+            tcx.import_source_files(cnum);
+        }
+        tcx.sess.source_map().source_file_by_truncated_id(key.file_id64)
+    });
+    // `None`: the file existed in a previous session but is gone from this one, so
+    // dependents of the old node re-execute.
+    Some(file?.line_bucket_hash(key.bucket))
 }

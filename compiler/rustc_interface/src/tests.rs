@@ -55,6 +55,7 @@ where
         path_mapping: sessopts.file_path_mapping(),
         hash_kind,
         checksum_hash_kind,
+        incremental: sessopts.incremental.is_some(),
     });
 
     rustc_span::create_session_globals_then(DEFAULT_EDITION, &[], sm_inputs, || {

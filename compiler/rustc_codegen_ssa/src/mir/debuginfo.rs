@@ -89,7 +89,8 @@ impl<'tcx, S: Copy, L: Copy> DebugScope<S, L> {
         let pos = span.lo();
         if pos < self.file_start_pos || pos >= self.file_end_pos {
             let sm = bx.sess().source_map();
-            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_char_pos(pos).file)
+            // Only the file is observed here, so no line-table dependency is needed.
+            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_source_file(pos))
         } else {
             self.dbg_scope
         }

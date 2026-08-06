@@ -283,6 +283,12 @@ impl QueryKey for Symbol {
     }
 }
 
+impl QueryKey for rustc_span::LineTablePrefixKey {
+    fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl QueryKey for Option<Symbol> {
     fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
         DUMMY_SP

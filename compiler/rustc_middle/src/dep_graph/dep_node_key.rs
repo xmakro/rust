@@ -227,3 +227,25 @@ impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
         LocalDefId::try_recover_key(tcx, dep_node).map(LocalModDefId::new_unchecked)
     }
 }
+
+impl<'tcx> DepNodeKey<'tcx> for rustc_span::LineTablePrefixKey {
+    #[inline(always)]
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::SelfHash
+    }
+
+    #[inline(always)]
+    fn to_fingerprint(&self, _: TyCtxt<'tcx>) -> Fingerprint {
+        Fingerprint::new(self.file_id64, self.bucket as u64)
+    }
+
+    #[inline(always)]
+    fn try_recover_key(_: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+        let fingerprint: Fingerprint = dep_node.key_fingerprint.into();
+        let (file_id64, bucket) = fingerprint.split();
+        Some(rustc_span::LineTablePrefixKey {
+            file_id64: file_id64.as_u64(),
+            bucket: bucket.as_u64() as u32,
+        })
+    }
+}

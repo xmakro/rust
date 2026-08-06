@@ -18,9 +18,7 @@ use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TypeVisitableExt, Unnormalized};
 use rustc_session::Session;
 use rustc_session::config::{self, DebugInfo};
-use rustc_span::{
-    BytePos, Pos, SourceFile, SourceFileAndLine, SourceFileHash, Span, StableSourceFileId, Symbol,
-};
+use rustc_span::{BytePos, Pos, SourceFile, SourceFileHash, Span, StableSourceFileId, Symbol};
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::DebuginfoKind;
 use smallvec::SmallVec;
@@ -683,17 +681,20 @@ impl<'ll> CodegenCx<'ll, '_> {
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
     fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
-        let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
-            Ok(SourceFileAndLine { sf: file, line }) => {
-                let line_pos = file.lines()[line];
+        // The line/column derived here end up in the object file's line tables, so they must
+        // come from the tracked lookup, which records the dependency that invalidates them.
+        let (file, line_index) = self.tcx.lookup_line_tracked(pos);
+        let (line, col) = match line_index {
+            Some(line_index) => {
+                let line_pos = file.lines()[line_index];
 
                 // Use 1-based indexing.
-                let line = (line + 1) as u32;
+                let line = (line_index + 1) as u32;
                 let col = (file.relative_position(pos) - line_pos).to_u32() + 1;
 
-                (file, line, col)
+                (line, col)
             }
-            Err(file) => (file, UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
+            None => (UNKNOWN_LINE_NUMBER, UNKNOWN_COLUMN_NUMBER),
         };
 
         // For MSVC, omit the column number.

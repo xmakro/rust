@@ -134,7 +134,10 @@ fn fill_region_tables<'tcx>(
         debug_assert!(false, "function has no mappings: {covfun:?}");
         return;
     };
-    let source_file = source_map.lookup_source_file(first_span.lo());
+    // Coverage mappings store line/column coordinates derived from the file's line table, so
+    // the file must come from the tracked lookup, which records the dependency that
+    // invalidates them.
+    let source_file = tcx.source_file_tracked(first_span.lo());
 
     let local_file_id = covfun.virtual_file_mapping.push_file(&source_file);
 

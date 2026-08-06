@@ -910,7 +910,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             "@{}",
                             // This may end up in stderr diagnostics but it may also be emitted
                             // into MIR. Hence we use the remapped path if available
-                            self.tcx().sess.source_map().span_to_diagnostic_string(span)
+                            self.tcx().span_to_diagnostic_string_tracked(span)
                         )?;
                     } else {
                         write!(self, "@")?;
@@ -941,7 +941,7 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             "@{}",
                             // This may end up in stderr diagnostics but it may also be emitted
                             // into MIR. Hence we use the remapped path if available
-                            self.tcx().sess.source_map().span_to_diagnostic_string(span)
+                            self.tcx().span_to_diagnostic_string_tracked(span)
                         )?;
                     } else {
                         write!(self, "@")?;
@@ -968,12 +968,12 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             } else {
                                 let span = self.tcx().def_span(did);
                                 let loc = if with_forced_trimmed_paths() {
-                                    self.tcx().sess.source_map().span_to_short_string(
+                                    self.tcx().span_to_short_string_tracked(
                                         span,
                                         RemapPathScopeComponents::DIAGNOSTICS,
                                     )
                                 } else {
-                                    self.tcx().sess.source_map().span_to_diagnostic_string(span)
+                                    self.tcx().span_to_diagnostic_string_tracked(span)
                                 };
                                 write!(
                                     self,
@@ -1030,12 +1030,12 @@ pub trait PrettyPrinter<'tcx>: Printer<'tcx> + fmt::Write {
                             // This may end up in stderr diagnostics but it may also be emitted
                             // into MIR. Hence we use the remapped path if available
                             let loc = if with_forced_trimmed_paths() {
-                                self.tcx().sess.source_map().span_to_short_string(
+                                self.tcx().span_to_short_string_tracked(
                                     span,
                                     RemapPathScopeComponents::DIAGNOSTICS,
                                 )
                             } else {
-                                self.tcx().sess.source_map().span_to_diagnostic_string(span)
+                                self.tcx().span_to_diagnostic_string_tracked(span)
                             };
                             write!(self, "@{loc}")?;
                         }
@@ -2312,7 +2312,7 @@ impl<'tcx> Printer<'tcx> for FmtPrinter<'_, 'tcx> {
                     "<impl at {}>",
                     // This may end up in stderr diagnostics but it may also be emitted
                     // into MIR. Hence we use the remapped path if available
-                    self.tcx.sess.source_map().span_to_diagnostic_string(span)
+                    self.tcx.span_to_diagnostic_string_tracked(span)
                 )?;
                 self.empty_path = false;
 

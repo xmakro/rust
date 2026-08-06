@@ -215,6 +215,28 @@ rustc_queries! {
         desc { "getting the source span" }
     }
 
+    /// Hash of a prefix of a source file's line-start table (plus its multibyte-character and
+    /// position-normalization tables), i.e. everything line-index and character-column
+    /// computation for a position in that prefix depends on besides the byte offset. It does
+    /// not cover the file's text, so *display* columns (`char_width` over the rendered line)
+    /// are protected only against edits that change one of the tables; see
+    /// [`TyCtxt::lookup_line_tracked`].
+    ///
+    /// Span fingerprints only cover (file, offset within file, length); see `stable_hash_span`.
+    /// Code that derives line/column information from a span and stores the result in a query
+    /// result or codegen artifact must depend on this query for the span's file and line, so
+    /// that edits which move line breaks without changing byte offsets invalidate the derived
+    /// data. The prefix granularity keeps dependents green when line breaks only move after
+    /// the observed line's bucket. Returns `None` when the keyed file existed in a previous
+    /// session but not in this one. Do not read this query directly: obtain the file through
+    /// [`TyCtxt::lookup_line_tracked`] or [`TyCtxt::source_file_tracked`],
+    /// which pair the lookup with the dependency.
+    query file_lines_prefix_hash(key: rustc_span::LineTablePrefixKey) -> Option<rustc_data_structures::fingerprint::Fingerprint> {
+        // Accesses untracked data
+        eval_always
+        desc { "hashing a prefix of a source file's line table" }
+    }
+
     query lower_to_hir(def_id: LocalDefId) -> hir::MaybeOwner<'tcx> {
         eval_always
         desc { "lowering HIR for `{}`", tcx.def_path_str(def_id) }

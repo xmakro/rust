@@ -117,3 +117,79 @@ fn test_unnormalized_source_length() {
     assert_eq!(sf.unnormalized_source_len, 19);
     assert_eq!(sf.normalized_source_len.0, 14);
 }
+
+fn file_for_bucket_hash(src: &str) -> SourceFile {
+    SourceFile::new(
+        FileName::Anon(Hash64::ZERO),
+        src.to_owned(),
+        SourceFileHashAlgorithm::Sha256,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn line_bucket_hash_prefix_property() {
+    // Identical first bucket, different tail: bucket 0 agrees, the last bucket differs.
+    let a = file_for_bucket_hash(&format!("{}{}", "x\n".repeat(64), "y\n".repeat(6)));
+    let b = file_for_bucket_hash(&format!("{}{}", "x\n".repeat(64), "yy\n".repeat(6)));
+    assert_eq!(a.line_bucket_hash(0), b.line_bucket_hash(0));
+    assert_ne!(a.line_bucket_hash(1), b.line_bucket_hash(1));
+
+    // An early edit changes every bucket.
+    let c = file_for_bucket_hash(&format!("{}{}", "xx\n".repeat(64), "y\n".repeat(6)));
+    assert_ne!(a.line_bucket_hash(0), c.line_bucket_hash(0));
+    assert_ne!(a.line_bucket_hash(1), c.line_bucket_hash(1));
+}
+
+#[test]
+fn line_bucket_hash_clamps_past_end() {
+    let a = file_for_bucket_hash(&"x\n".repeat(70));
+    assert_eq!(a.line_bucket_hash(1), a.line_bucket_hash(2));
+    assert_eq!(a.line_bucket_hash(1), a.line_bucket_hash(99));
+}
+
+#[test]
+fn line_bucket_hash_empty_table() {
+    let empty = file_for_bucket_hash("");
+    assert_eq!(empty.count_lines(), 0);
+    // The sentinel snapshot answers every bucket, and differs from a non-empty table.
+    assert_eq!(empty.line_bucket_hash(0), empty.line_bucket_hash(7));
+    let one = file_for_bucket_hash("x");
+    assert_eq!(one.count_lines(), 1);
+    assert_ne!(empty.line_bucket_hash(0), one.line_bucket_hash(0));
+}
+
+#[test]
+fn line_bucket_hash_boundary_split() {
+    // 64 lines vs 65 lines with identical byte offsets: splitting the last line of the
+    // first bucket inserts a line start right at the bucket boundary. The whole-file
+    // bucket for line 63 is 1 in both files (clamped in `a`), and the values must differ
+    // or a dependent of line 63 would stay green across the split.
+    let a = file_for_bucket_hash(&format!("{}yz\n", "x\n".repeat(63)));
+    let b = file_for_bucket_hash(&format!("{}y\nz", "x\n".repeat(63)));
+    assert_eq!(a.count_lines(), 64);
+    assert_eq!(b.count_lines(), 65);
+    assert_eq!(LineTablePrefixKey::new(a.stable_id, 63).bucket, 1);
+    assert_eq!(LineTablePrefixKey::new(b.stable_id, 63).bucket, 1);
+    assert_ne!(a.line_bucket_hash(1), b.line_bucket_hash(1));
+
+    // `whole_file` covers appends past the last recorded entry.
+    assert_eq!(LineTablePrefixKey::whole_file(&a).bucket, 1);
+    assert_eq!(LineTablePrefixKey::whole_file(&b).bucket, 1);
+}
+
+#[test]
+fn line_bucket_hash_covers_char_tables() {
+    // Same line starts and lengths, different multibyte table ("é" is two bytes).
+    let a = file_for_bucket_hash("é\n");
+    let b = file_for_bucket_hash("ab\n");
+    assert_eq!(a.lines(), b.lines());
+    assert_ne!(a.line_bucket_hash(0), b.line_bucket_hash(0));
+
+    // Same normalized content, different normalization table (CRLF vs LF).
+    let c = file_for_bucket_hash("a\r\nb");
+    let d = file_for_bucket_hash("a\nb");
+    assert_eq!(c.lines(), d.lines());
+    assert_ne!(c.line_bucket_hash(0), d.line_bucket_hash(0));
+}
