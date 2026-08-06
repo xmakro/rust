@@ -148,7 +148,7 @@ impl<'a> Iterator for Frame<'a> {
 ///
 /// `interp` would contain `$id => bar` and `src` would contain `println!("{}", stringify!($id));`.
 ///
-/// `transcribe` would return a `TokenStream` containing `println!("{}", stringify!(bar));`.
+/// `transcribe` would return a token buffer containing `println!("{}", stringify!(bar));`.
 ///
 /// Along the way, we do some additional error checking.
 pub(super) fn transcribe<'a>(

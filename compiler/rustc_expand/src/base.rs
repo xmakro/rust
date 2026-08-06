@@ -279,9 +279,15 @@ impl<'cx> MacroExpanderResult<'cx> {
         // Emit SEMICOLON_IN_EXPRESSIONS_FROM_MACROS here, rather than the NON_LOCAL version.
         let is_local = true;
 
+        // Parse an existing view in place; only tree-backed streams need the
+        // flattening pass.
+        let cursor = match tts.flat_view() {
+            Some(view) => FlatTokenCursor::from_view(view),
+            None => FlatTokenCursor::new(tts),
+        };
         let parser = ParserAnyMacro::from_flat(
             cx,
-            FlatTokenCursor::new(tts),
+            cursor,
             site_span,
             arm_span,
             is_local,

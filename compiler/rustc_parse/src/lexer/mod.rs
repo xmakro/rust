@@ -99,7 +99,10 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
     };
     // Lexing produces the parser's flat token buffer directly; a token *tree*
     // is only rebuilt from it for the few callers that need one. Pre-size the
-    // buffers with a rough tokens-per-byte estimate to avoid regrowth.
+    // buffers assuming one token per ~6 source bytes, on the dense side of
+    // typical Rust (identifiers, whitespace and comments push the real ratio
+    // higher) so that regrowth copies are rare; `from_parts` returns the
+    // slack if the estimate overshoots badly.
     let mut entries = Vec::with_capacity(src.len() / 6 + 16);
     let mut matches = Vec::with_capacity(src.len() / 6 + 16);
     let res = lexer.lex_token_trees(/* is_delimited */ false, 0, &mut entries, &mut matches);

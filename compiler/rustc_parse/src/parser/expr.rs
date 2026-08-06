@@ -1275,6 +1275,11 @@ impl<'a> Parser<'a> {
             None
         };
         let open_paren = self.token.span;
+        // Comparing depths across a bounded view's range end is normally a
+        // hazard (past the end `depth()` is 0, not the origin buffer's
+        // depth), but here it is benign: both samples come from the same
+        // cursor, and `call_depth` is >= 1 (taken inside the parens), so at
+        // the range end the equality fails just as the old cursor's did.
         let call_depth = self.token_cursor.depth();
 
         let seq = match self.parse_expr_paren_seq() {
@@ -2523,8 +2528,8 @@ impl<'a> Parser<'a> {
         }
 
         if self.token == TokenKind::Semi
-            && self.token_cursor.enclosing_delimiter() == Some(Delimiter::Parenthesis)
             && self.may_recover()
+            && self.token_cursor.enclosing_delimiter() == Some(Delimiter::Parenthesis)
         {
             // It is likely that the closure body is a block but where the
             // braces have been removed. We will recover and eat the next
