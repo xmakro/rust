@@ -1386,6 +1386,71 @@ impl FlatSink {
         }
     }
 
+    /// Replays a lazily captured token stream directly into the sink,
+    /// without materializing an `AttrTokenStream` or token trees. This is
+    /// how non-`tt` metavariable fragments reach macro expansion output on
+    /// the common path.
+    ///
+    /// Returns `false` without emitting anything when the capture needs
+    /// tree-level processing: an already-materialized stream, pending
+    /// replacements (cfg-expansion / inner attributes), a broken last
+    /// token, or a capture starting with a metavar-invisible group (a
+    /// superset of the same-`MetaVarKind` unwrap rule, which the caller's
+    /// tree path implements precisely).
+    pub fn splice_lazy(&mut self, lazy: &LazyAttrTokenStream) -> bool {
+        let LazyAttrTokenStreamInner::Pending {
+            start_token,
+            cursor_snapshot,
+            num_calls,
+            break_last_token,
+            node_replacements,
+        } = &*lazy.0
+        else {
+            return false;
+        };
+        if *break_last_token != 0 || !node_replacements.is_empty() {
+            return false;
+        }
+        if *num_calls == 0 {
+            return true;
+        }
+        if matches!(start_token.0.kind, token::OpenInvisible(token::InvisibleOrigin::MetaVar(_))) {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        let start_len = self.entries.len();
+        // Captured sequences have matching delimiters (a `collect_tokens`
+        // invariant); the depth checks turn a violation into a panic before
+        // it can corrupt the sink's enclosing groups.
+        let mut depth = 0u32;
+        let mut cursor = cursor_snapshot.clone();
+        let tokens = iter::once(*start_token)
+            .chain(iter::repeat_with(|| cursor.next()))
+            .take(*num_calls as usize);
+        for (token, spacing) in tokens {
+            if token.kind.open_delim().is_some() {
+                depth += 1;
+                self.open_delim(token, spacing);
+            } else if token.kind.close_delim().is_some() {
+                assert!(depth > 0, "captured token sequence closes an unopened delimiter");
+                depth -= 1;
+                self.close_delim(token, spacing);
+            } else {
+                self.push_token(token, spacing);
+            }
+        }
+        assert_eq!(depth, 0, "captured token sequence leaves a delimiter open");
+        // Differential check: the replay must produce exactly the trees the
+        // materializing path would.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            flat_range_to_trees(&self.entries, &self.matches, start_len, self.entries.len())
+                == lazy.to_attr_token_stream().to_token_trees(),
+            "sink replay diverged from the materialized capture"
+        );
+        true
+    }
+
     /// Finishes the buffer. All opened delimiters must have been closed.
     pub fn finish(self) -> FlatTokenCursor {
         debug_assert!(self.open_stack.is_empty());

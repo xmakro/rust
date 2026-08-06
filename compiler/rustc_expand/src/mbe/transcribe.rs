@@ -2,9 +2,10 @@ use rustc_ast::token::{
     self, Delimiter, IdentIsRaw, InvisibleOrigin, Lit, LitKind, MetaVarKind, Token, TokenKind,
 };
 use rustc_ast::tokenstream::{
-    DelimSpacing, DelimSpan, FlatSink, FlatTokenCursor, FlatTt, Spacing, TokenStream, TokenTree,
+    DelimSpacing, DelimSpan, FlatSink, FlatTokenCursor, FlatTt, LazyAttrTokenStream, Spacing,
+    TokenStream, TokenTree,
 };
-use rustc_ast::{ExprKind, StmtKind, TyKind, UnOp};
+use rustc_ast::{ExprKind, HasAttrs, HasTokens, StmtKind, TyKind, UnOp};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_errors::{Diag, DiagCtxtHandle, PResult, listify, pluralize};
 use rustc_parse::lexer::nfc_normalize;
@@ -469,30 +470,41 @@ fn transcribe_pnr<'tx>(
             sp,
             item.span,
             MetaVarKind::Item,
-            TokenStream::from_ast(item),
+            if item.attrs.is_empty() { item.tokens() } else { None },
+            || TokenStream::from_ast(item),
         ),
         ParseNtResult::Block(block) => emit_delimited_fragment(
             tscx,
             sp,
             block.node.span,
             MetaVarKind::Block,
-            TokenStream::from_ast(block),
+            block.tokens.as_ref(),
+            || TokenStream::from_ast(block),
         ),
         ParseNtResult::Stmt(stmt) => {
-            let stream = if let StmtKind::Empty = stmt.kind {
-                // FIXME: Properly collect tokens for empty statements.
-                TokenStream::token_alone(token::Semi, stmt.span)
+            let lazy = if let StmtKind::Empty = stmt.kind {
+                None
+            } else if stmt.attrs().is_empty() {
+                stmt.tokens()
             } else {
-                TokenStream::from_ast(stmt)
+                None
             };
-            emit_delimited_fragment(tscx, sp, stmt.span, MetaVarKind::Stmt, stream)
+            emit_delimited_fragment(tscx, sp, stmt.span, MetaVarKind::Stmt, lazy, || {
+                if let StmtKind::Empty = stmt.kind {
+                    // FIXME: Properly collect tokens for empty statements.
+                    TokenStream::token_alone(token::Semi, stmt.span)
+                } else {
+                    TokenStream::from_ast(stmt)
+                }
+            })
         }
         ParseNtResult::Pat(pat, pat_kind) => emit_delimited_fragment(
             tscx,
             sp,
             pat.node.span,
             MetaVarKind::Pat(*pat_kind),
-            TokenStream::from_ast(pat),
+            pat.tokens.as_ref(),
+            || TokenStream::from_ast(pat),
         ),
         ParseNtResult::Expr(expr, kind) => {
             let (can_begin_literal_maybe_minus, can_begin_string_literal) = match &expr.kind {
@@ -511,7 +523,8 @@ fn transcribe_pnr<'tx>(
                     can_begin_literal_maybe_minus,
                     can_begin_string_literal,
                 },
-                TokenStream::from_ast(expr),
+                if expr.attrs.is_empty() { expr.tokens() } else { None },
+                || TokenStream::from_ast(expr),
             )
         }
         ParseNtResult::Literal(lit) => emit_delimited_fragment(
@@ -519,7 +532,8 @@ fn transcribe_pnr<'tx>(
             sp,
             lit.span,
             MetaVarKind::Literal,
-            TokenStream::from_ast(lit),
+            if lit.attrs.is_empty() { lit.tokens() } else { None },
+            || TokenStream::from_ast(lit),
         ),
         ParseNtResult::Ty(ty) => {
             let is_path = matches!(&ty.node.kind, TyKind::Path(None, _path));
@@ -528,7 +542,8 @@ fn transcribe_pnr<'tx>(
                 sp,
                 ty.node.span,
                 MetaVarKind::Ty { is_path },
-                TokenStream::from_ast(ty),
+                ty.tokens.as_ref(),
+                || TokenStream::from_ast(ty),
             )
         }
         ParseNtResult::Meta(attr_item) => {
@@ -538,7 +553,8 @@ fn transcribe_pnr<'tx>(
                 sp,
                 attr_item.node.span,
                 MetaVarKind::Meta { has_meta_form },
-                TokenStream::from_ast(attr_item),
+                attr_item.tokens.as_ref(),
+                || TokenStream::from_ast(attr_item),
             )
         }
         ParseNtResult::Path(path) => emit_delimited_fragment(
@@ -546,14 +562,16 @@ fn transcribe_pnr<'tx>(
             sp,
             path.node.span,
             MetaVarKind::Path,
-            TokenStream::from_ast(path),
+            path.tokens.as_ref(),
+            || TokenStream::from_ast(path),
         ),
         ParseNtResult::Vis(vis) => emit_delimited_fragment(
             tscx,
             sp,
             vis.node.span,
             MetaVarKind::Vis,
-            TokenStream::from_ast(vis),
+            vis.tokens.as_ref(),
+            || TokenStream::from_ast(vis),
         ),
         ParseNtResult::Guard(guard) => {
             // FIXME(macro_guard_matcher):
@@ -562,14 +580,14 @@ fn transcribe_pnr<'tx>(
 
             let leading_if_span =
                 guard.span_with_leading_if.with_hi(guard.span_with_leading_if.lo() + BytePos(2));
-            let ts = std::iter::once(TokenTree::token_alone(
-                token::Ident(kw::If, IdentIsRaw::No),
-                leading_if_span,
-            ))
-            .chain(TokenStream::from_ast(&guard.cond).iter().cloned())
-            .collect();
-
-            emit_delimited_fragment(tscx, sp, guard.span_with_leading_if, MetaVarKind::Guard, ts)
+            emit_delimited_fragment(tscx, sp, guard.span_with_leading_if, MetaVarKind::Guard, None, || {
+                std::iter::once(TokenTree::token_alone(
+                    token::Ident(kw::If, IdentIsRaw::No),
+                    leading_if_span,
+                ))
+                .chain(TokenStream::from_ast(&guard.cond).iter().cloned())
+                .collect()
+            })
         }
     };
 
@@ -779,23 +797,19 @@ fn splice_flat_tt(sink: &mut FlatSink, ftt: &FlatTt) {
 /// `MetaVarKind`, because some proc macros can't handle multiple layers of
 /// invisible delimiters of the same `MetaVarKind`; this loses some span
 /// info, though it hopefully won't matter).
+///
+/// When the fragment's lazily captured tokens are available (`lazy`) they
+/// replay straight into the sink; `stream` is only built for the fallback
+/// tree path (attribute-bearing nodes, pending replacements, captures a
+/// replay cannot represent, and the same-`MetaVarKind` unwrap above).
 fn emit_delimited_fragment(
     tscx: &mut TranscrCtx<'_, '_>,
     mut sp: Span,
     mk_span: Span,
     mv_kind: MetaVarKind,
-    mut stream: TokenStream,
+    lazy: Option<&LazyAttrTokenStream>,
+    stream: impl FnOnce() -> TokenStream,
 ) {
-    if stream.len() == 1 {
-        let tree = stream.iter().next().unwrap();
-        if let TokenTree::Delimited(_, _, delim, inner) = tree
-            && let Delimiter::Invisible(InvisibleOrigin::MetaVar(mvk)) = delim
-            && mv_kind == *mvk
-        {
-            stream = inner.clone();
-        }
-    }
-
     // Emit as tokens within `Delimiter::Invisible` to maintain parsing
     // priorities.
     tscx.marker.mark_span(&mut sp);
@@ -804,7 +818,19 @@ fn emit_delimited_fragment(
     // `$foo` in the decl macro RHS.
     let delim = Delimiter::Invisible(InvisibleOrigin::MetaVar(mv_kind));
     tscx.sink.open_delim(Token::new(delim.as_open_token_kind(), sp), Spacing::Alone);
-    tscx.sink.splice_stream(&stream);
+    if !lazy.is_some_and(|lazy| tscx.sink.splice_lazy(lazy)) {
+        let mut stream = stream();
+        if stream.len() == 1 {
+            let tree = stream.iter().next().unwrap();
+            if let TokenTree::Delimited(_, _, delim, inner) = tree
+                && let Delimiter::Invisible(InvisibleOrigin::MetaVar(mvk)) = delim
+                && mv_kind == *mvk
+            {
+                stream = inner.clone();
+            }
+        }
+        tscx.sink.splice_stream(&stream);
+    }
     tscx.sink.close_delim(Token::new(delim.as_close_token_kind(), sp), Spacing::Alone);
 }
 
