@@ -6,8 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::{assert_matches, io, str};
 
 use ast::token::IdentIsRaw;
-use rustc_ast::token::{self, Delimiter, Token};
-use rustc_ast::tokenstream::{DelimSpacing, DelimSpan, Spacing, TokenStream, TokenTree};
+use rustc_ast::token::{self, Delimiter, InvisibleOrigin, Token};
+use rustc_ast::tokenstream::{
+    DelimSpacing, DelimSpan, FlatTokenCursor, Spacing, TokenStream, TokenTree,
+};
 use rustc_ast::{self as ast, PatKind, visit};
 use rustc_ast_pretty::pprust::item_to_string;
 use rustc_errors::annotate_snippet_emitter_writer::AnnotateSnippetEmitter;
@@ -16,7 +18,7 @@ use rustc_errors::{AutoStream, DiagCtxt, MultiSpan, PResult};
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::{FilePathMapping, SourceMap};
 use rustc_span::{
-    BytePos, FileName, Pos, Span, Symbol, create_default_session_globals_then, kw, sym,
+    BytePos, DUMMY_SP, FileName, Pos, Span, Symbol, create_default_session_globals_then, kw, sym,
 };
 
 use crate::lexer::StripTokens;
@@ -2364,6 +2366,122 @@ fn string_to_tts_1() {
         ]);
 
         assert_eq!(tts, expected);
+    })
+}
+
+#[test]
+fn flat_round_trip() {
+    create_default_session_globals_then(|| {
+        for src in [
+            "",
+            "a b c",
+            "fn a(b: i32) { b; }",
+            "macro_rules! zip (($a)=>($a));",
+            "a!{} b![] c!() d! { e! [ f!( ) ] }",
+            "x >>= y << z",
+        ] {
+            let stream = string_to_stream(src.to_string());
+            let rebuilt = FlatTokenCursor::new(stream.clone()).to_token_stream();
+            assert_eq!(stream, rebuilt, "flatten/rebuild round trip diverged for {src:?}");
+        }
+    })
+}
+
+#[test]
+fn flat_view_parses_group_ending_at_view_end() {
+    // Regression: a bounded view cursor returns depth 0 past its range end,
+    // so a `parse_token_tree` loop bounded on `depth()` would never
+    // terminate when the captured group ends exactly at the view end. The
+    // loop must be bounded on entry positions.
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let mut p = string_to_parser(&psess, "(a (b c))".to_string());
+        let args = p.parse_delim_args().unwrap();
+        assert!(args.tokens.flat_view().is_some());
+        let mut inner = Parser::new(&psess, args.tokens.clone(), None);
+        assert!(matches!(inner.parse_token_tree(), TokenTree::Token(..)));
+        // `(b c)` ends exactly at the view end.
+        assert!(matches!(inner.parse_token_tree(), TokenTree::Delimited(..)));
+        assert_eq!(inner.token.kind, token::Eof);
+    })
+}
+
+#[test]
+fn flat_view_debug_is_bounded() {
+    // Regression: Debug on a view-backed stream must print the viewed range
+    // only, not the whole underlying buffer.
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let mut p = string_to_parser(&psess, "(inside) outside_sentinel".to_string());
+        let args = p.parse_delim_args().unwrap();
+        let dump = format!("{:?}", args.tokens);
+        assert!(dump.contains("inside"));
+        assert!(!dump.contains("outside_sentinel"), "view Debug dumped the whole buffer: {dump}");
+    })
+}
+
+#[test]
+fn flat_view_eq_and_iter_len() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let mut p = string_to_parser(&psess, "(a (b c) d)".to_string());
+        let args = p.parse_delim_args().unwrap();
+        let flat = args.tokens.clone();
+        assert!(flat.flat_view().is_some());
+        // A view-backed stream and its eager rebuild compare equal, in both
+        // directions.
+        let eager: TokenStream = flat.iter().cloned().collect();
+        assert!(eager.flat_view().is_none());
+        assert_eq!(flat, eager);
+        assert_eq!(eager, flat);
+        // Iteration knows its exact length.
+        let mut iter = flat.iter();
+        assert_eq!(iter.len(), 3);
+        iter.next();
+        assert_eq!(iter.len(), 2);
+    })
+}
+
+#[test]
+fn tree_look_ahead_counts_leading_invisible_group() {
+    // Regression: tree-level lookahead must treat a *skipped* invisible
+    // group right at the cursor as one whole element, exactly like the old
+    // tree-walking cursor treated the corresponding `Delimited`. Filtering
+    // the open entry out (the way plain token consumption does) enters the
+    // group transparently and pairs every subsequent delimiter-counting walk
+    // one nesting level too deep.
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let stream = TokenStream::new(vec![
+            TokenTree::token_alone(token::Ident(Symbol::intern("x"), IdentIsRaw::No), DUMMY_SP),
+            TokenTree::Delimited(
+                DelimSpan::from_single(DUMMY_SP),
+                DelimSpacing::new(Spacing::Alone, Spacing::Alone),
+                Delimiter::Invisible(InvisibleOrigin::ProcMacro),
+                TokenStream::new(vec![TokenTree::token_alone(
+                    token::Ident(Symbol::intern("inside"), IdentIsRaw::No),
+                    DUMMY_SP,
+                )]),
+            ),
+            TokenTree::token_alone(token::Ident(Symbol::intern("y"), IdentIsRaw::No), DUMMY_SP),
+        ]);
+        let parser = Parser::new(&psess, stream, None);
+        // The parser sits on `x`; the invisible group is the next element.
+        assert!(parser.token.is_ident_named(Symbol::intern("x")));
+        let next = parser.tree_look_ahead(1, |tt| match tt {
+            TokenTree::Delimited(.., Delimiter::Invisible(InvisibleOrigin::ProcMacro), inner) => {
+                // The group's contents are a real (lazy) view, not a stub.
+                inner.len() == 1
+            }
+            _ => false,
+        });
+        assert_eq!(next, Some(true));
+        // The element after the group is `y`, one step past it.
+        let after = parser.tree_look_ahead(2, |tt| match tt {
+            TokenTree::Token(tok, _) => tok.is_ident_named(Symbol::intern("y")),
+            _ => false,
+        });
+        assert_eq!(after, Some(true));
     })
 }
 
