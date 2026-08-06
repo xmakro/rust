@@ -161,7 +161,7 @@ pub(super) fn transcribe<'a>(
 ) -> PResult<'a, FlatTokenCursor> {
     // Nothing for us to transcribe...
     if src.tts.is_empty() {
-        return Ok(FlatTokenCursor::from_parts(Vec::new(), Vec::new()));
+        return Ok(FlatSink::new().finish());
     }
 
     let mut tscx = TranscrCtx {
@@ -583,12 +583,12 @@ fn transcribe_metavar_expr<'tx>(
     expr: &MetaVarExpr,
 ) -> PResult<'tx, ()> {
     let dcx = tscx.psess.dcx();
-    let tt = match *expr {
+    let token = match *expr {
         MetaVarExpr::Concat(ref elements) => metavar_expr_concat(tscx, dspan, elements)?,
         MetaVarExpr::Count(original_ident, depth) => {
             let matched = matched_from_ident(dcx, original_ident, tscx.interp)?;
             let count = count_repetitions(dcx, depth, matched, &tscx.repeats, &dspan)?;
-            TokenTree::token_alone(
+            Token::new(
                 TokenKind::lit(token::Integer, sym::integer(count), None),
                 tscx.visited_dspan(dspan),
             )
@@ -599,7 +599,7 @@ fn transcribe_metavar_expr<'tx>(
             return Ok(());
         }
         MetaVarExpr::Index(depth) => match tscx.repeats.iter().nth_back(depth) {
-            Some((index, _)) => TokenTree::token_alone(
+            Some((index, _)) => Token::new(
                 TokenKind::lit(token::Integer, sym::integer(*index), None),
                 tscx.visited_dspan(dspan),
             ),
@@ -608,7 +608,7 @@ fn transcribe_metavar_expr<'tx>(
             }
         },
         MetaVarExpr::Len(depth) => match tscx.repeats.iter().nth_back(depth) {
-            Some((_, length)) => TokenTree::token_alone(
+            Some((_, length)) => Token::new(
                 TokenKind::lit(token::Integer, sym::integer(*length), None),
                 tscx.visited_dspan(dspan),
             ),
@@ -617,10 +617,7 @@ fn transcribe_metavar_expr<'tx>(
             }
         },
     };
-    let TokenTree::Token(token, spacing) = tt else {
-        unreachable!("metavariable expressions produce single tokens")
-    };
-    tscx.sink.push_token(token, spacing);
+    tscx.sink.push_token(token, Spacing::Alone);
     Ok(())
 }
 
@@ -629,7 +626,7 @@ fn metavar_expr_concat<'tx>(
     tscx: &mut TranscrCtx<'tx, '_>,
     dspan: DelimSpan,
     elements: &[MetaVarExprConcatElem],
-) -> PResult<'tx, TokenTree> {
+) -> PResult<'tx, Token> {
     let dcx = tscx.psess.dcx();
     let mut concatenated = String::new();
     for element in elements {
@@ -669,10 +666,7 @@ fn metavar_expr_concat<'tx>(
     // The current implementation marks the span as coming from the macro regardless of
     // contexts of the concatenated identifiers but this behavior may change in the
     // future.
-    Ok(TokenTree::Token(
-        Token::from_ast_ident(Ident::new(symbol, concatenated_span)),
-        Spacing::Alone,
-    ))
+    Ok(Token::from_ast_ident(Ident::new(symbol, concatenated_span)))
 }
 
 /// Store the metavariable span for this original span into a side table.
@@ -733,7 +727,7 @@ fn transcribe_flat_tt(tscx: &mut TranscrCtx<'_, '_>, metavar_span: Span, ftt: &F
         FlatTt::Slice(slice) => {
             let entries = slice.entries();
             let (open, close) = (entries.first().unwrap(), entries.last().unwrap());
-            let dspan = DelimSpan::from_pair(open.token.span, close.token.span);
+            let dspan = DelimSpan::from_pair(open.token().span, close.token().span);
             with_metavar_spans(|mspans| {
                 mspans.insert(dspan.open, metavar_span)
                     && mspans.insert(dspan.close, metavar_span)
@@ -757,7 +751,7 @@ fn transcribe_flat_tt(tscx: &mut TranscrCtx<'_, '_>, metavar_span: Span, ftt: &F
         FlatTt::Slice(slice) => {
             let entries = slice.entries();
             let (open_span, close_span) =
-                (entries.first().unwrap().token.span, entries.last().unwrap().token.span);
+                (entries.first().unwrap().token().span, entries.last().unwrap().token().span);
             let open = metavar_span.with_ctxt(open_span.ctxt());
             let close = metavar_span.with_ctxt(close_span.ctxt());
             with_metavar_spans(|mspans| {

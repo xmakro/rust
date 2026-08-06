@@ -1,7 +1,7 @@
 use diagnostics::make_errors_for_mismatched_closing_delims;
 use rustc_ast::ast::{self, AttrStyle};
 use rustc_ast::token::{self, CommentKind, Delimiter, IdentIsRaw, Token, TokenKind};
-use rustc_ast::tokenstream::FlatTokenCursor;
+use rustc_ast::tokenstream::{FlatSink, FlatTokenCursor};
 use rustc_ast::util::unicode::{TEXT_FLOW_CONTROL_CHARS, contains_text_flow_control_chars};
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, DiagCtxtHandle, Diagnostic, StashKey};
@@ -98,14 +98,18 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
         diag_info: TokenTreeDiagInfo::default(),
     };
     // Lexing produces the parser's flat token buffer directly; a token *tree*
-    // is only rebuilt from it for the few callers that need one. Pre-size the
-    // buffers assuming one token per ~6 source bytes, on the dense side of
-    // typical Rust (identifiers, whitespace and comments push the real ratio
-    // higher) so that regrowth copies are rare; `from_parts` returns the
-    // slack if the estimate overshoots badly.
-    let mut entries = Vec::with_capacity(src.len() / 6 + 16);
-    let mut matches = Vec::with_capacity(src.len() / 6 + 16);
-    let res = lexer.lex_token_trees(/* is_delimited */ false, 0, &mut entries, &mut matches);
+    // is only rebuilt from it for the few callers that need one.
+    //
+    // Pre-size the buffer at one token per 6 source bytes. Measured over
+    // rust-lang/rust itself (non-trivia lexer tokens, files >= 256 bytes),
+    // byte-weighted density is ~7.0 bytes/token for compiler/ and ~5.9 for
+    // library/, with per-file quartiles roughly 5.1/6.1/7.4 and pathological
+    // token-stress files down at ~1.7. Estimating on the dense side is
+    // deliberate: undershoot costs one partial regrowth copy, while
+    // overshoot within the slack threshold of `finish` is only transient
+    // waste (beyond it, `finish` shrinks, which copies the full buffer).
+    let mut sink = FlatSink::with_capacity(src.len() / 6 + 16);
+    let res = lexer.lex_token_trees(/* is_delimited */ false, &mut sink);
 
     let mut unmatched_closing_delims: Vec<_> =
         make_errors_for_mismatched_closing_delims(&lexer.diag_info.unmatched_delims, psess);
@@ -113,7 +117,7 @@ pub(crate) fn lex_token_trees<'psess, 'src>(
     match res {
         Ok(_open_spacing) => {
             if unmatched_closing_delims.is_empty() {
-                Ok(FlatTokenCursor::from_parts(entries, matches))
+                Ok(sink.finish())
             } else {
                 // Return error if there are unmatched delimiters or unclosed delimiters.
                 Err(unmatched_closing_delims)

@@ -620,6 +620,17 @@ pub enum Spacing {
     JointHidden,
 }
 
+/// The state of a view-backed [`TokenStream`]: a view of one nesting level
+/// of a flat token buffer, plus its lazily materialized token trees. Boxed
+/// in [`TokenStreamInner::Flat`] so the enum stays at `Vec` size (24 bytes,
+/// niched on the box pointer): eager streams — the vast majority — carry no
+/// dead `OnceLock`, and view streams pay one extra allocation each.
+#[derive(Clone)]
+pub(crate) struct FlatLazy {
+    view: FlatTokenSlice,
+    trees: OnceLock<Vec<TokenTree>>,
+}
+
 /// The backing of a [`TokenStream`]: either materialized token trees, or a
 /// lazily materialized view of one nesting level of a flat token buffer.
 /// The latter lets macro-invocation arguments flow from the parser to the
@@ -628,7 +639,7 @@ pub enum Spacing {
 #[derive(Clone)]
 pub(crate) enum TokenStreamInner {
     Eager(Vec<TokenTree>),
-    Flat { view: FlatTokenSlice, trees: OnceLock<Vec<TokenTree>> },
+    Flat(Box<FlatLazy>),
 }
 
 /// A `TokenStream` is an abstract sequence of tokens, organized into [`TokenTree`]s.
@@ -639,7 +650,9 @@ pub struct TokenStream(pub(crate) Arc<TokenStreamInner>);
 // impl on `TokenStream(Arc<Vec<TokenTree>>)`. For a flat view this
 // materializes (and prints) only the viewed range — the derived impl would
 // dump the whole underlying buffer for every view, which makes debug dumps
-// of unexpanded macro calls quadratic in crate size.
+// of unexpanded macro calls quadratic in crate size. The materialized trees
+// are cached in the stream's `OnceLock`, so formatting a view-backed stream
+// populates its lazy state as a side effect.
 impl fmt::Debug for TokenStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("TokenStream").field(self.trees_vec()).finish()
@@ -703,43 +716,52 @@ impl TokenStream {
     /// Creates a stream that is a lazily materialized view of a flat buffer
     /// range covering one nesting level.
     pub fn from_flat_view(view: FlatTokenSlice) -> TokenStream {
-        TokenStream(Arc::new(TokenStreamInner::Flat { view, trees: OnceLock::new() }))
+        TokenStream(Arc::new(TokenStreamInner::Flat(Box::new(FlatLazy {
+            view,
+            trees: OnceLock::new(),
+        }))))
     }
 
     /// The flat view backing this stream, if it has one (and tree access
     /// would thus require materialization).
     pub fn flat_view(&self) -> Option<&FlatTokenSlice> {
         match &*self.0 {
-            TokenStreamInner::Flat { view, .. } => Some(view),
+            TokenStreamInner::Flat(lazy) => Some(&lazy.view),
             TokenStreamInner::Eager(_) => None,
         }
     }
 
     /// The materialized token trees, materializing a flat view on first use.
+    ///
+    /// For a view shared across threads (`-Zthreads`), concurrent first
+    /// calls may each compute the trees, with all but the `OnceLock` winner
+    /// discarded; the result is the same either way.
     fn trees_vec(&self) -> &Vec<TokenTree> {
         match &*self.0 {
             TokenStreamInner::Eager(trees) => trees,
-            TokenStreamInner::Flat { view, trees } => trees.get_or_init(|| view.to_tree_vec()),
+            TokenStreamInner::Flat(lazy) => lazy.trees.get_or_init(|| lazy.view.to_tree_vec()),
         }
     }
 
     /// Mutable access to the trees, converting a flat view into an eager
-    /// stream first.
+    /// stream first. The view case copies twice (materialize, then clone
+    /// into the new `Eager` allocation); mutation of view-backed streams is
+    /// rare enough that this has not been worth a dedicated path.
     fn vec_mut(&mut self) -> &mut Vec<TokenTree> {
-        if let TokenStreamInner::Flat { .. } = &*self.0 {
+        if let TokenStreamInner::Flat(..) = &*self.0 {
             let trees = self.trees_vec().clone();
             self.0 = Arc::new(TokenStreamInner::Eager(trees));
         }
         match Arc::make_mut(&mut self.0) {
             TokenStreamInner::Eager(trees) => trees,
-            TokenStreamInner::Flat { .. } => unreachable!(),
+            TokenStreamInner::Flat(..) => unreachable!(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match &*self.0 {
             TokenStreamInner::Eager(trees) => trees.is_empty(),
-            TokenStreamInner::Flat { view, .. } => view.len() == 0,
+            TokenStreamInner::Flat(lazy) => lazy.view.len() == 0,
         }
     }
 
@@ -967,22 +989,26 @@ impl StableHash for TokenStream {
     }
 }
 
+/// Iterates over the trees of a stream. Holds the materialized tree slice
+/// directly (materializing a flat view once at construction), so `next` is a
+/// plain slice index rather than a per-element re-resolution of the stream's
+/// backing.
 #[derive(Clone)]
 pub struct TokenStreamIter<'t> {
-    stream: &'t TokenStream,
+    trees: &'t [TokenTree],
     index: usize,
 }
 
 impl<'t> TokenStreamIter<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        TokenStreamIter { stream, index: 0 }
+        TokenStreamIter { trees: stream.trees_vec(), index: 0 }
     }
 
     // Peeking could be done via `Peekable`, but most iterators need peeking,
     // and this is simple and avoids the need to use `peekable` and `Peekable`
     // at all the use sites.
     pub fn peek(&self) -> Option<&'t TokenTree> {
-        self.stream.get(self.index)
+        self.trees.get(self.index)
     }
 }
 
@@ -990,14 +1016,16 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
-        self.stream.get(self.index).map(|tree| {
+        self.trees.get(self.index).map(|tree| {
             self.index += 1;
             tree
         })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.stream.len().saturating_sub(self.index);
+        // `index` only advances on a successful `next`, so it never exceeds
+        // the slice length.
+        let remaining = self.trees.len() - self.index;
         (remaining, Some(remaining))
     }
 }
@@ -1013,16 +1041,26 @@ impl std::iter::FusedIterator for TokenStreamIter<'_> {}
 /// those entries are filtered out by [`FlatTokenCursor::inlined_next`], but
 /// retaining them preserves the tree structure for tree-level lookahead and
 /// depth queries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatEntry {
-    pub token: Token,
-    pub spacing: Spacing,
+    token: Token,
+    spacing: Spacing,
     /// The nesting depth this entry lives at. Open-delimiter entries carry
     /// the *parent* depth, while the contents and the close-delimiter entry
     /// carry the inner depth. This makes [`FlatTokenCursor::depth`] agree
     /// with the `stack.len()` of the old tree-walking cursor at every point
     /// in the token sequence.
-    pub depth: u32,
+    depth: u32,
+}
+
+impl FlatEntry {
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    pub fn spacing(&self) -> Spacing {
+        self.spacing
+    }
 }
 
 /// The backing store of a flat token buffer: the entry sequence plus the
@@ -1030,13 +1068,19 @@ pub struct FlatEntry {
 /// slices clone with one reference-count bump. The match table is kept out
 /// of [`FlatEntry`] deliberately: it is consulted only at open-delimiter
 /// entries, and inlining it would widen every entry of the sequentially
-/// scanned buffer.
-pub struct FlatBuffer {
-    pub entries: Vec<FlatEntry>,
+/// scanned buffer (though it does cost 4 bytes per entry itself; see the
+/// comment on `matches`).
+///
+/// Kept private to this module: the invariants (depths, match table) are
+/// maintained solely by [`FlatSink`], and all consumers go through cursor
+/// and slice methods.
+struct FlatBuffer {
+    entries: Vec<FlatEntry>,
     /// For every open-delimiter entry, the index of its matching
     /// close-delimiter entry (zero for other entries). Lets the parser skip
-    /// a whole delimited sequence in one step.
-    pub matches: Vec<u32>,
+    /// a whole delimited sequence in one step, at the cost of one `u32` per
+    /// entry (+12.5% on the 32-byte entries).
+    matches: Vec<u32>,
 }
 
 /// A linear cursor over a pre-flattened token stream, replacing the
@@ -1211,14 +1255,29 @@ impl FlatSink {
         self.matches.push(0);
     }
 
+    /// The number of entries emitted so far.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Emits an open-delimiter entry and enters the group. `token` must be an
-    /// open-delimiter token.
-    pub fn open_delim(&mut self, token: Token, spacing: Spacing) {
+    /// open-delimiter token. Returns the entry index of the open delimiter,
+    /// usable with [`FlatSink::patch_open_spacing`].
+    pub fn open_delim(&mut self, token: Token, spacing: Spacing) -> usize {
         debug_assert!(token.kind.open_delim().is_some());
         let open_idx = self.entries.len() as u32;
         self.entries.push(FlatEntry { token, spacing, depth: self.depth() });
         self.matches.push(0);
         self.open_stack.push(open_idx);
+        open_idx as usize
+    }
+
+    /// Rewrites the spacing of the open-delimiter entry at `open_idx`. The
+    /// lexer only knows an open delimiter's spacing after bumping past it,
+    /// so it emits the entry with a placeholder and patches it here.
+    pub fn patch_open_spacing(&mut self, open_idx: usize, spacing: Spacing) {
+        debug_assert!(self.entries[open_idx].token.kind.open_delim().is_some());
+        self.entries[open_idx].spacing = spacing;
     }
 
     /// Emits the close-delimiter entry for the innermost open group and
@@ -1341,9 +1400,10 @@ impl FlatTokenCursor {
         sink.finish()
     }
 
-    /// Assembles a cursor from a pre-built buffer, as produced directly by
-    /// the lexer.
-    pub fn from_parts(mut entries: Vec<FlatEntry>, mut matches: Vec<u32>) -> FlatTokenCursor {
+    /// Assembles a cursor from a pre-built buffer. Private: buffers are only
+    /// produced by [`FlatSink`], which maintains the depth and match-table
+    /// invariants; external producers go through the sink.
+    fn from_parts(mut entries: Vec<FlatEntry>, mut matches: Vec<u32>) -> FlatTokenCursor {
         // Expansion output is not bounded by the source-file size limit, so
         // the 32-bit entry indices need a real guard: a silent wrap would
         // corrupt the match table.
@@ -1352,7 +1412,11 @@ impl FlatTokenCursor {
         debug_assert!(flat_buffer_is_well_formed(&entries, &matches));
         // Presize estimates can overshoot (comment- and string-heavy files),
         // and captured views can pin the buffer for a long time; return
-        // large slack allocations rather than retaining them.
+        // large slack allocations rather than retaining them. The len/4
+        // threshold keeps overshoot up to the ~p75 of measured source
+        // density (see the presize comment in `rustc_parse::lexer`) without
+        // a shrink copy; the 4096 floor exempts small buffers, where slack
+        // is cheaper than any copy.
         if entries.capacity() - entries.len() > 4096 + entries.len() / 4 {
             entries.shrink_to_fit();
             matches.shrink_to_fit();
@@ -1442,7 +1506,11 @@ impl FlatTokenCursor {
     /// current position, or `None` in the outermost stream.
     pub fn enclosing_delimiter(&self) -> Option<Delimiter> {
         // Every entry carries its nesting depth, so depth 0 (or the range
-        // end) means "no enclosing delimiter" without any scan.
+        // end) means "no enclosing delimiter" without any scan. Note this
+        // fast path only fires for full-buffer cursors: a bounded view
+        // cursor carries the origin buffer's depths, which are nonzero even
+        // at the view's own top level, so it takes the scan below (bounded
+        // by the view's range end).
         if self.depth() == 0 {
             return None;
         }
@@ -1507,6 +1575,10 @@ impl FlatTokenCursor {
     /// deliberately walks from the raw cursor position so that a skipped
     /// invisible group right at the cursor counts as one element rather than
     /// being entered transparently.
+    ///
+    /// A delimited result allocates (the returned tree owns its view
+    /// stream); all current callers are cold recovery/lookahead paths, so
+    /// this has not been worth a by-parts return type.
     pub fn look_ahead_tree(&self, dist: usize) -> Option<TokenTree> {
         debug_assert!(dist >= 1);
         let entries = &self.buf.entries;
@@ -1562,7 +1634,10 @@ impl FlatTokenCursor {
             entry.token.kind.open_delim().is_some(),
             "current token is not a buffer-backed open delimiter"
         );
-        debug_assert_eq!(&entry.token, open_token);
+        // Compare kinds only: `Parser::bump` rewrites a dummy entry span to
+        // a fallback span for diagnostics, so the parser's current token can
+        // differ from the buffer entry in span while being the same token.
+        debug_assert_eq!(entry.token.kind, open_token.kind);
         let close_idx = self.buf.matches[open_idx as usize];
         debug_assert!(close_idx > open_idx);
         (FlatTokenSlice::new(Arc::clone(&self.buf), open_idx, close_idx + 1), close_idx)
@@ -1572,6 +1647,13 @@ impl FlatTokenCursor {
     /// consumes (or starts skipping from).
     pub fn position(&self) -> u32 {
         self.index
+    }
+
+    /// The full backing buffer of this cursor, for validation in tests. Not
+    /// part of the parsing API.
+    #[doc(hidden)]
+    pub fn raw_parts(&self) -> (&[FlatEntry], &[u32]) {
+        (&self.buf.entries, &self.buf.matches)
     }
 
     /// Moves the cursor forward to `index`, skipping everything in between.
@@ -1699,10 +1781,14 @@ mod size_asserts {
     // tidy-alphabetical-start
     static_assert_size!(AttrTokenStream, 8);
     static_assert_size!(AttrTokenTree, 32);
+    static_assert_size!(FlatEntry, 32);
+    static_assert_size!(FlatTokenCursor, 16);
+    static_assert_size!(FlatTokenSlice, 16);
     static_assert_size!(LazyAttrTokenStream, 8);
     static_assert_size!(LazyAttrTokenStreamInner, 64);
     static_assert_size!(Option<LazyAttrTokenStream>, 8); // must be small, used in many AST nodes
     static_assert_size!(TokenStream, 8);
+    static_assert_size!(TokenStreamInner, 24); // niches on the `Flat` box: eager streams pay no view overhead
     static_assert_size!(TokenTree, 32);
     // tidy-alphabetical-end
 }

@@ -1869,9 +1869,11 @@ pub(super) fn parser_from_cx(
 ) -> Parser<'_> {
     // Macro-invocation arguments usually arrive as a lazy view of the flat
     // token buffer; parse straight from it, unless doc comments require the
-    // desugaring pre-pass (rare).
+    // desugaring pre-pass (rare). The scan is O(arguments) per invocation,
+    // but so was the tree walk `desugar_doc_comments` did here before; the
+    // flat scan replaces it, not adds to it.
     if let Some(view) = tts.flat_view()
-        && !view.entries().iter().any(|e| matches!(e.token.kind, token::DocComment(..)))
+        && !view.entries().iter().any(|e| matches!(e.token().kind, token::DocComment(..)))
     {
         let cursor = FlatTokenCursor::from_view(view);
         return Parser::new_from_flat(psess, cursor, rustc_parse::MACRO_ARGUMENTS)

@@ -2388,6 +2388,40 @@ fn flat_round_trip() {
 }
 
 #[test]
+fn lexer_buffer_is_flatten_fixed_point() {
+    // The lexer emits the flat buffer directly, with its own depth and
+    // match-table bookkeeping; `FlatTokenCursor::new` derives the same
+    // invariants from a token tree via `FlatSink::splice_stream`. The
+    // lexer's buffer must be a fixed point of rebuild-then-reflatten:
+    // entry-for-entry equal (tokens, spans, spacings, depths) with an
+    // identical match table. `flat_round_trip` above compares only the
+    // rebuilt *trees*, which cannot see depth or match divergence.
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        for src in [
+            "",
+            "a b c",
+            "fn a(b: i32) { b.c((d, [e]), f{g: h}); }",
+            "/// doc\nfn f() {}",
+            "x >>= y << z >> w",
+            "a!{ b![ (c) ] }",
+            "{} () []",
+        ] {
+            let source_file = psess
+                .source_map()
+                .new_source_file(FileName::anon_source_code(src), src.to_string());
+            let lexed = crate::source_file_to_flat(&psess, source_file, None, StripTokens::Nothing)
+                .unwrap_or_else(|_| panic!("lexing failed for {src:?}"));
+            let reference = FlatTokenCursor::new(lexed.to_token_stream());
+            let (lexed_entries, lexed_matches) = lexed.raw_parts();
+            let (ref_entries, ref_matches) = reference.raw_parts();
+            assert_eq!(lexed_entries, ref_entries, "lexer entries diverged for {src:?}");
+            assert_eq!(lexed_matches, ref_matches, "lexer match table diverged for {src:?}");
+        }
+    })
+}
+
+#[test]
 fn flat_view_parses_group_ending_at_view_end() {
     // Regression: a bounded view cursor returns depth 0 past its range end,
     // so a `parse_token_tree` loop bounded on `depth()` would never

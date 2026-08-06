@@ -1783,56 +1783,55 @@ declare_lint_pass!(
 struct UnderMacro(bool);
 
 impl KeywordIdents {
+    /// Checks one macro token, tracking whether the preceding token was `$`
+    /// (so `$async` etc. are allowed) and reporting only non-raw idents.
+    /// Shared between the flat-buffer scan and the token-tree walk in
+    /// `check_tokens`, which must lint identically.
+    fn check_macro_token(
+        &mut self,
+        cx: &EarlyContext<'_>,
+        token: &ast::token::Token,
+        prev_dollar: &mut bool,
+    ) {
+        if let Some((ident, token::IdentIsRaw::No)) = token.ident() {
+            if !*prev_dollar {
+                self.check_ident_token(cx, UnderMacro(true), ident, "");
+            }
+        } else if let Some((ident, token::IdentIsRaw::No)) = token.lifetime() {
+            self.check_ident_token(cx, UnderMacro(true), ident.without_first_quote(), "'");
+        } else if token.kind == TokenKind::Dollar {
+            *prev_dollar = true;
+            return;
+        }
+        *prev_dollar = false;
+    }
+
     fn check_tokens(&mut self, cx: &EarlyContext<'_>, tokens: &TokenStream) {
         // A stream that is a lazy view of a flat token buffer can be checked
         // in place: every token (including nested group contents) is an
         // entry, and delimiter entries reset the `$` state exactly like the
-        // tree traversal below. This keeps the pre-expansion lint from
-        // materializing the tree of every macro invocation's arguments.
+        // `Delimited` arm of the tree walk below. This keeps the
+        // pre-expansion lint from materializing the tree of every macro
+        // invocation's arguments.
         if let Some(view) = tokens.flat_view() {
             let mut prev_dollar = false;
             for entry in view.entries() {
-                let token = &entry.token;
-                if let Some((ident, token::IdentIsRaw::No)) = token.ident() {
-                    if !prev_dollar {
-                        self.check_ident_token(cx, UnderMacro(true), ident, "");
-                    }
-                } else if let Some((ident, token::IdentIsRaw::No)) = token.lifetime() {
-                    self.check_ident_token(cx, UnderMacro(true), ident.without_first_quote(), "'");
-                } else if token.kind == TokenKind::Dollar {
-                    prev_dollar = true;
-                    continue;
-                }
-                prev_dollar = false;
+                self.check_macro_token(cx, entry.token(), &mut prev_dollar);
             }
             return;
         }
 
-        // Check if the preceding token is `$`, because we want to allow `$async`, etc.
         let mut prev_dollar = false;
         for tt in tokens.iter() {
             match tt {
-                // Only report non-raw idents.
                 TokenTree::Token(token, _) => {
-                    if let Some((ident, token::IdentIsRaw::No)) = token.ident() {
-                        if !prev_dollar {
-                            self.check_ident_token(cx, UnderMacro(true), ident, "");
-                        }
-                    } else if let Some((ident, token::IdentIsRaw::No)) = token.lifetime() {
-                        self.check_ident_token(
-                            cx,
-                            UnderMacro(true),
-                            ident.without_first_quote(),
-                            "'",
-                        );
-                    } else if token.kind == TokenKind::Dollar {
-                        prev_dollar = true;
-                        continue;
-                    }
+                    self.check_macro_token(cx, token, &mut prev_dollar);
                 }
-                TokenTree::Delimited(.., tts) => self.check_tokens(cx, tts),
+                TokenTree::Delimited(.., tts) => {
+                    self.check_tokens(cx, tts);
+                    prev_dollar = false;
+                }
             }
-            prev_dollar = false;
         }
     }
 

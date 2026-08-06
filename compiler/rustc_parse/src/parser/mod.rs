@@ -346,7 +346,9 @@ impl<'a> Parser<'a> {
         subparser_name: Option<&'static str>,
     ) -> Self {
         // A stream that is a lazy view of a flat buffer can be parsed in
-        // place; only eager streams need the flatten pass.
+        // place; only eager streams need the flatten pass. Callers that
+        // already hold a cursor (the lexer, mbe expansion) use
+        // `new_from_flat` directly and skip this dispatch.
         let cursor = match stream.flat_view() {
             Some(view) => FlatTokenCursor::from_view(view),
             None => FlatTokenCursor::new(stream),
@@ -1118,6 +1120,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Advance the parser by one token using provided token as the next one.
+    /// Advance to an injected token that does not come from the token
+    /// cursor (e.g. the second half of a broken compound token).
+    ///
+    /// Note: injected tokens must not be open delimiters. The token capture
+    /// machinery (`Parser::parse_token_tree_flat` via `current_group_slice`)
+    /// requires the current open delimiter to be backed by the buffer entry
+    /// just before the cursor position, and fails loudly otherwise.
     fn bump_with(&mut self, next: (Token, Spacing)) {
         self.inlined_bump_with(next)
     }
@@ -1384,8 +1393,8 @@ impl<'a> Parser<'a> {
             };
             let entries = slice.entries();
             let (open, close) = (entries.first().unwrap(), entries.last().unwrap());
-            let dspan = DelimSpan::from_pair(open.token.span, close.token.span);
-            let delim = open.token.kind.open_delim().unwrap();
+            let dspan = DelimSpan::from_pair(open.token().span, close.token().span);
+            let delim = open.token().kind.open_delim().unwrap();
             let inner = slice.inner_view();
             let tokens =
                 if eager { inner.to_token_stream() } else { TokenStream::from_flat_view(inner) };
