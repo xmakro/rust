@@ -6,7 +6,7 @@ use rustc_abi::Size;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
 use rustc_codegen_ssa::traits::{DebugInfoBuilderMethods, DebugInfoCodegenMethods};
 use rustc_middle::ty::{ExistentialTraitRef, Instance, Ty};
-use rustc_span::{BytePos, Pos, SourceFile, Span, Symbol};
+use rustc_span::{Pos, SourceFile, Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
 use crate::builder::Builder;
@@ -27,7 +27,7 @@ impl<'a, 'gcc, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
 
     fn dbg_create_lexical_block(
         &mut self,
-        _pos: BytePos,
+        _span: Span,
         _parent_scope: Self::DIScope,
     ) -> Self::DIScope {
     }
@@ -54,8 +54,7 @@ impl<'a, 'gcc, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         _inlined_at: Option<Self::DILocation>,
         span: Span,
     ) -> Self::DILocation {
-        let pos = span.lo();
-        let DebugLoc { file, line, col } = self.lookup_debug_loc(pos);
+        let DebugLoc { file, line, col } = self.lookup_debug_loc(span);
         match file.name {
             rustc_span::FileName::Real(ref name) => self.context.new_location(
                 name.path(rustc_span::RemapPathScopeComponents::DEBUGINFO).to_string_lossy(),
@@ -140,10 +139,11 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
     // Source of Origin: cg_llvm
-    pub fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
+    pub fn lookup_debug_loc(&self, span: Span) -> DebugLoc {
         // The line/column derived here end up in the object file's line tables, so they must
-        // come from the tracked lookup, which records the dependency that invalidates them.
-        let (file, line_index) = self.tcx.lookup_line_tracked(pos);
+        // come from the tracked lookup, which records the dependencies that invalidate them.
+        let pos = span.data_untracked().lo;
+        let (file, line_index) = self.tcx.lookup_line_tracked(span);
         let (line, col) = match line_index {
             Some(line_index) => {
                 let line_pos = file.lines()[line_index];

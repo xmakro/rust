@@ -214,7 +214,7 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         // replayed from a green cache (errors block cache finalization). Use the tracked
         // lookup anyway so this cannot silently go stale if the triple ever ends up in a
         // cached value or replayable diagnostic.
-        let (file, _line_index) = self.tcx.lookup_line_tracked(topmost.lo());
+        let (file, _line_index) = self.tcx.lookup_line_tracked(topmost);
         let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());
 
         use rustc_span::RemapPathScopeComponents;

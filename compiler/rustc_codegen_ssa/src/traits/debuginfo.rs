@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use rustc_abi::Size;
 use rustc_middle::ty::{ExistentialTraitRef, Instance, Ty};
-use rustc_span::{BytePos, SourceFile, Span, Symbol};
+use rustc_span::{SourceFile, Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
 use super::BackendTypes;
@@ -29,7 +29,7 @@ pub trait DebugInfoBuilderMethods<'tcx>: BackendTypes {
 
     fn dbg_create_lexical_block(
         &mut self,
-        pos: BytePos,
+        span: Span,
         parent_scope: Self::DIScope,
     ) -> Self::DIScope;
 

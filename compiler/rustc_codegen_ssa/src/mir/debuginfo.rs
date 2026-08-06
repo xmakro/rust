@@ -777,7 +777,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         bx.dbg_scope_fn(callee, callee_fn_abi, None)
                     })
             }
-            None => bx.dbg_create_lexical_block(scope_data.span.lo(), parent_scope.dbg_scope),
+            None => bx.dbg_create_lexical_block(scope_data.span, parent_scope.dbg_scope),
         };
 
         let inlined_at = scope_data.inlined.map(|(_, callsite_span)| {

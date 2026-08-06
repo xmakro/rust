@@ -18,7 +18,7 @@ use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
 use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TypeVisitableExt, Unnormalized};
 use rustc_session::Session;
 use rustc_session::config::{self, DebugInfo};
-use rustc_span::{BytePos, Pos, SourceFile, SourceFileHash, Span, StableSourceFileId, Symbol};
+use rustc_span::{Pos, SourceFile, SourceFileHash, Span, StableSourceFileId, Symbol};
 use rustc_target::callconv::FnAbi;
 use rustc_target::spec::DebuginfoKind;
 use smallvec::SmallVec;
@@ -135,7 +135,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let def_id = instance.def_id();
         let (containing_scope, is_method) = get_containing_scope(self, instance);
         let span = tcx.def_span(def_id);
-        let loc = self.lookup_debug_loc(span.lo());
+        let loc = self.lookup_debug_loc(span);
         let file_metadata = file_metadata(self, &loc.file);
 
         let function_type_metadata =
@@ -366,12 +366,8 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         }
     }
 
-    fn dbg_create_lexical_block(
-        &mut self,
-        pos: BytePos,
-        parent_scope: &'ll DIScope,
-    ) -> &'ll DIScope {
-        let loc = self.lookup_debug_loc(pos);
+    fn dbg_create_lexical_block(&mut self, span: Span, parent_scope: &'ll DIScope) -> &'ll DIScope {
+        let loc = self.lookup_debug_loc(span);
         let file_metadata = file_metadata(self, &loc.file);
         unsafe {
             llvm::LLVMDIBuilderCreateLexicalBlock(
@@ -406,7 +402,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let (line, col) = if span.is_dummy() && !self.sess().target.is_like_msvc {
             (0, 0)
         } else {
-            let DebugLoc { line, col, .. } = self.lookup_debug_loc(span.lo());
+            let DebugLoc { line, col, .. } = self.lookup_debug_loc(span);
             (line, col)
         };
 
@@ -431,7 +427,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         variable_kind: VariableKind,
         span: Span,
     ) -> &'ll DIVariable {
-        let loc = self.lookup_debug_loc(span.lo());
+        let loc = self.lookup_debug_loc(span);
         let file_metadata = file_metadata(self, &loc.file);
 
         let type_metadata = spanned_type_di_node(self, variable_type, span);
@@ -680,10 +676,11 @@ impl<'ll> CodegenCx<'ll, '_> {
     // FIXME(eddyb) rename this to better indicate it's a duplicate of
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
-    fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
+    fn lookup_debug_loc(&self, span: Span) -> DebugLoc {
         // The line/column derived here end up in the object file's line tables, so they must
-        // come from the tracked lookup, which records the dependency that invalidates them.
-        let (file, line_index) = self.tcx.lookup_line_tracked(pos);
+        // come from the tracked lookup, which records the dependencies that invalidate them.
+        let pos = span.data_untracked().lo;
+        let (file, line_index) = self.tcx.lookup_line_tracked(span);
         let (line, col) = match line_index {
             Some(line_index) => {
                 let line_pos = file.lines()[line_index];

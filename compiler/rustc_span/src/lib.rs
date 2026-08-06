@@ -2925,6 +2925,28 @@ impl StableHash for Span {
     }
 }
 
+/// A definition's span as returned by the `source_span` query, wrapped so that the query's
+/// result fingerprint covers everything observable from the span *except* its position:
+/// (file, length) instead of (file, offset, length).
+///
+/// `source_span` is the anchor that every consumer of a definition's relative spans depends
+/// on (see `SPAN_TRACK`). With the position excluded from its fingerprint, a definition that
+/// merely moves within its file, because text above it was edited, keeps a green anchor, so
+/// dependents that only *carry* its spans (typeck, MIR, ...) are not invalidated: their own
+/// relative-span fingerprints are position-independent, and reloaded spans re-anchor against
+/// the current session's `source_span` value on decode. Consumers that render the absolute
+/// position into a cached artifact (line numbers in `#[track_caller]`, debuginfo, coverage)
+/// must record an explicit `def_position` dependency instead; see
+/// `TyCtxt::lookup_line_tracked`.
+#[derive(Debug, Clone, Copy)]
+pub struct AnchorSpan(pub Span);
+
+impl StableHash for AnchorSpan {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        hcx.stable_hash_anchor_span(self.0.to_raw_span(), hasher)
+    }
+}
+
 /// Useful type to use with `Result<>` indicate that an error has already
 /// been reported to the user, so no need to continue checking.
 ///

@@ -26,7 +26,7 @@ fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
                 TaskDepsRef::EvalAlways | TaskDepsRef::Ignore | TaskDepsRef::Forbid => false,
             };
             if tracks_deps {
-                let _span = icx.tcx.source_span(def_id);
+                let _span = icx.tcx.source_span(def_id).0;
                 // Sanity check: relative span's parent must be an absolute span.
                 debug_assert_eq!(_span.data_untracked().parent, None);
             }
