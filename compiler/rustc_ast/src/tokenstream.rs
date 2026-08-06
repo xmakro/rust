@@ -1045,13 +1045,13 @@ pub struct FlatBuffer {
 /// replay) is one reference-count bump.
 #[derive(Clone)]
 pub struct FlatTokenCursor {
-    pub buf: Arc<FlatBuffer>,
-    /// Index of the next entry to consume.
-    pub index: u32,
+    buf: Arc<FlatBuffer>,
+    /// Index of the next entry to consume. Invariant: `index <= end`.
+    index: u32,
     /// Exclusive end of the entry range this cursor may consume. Equal to
     /// `entries.len()` except for cursors over a sub-range of a buffer
     /// (macro-invocation arguments), which yield `Eof` at the range end.
-    pub end: u32,
+    end: u32,
 }
 
 // Manual impl: the derived one would print the whole underlying buffer
@@ -1075,9 +1075,10 @@ impl fmt::Debug for FlatTokenCursor {
 /// is the flat analog of an `Arc`-shared subtree.
 #[derive(Clone)]
 pub struct FlatTokenSlice {
-    pub buf: Arc<FlatBuffer>,
-    pub start: u32,
-    pub end: u32,
+    buf: Arc<FlatBuffer>,
+    /// Invariant: `start <= end <= buf.entries.len()`.
+    start: u32,
+    end: u32,
 }
 
 // Manual impl: the derived one would print the whole underlying buffer
@@ -1093,12 +1094,25 @@ impl fmt::Debug for FlatTokenSlice {
 }
 
 impl FlatTokenSlice {
+    fn new(buf: Arc<FlatBuffer>, start: u32, end: u32) -> FlatTokenSlice {
+        debug_assert!(start <= end && end as usize <= buf.entries.len());
+        FlatTokenSlice { buf, start, end }
+    }
+
     pub fn len(&self) -> usize {
         (self.end - self.start) as usize
     }
 
     pub fn entries(&self) -> &[FlatEntry] {
         &self.buf.entries[self.start as usize..self.end as usize]
+    }
+
+    /// The view of this slice's contents, without the open and close
+    /// delimiter entries. Requires the slice to be a whole delimited group.
+    pub fn inner_view(&self) -> FlatTokenSlice {
+        debug_assert!(self.buf.entries[self.start as usize].token.kind.open_delim().is_some());
+        debug_assert!(self.len() >= 2);
+        FlatTokenSlice::new(Arc::clone(&self.buf), self.start + 1, self.end - 1)
     }
 
     /// Rebuilds this slice as a token tree. Requires the slice to be a whole
@@ -1153,12 +1167,23 @@ impl FlatTt {
 /// building a `TokenStream`. Delimited groups are emitted as an open entry,
 /// contents, and a close entry (patching the match table); whole slices and
 /// token trees can be spliced in with their depths and match indices rebased.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct FlatSink {
-    pub entries: Vec<FlatEntry>,
-    pub matches: Vec<u32>,
+    entries: Vec<FlatEntry>,
+    matches: Vec<u32>,
     /// Entry indices of currently open delimiters.
     open_stack: Vec<u32>,
+}
+
+// Manual impl: a sink mid-transcription holds an entire expansion's tokens;
+// print a summary instead of dumping them.
+impl fmt::Debug for FlatSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatSink")
+            .field("entries", &self.entries.len())
+            .field("depth", &self.open_stack.len())
+            .finish()
+    }
 }
 
 impl FlatSink {
@@ -1235,6 +1260,15 @@ impl FlatSink {
             if m == 0 { 0 } else { (m as i64 + idx_delta) as u32 }
         }));
         (dst_start, self.entries.len())
+    }
+
+    /// Rewrites the spans of the boundary (first and last) entries of the
+    /// range returned by [`FlatSink::splice_slice`]. Used by transcription to
+    /// re-attribute a spliced group's delimiters to the metavariable span.
+    pub fn set_boundary_spans(&mut self, (start, end): (usize, usize), open: Span, close: Span) {
+        debug_assert!(start < end && end == self.entries.len());
+        self.entries[start].token.span = open;
+        self.entries[end - 1].token.span = close;
     }
 
     /// Appends the flattened form of a token stream, exactly as
@@ -1431,23 +1465,120 @@ impl FlatTokenCursor {
         None
     }
 
-    /// The entry index of the next entry (skipping skipped invisible
-    /// delimiters), i.e. the entry that the next call to `inlined_next`
-    /// would yield. Returns the range end at the end of the stream.
-    pub fn next_entry_index(&self) -> usize {
+    /// The first token after the close delimiter of the innermost delimited
+    /// sequence containing the current position, provided it is a normal
+    /// (non-delimiter) token. Nested groups are stepped over via the match
+    /// table.
+    ///
+    /// This must walk from the raw cursor position: a skipped invisible
+    /// *open* right at the cursor still has its close ahead of us, so
+    /// filtering it out (as consumption does) would pair the walk one
+    /// nesting level too deep.
+    pub fn token_after_enclosing_close(&self) -> Option<Token> {
+        let entries = &self.buf.entries;
+        let end = self.end as usize;
         let mut i = self.index as usize;
-        while let Some(entry) = self.buf.entries.get(i).filter(|_| i < self.end as usize) {
-            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
-                && origin.skip()
-            {
+        while i < end {
+            let entry = &entries[i];
+            if entry.token.kind.open_delim().is_some() {
+                let close_idx = self.buf.matches[i] as usize;
+                debug_assert!(close_idx > i);
+                i = close_idx + 1;
+            } else if entry.token.kind.close_delim().is_some() {
+                let after = entries.get(i + 1).filter(|_| i + 1 < end)?;
+                // Match only normal tokens, like the tree-level lookahead of
+                // the old cursor (the following tree had to be a `Token`).
+                return (after.token.kind.open_delim().is_none()
+                    && after.token.kind.close_delim().is_none())
+                .then_some(after.token);
+            } else {
                 i += 1;
-                continue;
             }
-            break;
         }
-        i
+        None
     }
 
+    /// The `dist`-th (one-based) upcoming whole element — token or delimited
+    /// group, including non-consumed invisible ones — at the current nesting
+    /// level, without consuming anything. A delimited group is returned with
+    /// a lazy view of its contents. Returns `None` if the current level ends
+    /// before `dist` elements, matching tree-level lookahead on the old
+    /// cursor. Like [`FlatTokenCursor::token_after_enclosing_close`], this
+    /// deliberately walks from the raw cursor position so that a skipped
+    /// invisible group right at the cursor counts as one element rather than
+    /// being entered transparently.
+    pub fn look_ahead_tree(&self, dist: usize) -> Option<TokenTree> {
+        debug_assert!(dist >= 1);
+        let entries = &self.buf.entries;
+        let end = self.end as usize;
+        let mut i = self.index as usize;
+        let mut remaining = dist;
+        loop {
+            let entry = entries.get(i).filter(|_| i < end)?;
+            let is_open = entry.token.kind.open_delim().is_some();
+            if !is_open && entry.token.kind.close_delim().is_some() {
+                // End of the current nesting level.
+                return None;
+            }
+            let close_idx = if is_open {
+                let close_idx = self.buf.matches[i] as usize;
+                debug_assert!(close_idx > i && close_idx < end);
+                close_idx
+            } else {
+                i
+            };
+            if remaining <= 1 {
+                return Some(if is_open {
+                    let close = &entries[close_idx];
+                    TokenTree::Delimited(
+                        DelimSpan::from_pair(entry.token.span, close.token.span),
+                        DelimSpacing::new(entry.spacing, close.spacing),
+                        entry.token.kind.open_delim().unwrap(),
+                        TokenStream::from_flat_view(FlatTokenSlice::new(
+                            Arc::clone(&self.buf),
+                            i as u32 + 1,
+                            close_idx as u32,
+                        )),
+                    )
+                } else {
+                    TokenTree::Token(entry.token, entry.spacing)
+                });
+            }
+            remaining -= 1;
+            i = close_idx + 1;
+        }
+    }
+
+    /// The entry index of the whole delimited group whose open-delimiter
+    /// entry produced `open_token` (the parser's current token), returned as
+    /// a slice of the buffer plus the entry index of its close delimiter.
+    /// Panics if the current token is not backed by an open-delimiter entry,
+    /// e.g. if it was injected via `bump_with`: capturing would silently
+    /// cover the wrong range.
+    pub fn current_group_slice(&self, open_token: &Token) -> (FlatTokenSlice, u32) {
+        let open_idx = self.index.checked_sub(1).expect("no consumed entry to capture");
+        let entry = &self.buf.entries[open_idx as usize];
+        assert!(
+            entry.token.kind.open_delim().is_some(),
+            "current token is not a buffer-backed open delimiter"
+        );
+        debug_assert_eq!(&entry.token, open_token);
+        let close_idx = self.buf.matches[open_idx as usize];
+        debug_assert!(close_idx > open_idx);
+        (FlatTokenSlice::new(Arc::clone(&self.buf), open_idx, close_idx + 1), close_idx)
+    }
+
+    /// The current entry index: the entry the next `inlined_next` call
+    /// consumes (or starts skipping from).
+    pub fn position(&self) -> u32 {
+        self.index
+    }
+
+    /// Moves the cursor forward to `index`, skipping everything in between.
+    pub fn reposition_forward(&mut self, index: u32) {
+        debug_assert!(index >= self.index && index <= self.end);
+        self.index = index;
+    }
 }
 
 /// Whether every open-delimiter entry has a patched match index pointing at

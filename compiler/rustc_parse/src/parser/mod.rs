@@ -17,7 +17,6 @@ mod ty;
 pub mod asm;
 pub mod cfg_select;
 
-use std::sync::Arc;
 use std::{fmt, mem, slice};
 
 use attr_wrapper::{AttrWrapper, UsePreAttrPos};
@@ -31,8 +30,8 @@ use rustc_ast::token::{
     self, IdentIsRaw, InvisibleOrigin, MetaVarKind, NtExprKind, NtPatKind, Token, TokenKind,
 };
 use rustc_ast::tokenstream::{
-    DelimSpacing, DelimSpan, FlatTokenCursor, FlatTokenSlice, FlatTt, ParserRange,
-    ParserReplacement, Spacing, TokenStream, TokenTree, WithTokens,
+    DelimSpan, FlatTokenCursor, FlatTt, ParserRange, ParserReplacement, Spacing, TokenStream,
+    TokenTree, WithTokens,
 };
 use rustc_ast::util::case::Case;
 use rustc_ast::util::classify;
@@ -512,40 +511,14 @@ impl<'a> Parser<'a> {
     }
 
     // Check the first token after the delimiter that closes the current
-    // delimited sequence. (Panics if used in the outermost token stream, which
-    // has no delimiters.) It uses a clone of the relevant tree cursor to skip
-    // past the entire `TokenTree::Delimited` in a single step, avoiding the
-    // need for unbounded token lookahead.
+    // delimited sequence (false in the outermost token stream, which has no
+    // delimiters). Nested groups are stepped over via the match table, so
+    // this needs no unbounded token lookahead.
     //
     // Primarily used when `self.token` matches `OpenInvisible(_))`, to look
     // ahead through the current metavar expansion.
     fn check_noexpect_past_close_delim(&self, tok: &TokenKind) -> bool {
-        // Find the close delimiter of the current delimited sequence by
-        // walking forward at the current depth, then look at the token just
-        // after it, provided it is a normal token (matching the tree-level
-        // behavior of the old cursor, which only matched `TokenTree::Token`).
-        let entries = &self.token_cursor.buf.entries;
-        let end = self.token_cursor.end as usize;
-        let mut i = self.token_cursor.next_entry_index();
-        let mut rel = 0usize;
-        while let Some(entry) = entries.get(i).filter(|_| i < end) {
-            if entry.token.kind.open_delim().is_some() {
-                rel += 1;
-            } else if entry.token.kind.close_delim().is_some() {
-                if rel == 0 {
-                    return matches!(
-                        entries.get(i + 1).filter(|_| i + 1 < end),
-                        Some(entry)
-                            if entry.token.kind.open_delim().is_none()
-                                && entry.token.kind.close_delim().is_none()
-                                && &entry.token.kind == tok
-                    );
-                }
-                rel -= 1;
-            }
-            i += 1;
-        }
-        false
+        self.token_cursor.token_after_enclosing_close().is_some_and(|after| after.kind == *tok)
     }
 
     /// Consumes a token 'tok' if it exists. Returns whether the given token was present.
@@ -1203,39 +1176,10 @@ impl<'a> Parser<'a> {
     ) -> Option<R> {
         assert_ne!(dist, 0);
         // Walk whole elements (tokens or delimited groups, including
-        // invisible ones) at the current nesting level. For a delimited
-        // group the looker receives a `Delimited` with an *empty* inner
-        // stream: current callers only inspect the delimiter and token
-        // kinds. Returns `None` when the current level ends first.
-        let entries = &self.token_cursor.buf.entries;
-        let matches = &self.token_cursor.buf.matches;
-        let end = self.token_cursor.end as usize;
-        let mut i = self.token_cursor.next_entry_index();
-        let mut remaining = dist - 1;
-        loop {
-            let entry = entries.get(i).filter(|_| i < end)?;
-            let is_open = entry.token.kind.open_delim().is_some();
-            if !is_open && entry.token.kind.close_delim().is_some() {
-                // End of the current nesting level.
-                return None;
-            }
-            if remaining == 0 {
-                return Some(if is_open {
-                    let close = &entries[matches[i] as usize];
-                    let delim = entry.token.kind.open_delim().unwrap();
-                    looker(&TokenTree::Delimited(
-                        DelimSpan::from_pair(entry.token.span, close.token.span),
-                        DelimSpacing::new(entry.spacing, close.spacing),
-                        delim,
-                        TokenStream::default(),
-                    ))
-                } else {
-                    looker(&TokenTree::Token(entry.token, entry.spacing))
-                });
-            }
-            remaining -= 1;
-            i = if is_open { matches[i] as usize + 1 } else { i + 1 };
-        }
+        // invisible ones) at the current nesting level; a delimited group
+        // carries a lazy view of its contents. Returns `None` when the
+        // current level ends first.
+        self.token_cursor.look_ahead_tree(dist).map(|tree| looker(&tree))
     }
 
     /// Returns whether any of the given keywords are `dist` tokens ahead of the current one.
@@ -1442,11 +1386,7 @@ impl<'a> Parser<'a> {
             let (open, close) = (entries.first().unwrap(), entries.last().unwrap());
             let dspan = DelimSpan::from_pair(open.token.span, close.token.span);
             let delim = open.token.kind.open_delim().unwrap();
-            let inner = FlatTokenSlice {
-                buf: Arc::clone(&slice.buf),
-                start: slice.start + 1,
-                end: slice.end - 1,
-            };
+            let inner = slice.inner_view();
             let tokens =
                 if eager { inner.to_token_stream() } else { TokenStream::from_flat_view(inner) };
             DelimArgs { dspan, delim, tokens }
@@ -1464,25 +1404,16 @@ impl<'a> Parser<'a> {
     pub fn parse_token_tree_flat(&mut self) -> FlatTt {
         if self.token.kind.open_delim().is_some() {
             // The current token is the open delimiter, so the entry that
-            // produced it is the one just before the cursor position.
-            let open_idx = self.token_cursor.index as usize - 1;
-            let close_idx = self.token_cursor.buf.matches[open_idx] as usize;
-            debug_assert_eq!(self.token_cursor.buf.entries[open_idx].token, self.token);
-
-            // The delimited group we are currently within is what we are
-            // going to return.
-            let slice = FlatTokenSlice {
-                buf: Arc::clone(&self.token_cursor.buf),
-                start: open_idx as u32,
-                end: close_idx as u32 + 1,
-            };
+            // produced it is the one just before the cursor position; the
+            // delimited group it opens is what we are going to return.
+            let (slice, close_idx) = self.token_cursor.current_group_slice(&self.token);
 
             if let Capturing::No = self.capture_state.capturing {
                 // We are not capturing tokens, so skip to the end of the
                 // delimited sequence. This is a perf win when dealing with
                 // declarative macros that pass large `tt` fragments through
                 // multiple rules, as seen in the uom-0.37.0 crate.
-                self.token_cursor.index = close_idx as u32;
+                self.token_cursor.reposition_forward(close_idx);
                 self.bump();
             } else {
                 loop {
@@ -1494,7 +1425,7 @@ impl<'a> Parser<'a> {
                     // this group, since past the range end the origin
                     // buffer's depths are no longer visible.
                     self.bump();
-                    if self.token_cursor.index as usize > close_idx {
+                    if self.token_cursor.position() > close_idx {
                         break;
                     }
                 }

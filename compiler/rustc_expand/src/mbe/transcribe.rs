@@ -764,9 +764,8 @@ fn transcribe_flat_tt(tscx: &mut TranscrCtx<'_, '_>, metavar_span: Span, ftt: &F
                 mspans.insert(open, metavar_span) && mspans.insert(close, metavar_span)
             });
             // Splice the group and rewrite the delimiter entries' spans.
-            let (start, end) = tscx.sink.splice_slice(slice);
-            tscx.sink.entries[start].token.span = open;
-            tscx.sink.entries[end - 1].token.span = close;
+            let range = tscx.sink.splice_slice(slice);
+            tscx.sink.set_boundary_spans(range, open, close);
         }
     }
 }
