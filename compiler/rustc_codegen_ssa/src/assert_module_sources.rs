@@ -112,7 +112,9 @@ impl<'tcx> AssertModuleSource<'tcx> {
 
             if !self.check_config(cfg) {
                 debug!("check_attr: config does not match, ignoring attr");
-                return;
+                // Only this attribute is inapplicable; the item's remaining
+                // `rustc_partition_*` attributes must still be checked.
+                continue;
             }
 
             let user_path = module.as_str();
