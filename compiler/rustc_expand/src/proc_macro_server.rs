@@ -745,6 +745,11 @@ impl server::Server for Rustc<'_, '_> {
         span.shrink_to_hi()
     }
 
+    // The untracked lookups below are sound only because macro expansion re-executes every
+    // session and its output feeds content-hashed tokens downstream. Any future caching of
+    // expansion output across sessions must record a line-table dependency
+    // (`def_lines_hash`) for these observations, or the cached line/column values
+    // go stale when an edit moves line breaks without changing byte offsets.
     fn span_line(&mut self, span: Self::Span) -> usize {
         let loc = self.psess().source_map().lookup_char_pos(span.lo());
         loc.line

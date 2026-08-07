@@ -440,6 +440,9 @@ fn not_testable_error(cx: &ExtCtxt<'_>, is_bench: bool, attr_sp: Span, item: Opt
 
 fn get_location_info(cx: &ExtCtxt<'_>, fn_: &ast::Fn) -> (Symbol, usize, usize, usize, usize) {
     let span = fn_.ident.span;
+    // Untracked lookup, sound only because test-harness expansion re-executes every session
+    // and the emitted literals feed content-hashed tokens; see `expand_line` in
+    // `source_util.rs`.
     let (source_file, lo_line, lo_col, hi_line, hi_col) =
         cx.sess.source_map().span_to_location_info(span);
 

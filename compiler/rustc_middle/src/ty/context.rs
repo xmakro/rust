@@ -43,7 +43,7 @@ use rustc_session::config::CrateType;
 use rustc_session::cstore::{CrateStoreDyn, Untracked};
 use rustc_session::lint::Lint;
 use rustc_span::def_id::{CRATE_DEF_ID, DefPathHash, StableCrateId};
-use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Ident, SourceFile, Span, Symbol, kw, sym};
 use rustc_type_ir::TyKind::*;
 pub use rustc_type_ir::lift::Lift;
 use rustc_type_ir::{CollectAndApply, WithCachedTypeInfo, elaborate, search_graph};
@@ -1539,6 +1539,90 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.target.llvm_target.starts_with("nvptx")
     }
 
+    /// Records a dependency on `def_lines_hash(def)`, which covers the rendered line and
+    /// column values of every position within `def`'s span extent. Line/column data stored
+    /// into a query result or codegen artifact (`#[track_caller]` locations, debuginfo line
+    /// tables, coverage mappings, pretty-printed paths in cached diagnostics) must be
+    /// anchored this way, because span fingerprints alone do not cover line structure (see
+    /// `stable_hash_span`): an edit that moves a line break without changing byte offsets
+    /// re-fingerprints nothing, and only this dependency invalidates the derived data.
+    ///
+    /// The dependency covers line indices and character columns (the line-start, multibyte
+    /// and normalization tables), but not *display* columns: those additionally depend on the
+    /// rendered line's text (`char_width`), which no fingerprint covers. An edit replacing a
+    /// tab with a space, say, changes display columns without invalidating anything; the old
+    /// line/column span hashing had the same limitation for byte-identical layouts.
+    pub fn track_def_lines(self, def: DefId) {
+        // The dependency only exists to drive invalidation, so skip the query entirely when
+        // there is no dep graph to record it in.
+        if self.dep_graph.is_fully_enabled() {
+            // Coalesce typeck children (closures, coroutines, inline consts) into their
+            // root's node: the root's extent contains theirs, and they codegen into the
+            // root's CGU anyway, so per-child nodes would add count without precision.
+            let _ = self.def_lines_hash(self.typeck_root_def_id(def));
+        }
+    }
+
+    /// Returns the source file containing the span's start and the 0-based index of its
+    /// line (`None` if the file has no lines), recording a `def_lines_hash` dependency for
+    /// the span's parent definition; see [`Self::track_def_lines`]. A parentless span
+    /// records no dependency here: its position is pinned by its own absolute fingerprint,
+    /// and the caller must anchor the *line* rendering by also calling `track_def_lines`
+    /// for the definition whose extent covers the rendered position (codegen does this once
+    /// per function; definition-level renderings pass the definition itself).
+    pub fn lookup_line_tracked(self, span: Span) -> (Arc<SourceFile>, Option<usize>) {
+        let data = span.data_untracked();
+        let file = self.sess.source_map().lookup_source_file(data.lo);
+        let line = file.lookup_line(file.relative_position(data.lo));
+        if let Some(parent) = data.parent {
+            self.track_def_lines(parent.to_def_id());
+        }
+        (file, line)
+    }
+
+    /// Like [`Self::lookup_line_tracked`], but for consumers that derive line/column data
+    /// for positions throughout a definition's extent (coverage mappings): records the
+    /// `def_lines_hash` dependency for `anchor` and returns the file containing `pos`.
+    pub fn source_file_tracked(self, pos: rustc_span::BytePos, anchor: DefId) -> Arc<SourceFile> {
+        self.track_def_lines(anchor);
+        self.sess.source_map().lookup_source_file(pos)
+    }
+
+    /// Like [`SourceMap::span_to_diagnostic_string`], but records the line-anchoring
+    /// dependency for the rendered positions: the span's parent definition, or `anchor`
+    /// (the definition whose extent the span renders, e.g. the closure being printed) when
+    /// the span is parentless. Required whenever the rendered string can outlive the
+    /// session: pretty-printed types (`{closure@file:line:col}`) become diagnostic
+    /// arguments, and warnings emitted inside queries are cached and replayed verbatim
+    /// when the query is green, so an embedded line/column must be invalidated like any
+    /// other cached line observation.
+    pub fn span_to_diagnostic_string_tracked(self, span: Span, anchor: DefId) -> String {
+        self.track_span_line_tables(span, anchor);
+        self.sess.source_map().span_to_diagnostic_string(span)
+    }
+
+    /// See [`Self::span_to_diagnostic_string_tracked`].
+    pub fn span_to_short_string_tracked(
+        self,
+        span: Span,
+        anchor: DefId,
+        display_scope: rustc_span::RemapPathScopeComponents,
+    ) -> String {
+        self.track_span_line_tables(span, anchor);
+        self.sess.source_map().span_to_short_string(span, display_scope)
+    }
+
+    fn track_span_line_tables(self, span: Span, anchor: DefId) {
+        // Mirror the conditions under which `span_to_location_info` renders no location.
+        if self.sess.source_map().files().is_empty() || span.is_dummy() {
+            return;
+        }
+        match span.data_untracked().parent {
+            Some(parent) => self.track_def_lines(parent.to_def_id()),
+            None => self.track_def_lines(anchor),
+        }
+    }
+
     /// Returns `&'static core::panic::Location<'static>`.
     pub fn caller_location_ty(self) -> Ty<'tcx> {
         Ty::new_imm_ref(
@@ -2824,5 +2908,40 @@ pub fn provide(providers: &mut Providers) {
         // We want to check if the panic handler was defined in this crate
         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
     };
+    providers.def_lines_hash = def_lines_hash;
     providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
+}
+
+fn def_lines_hash(tcx: TyCtxt<'_>, def: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
+    use rustc_data_structures::fingerprint::Fingerprint;
+    // For a foreign `def`, `def_span` decodes the span from metadata, which imports the
+    // containing file into the source map. That matters when this query is forced during
+    // try-mark-green with a key recovered from a previous session's dep node, before any
+    // other decode has imported the file (debuginfo for locally instantiated upstream code
+    // records these nodes for upstream definitions). A deleted definition never gets here:
+    // its `DefId` cannot be recovered from the dep node, which marks dependents red.
+    let span = tcx.def_span(def);
+    if span.is_dummy() || tcx.sess.source_map().files().is_empty() {
+        // Synthesized definitions have no rendered positions; the constant still differs
+        // from every real extent hash, so a definition gaining a real span invalidates.
+        return Fingerprint::ZERO;
+    }
+    let data = span.data_untracked();
+    let file = tcx.sess.source_map().lookup_source_file(data.lo);
+    if !file.contains(data.lo) || file.is_empty() {
+        return Fingerprint::ZERO;
+    }
+    let lo = file.relative_position(data.lo);
+    // A pathological span reaching past the file renders like one clamped to it.
+    let hi = if data.hi > file.end_position() {
+        file.normalized_source_len
+    } else {
+        file.relative_position(data.hi)
+    };
+    // The file id pins the rendered filename and catches a definition moving between
+    // files without changing its extent-relative line structure.
+    let mut hasher = rustc_data_structures::stable_hash::StableHasher::new();
+    std::hash::Hash::hash(&file.stable_id, &mut hasher);
+    std::hash::Hash::hash(&file.line_extent_hash(lo, hi), &mut hasher);
+    hasher.finish()
 }

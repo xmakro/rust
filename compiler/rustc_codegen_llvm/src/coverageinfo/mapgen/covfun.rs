@@ -28,7 +28,7 @@ use crate::llvm;
 #[derive(Debug)]
 pub(crate) struct CovfunRecord<'tcx> {
     /// Not used directly, but helpful in debug messages.
-    _instance: Instance<'tcx>,
+    instance: Instance<'tcx>,
 
     mangled_function_name: &'tcx str,
     source_hash: u64,
@@ -58,7 +58,7 @@ pub(crate) fn prepare_covfun_record<'tcx>(
     let expressions = prepare_expressions(ids_info);
 
     let mut covfun = CovfunRecord {
-        _instance: instance,
+        instance,
         mangled_function_name: tcx.symbol_name(instance).name,
         source_hash: if is_used { fn_cov_info.function_source_hash } else { 0 },
         is_used,
@@ -134,7 +134,10 @@ fn fill_region_tables<'tcx>(
         debug_assert!(false, "function has no mappings: {covfun:?}");
         return;
     };
-    let source_file = source_map.lookup_source_file(first_span.lo());
+    // Coverage mappings store line/column coordinates for positions throughout this
+    // function's extent, so anchor them to the function's `def_lines_hash`; see
+    // `TyCtxt::track_def_lines`.
+    let source_file = tcx.source_file_tracked(first_span.lo(), covfun.instance.def_id());
 
     let local_file_id = covfun.virtual_file_mapping.push_file(&source_file);
 
@@ -183,7 +186,7 @@ pub(crate) fn generate_covfun_record<'tcx>(
     covfun: &CovfunRecord<'tcx>,
 ) {
     let &CovfunRecord {
-        _instance,
+        instance: _,
         mangled_function_name,
         source_hash,
         is_used,

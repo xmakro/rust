@@ -40,11 +40,9 @@ use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use tracing::debug;
 pub use unicode_width::UNICODE_VERSION;
 
-mod caching_source_map_view;
 pub mod source_map;
 use source_map::{SourceMap, SourceMapInputs};
 
-pub use self::caching_source_map_view::CachingSourceMapView;
 use crate::fatal_error::FatalError;
 
 pub mod edition;
@@ -78,10 +76,11 @@ use std::io::{self, Read};
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{fmt, iter};
 
 use md5::{Digest, Md5};
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::stable_hash::{StableHash, StableHasher};
 use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock};
 use rustc_data_structures::unord::UnordMap;
@@ -1946,6 +1945,9 @@ pub struct SourceFile {
     pub multibyte_chars: Vec<MultiByteChar>,
     /// Locations of characters removed during normalization.
     pub normalized_pos: Vec<NormalizedPos>,
+    /// Cached hashes of aligned runs of line lengths, built lazily in one pass for
+    /// [`SourceFile::line_extent_hash`].
+    pub line_length_block_hashes: OnceLock<Vec<Fingerprint>>,
     /// A hash of the filename & crate-id, used for uniquely identifying source
     /// files within the crate graph and for speeding up hashing in incremental
     /// compilation.
@@ -1968,6 +1970,9 @@ impl Clone for SourceFile {
             lines: self.lines.clone(),
             multibyte_chars: self.multibyte_chars.clone(),
             normalized_pos: self.normalized_pos.clone(),
+            // Start empty: a clone site that adjusts the tables must not inherit the
+            // originals' hashes.
+            line_length_block_hashes: OnceLock::new(),
             stable_id: self.stable_id,
             cnum: self.cnum,
         }
@@ -1983,8 +1988,8 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         self.normalized_source_len.encode(s);
         self.unnormalized_source_len.encode(s);
 
-        // We are always in `Lines` form by the time we reach here.
-        assert!(self.lines.read().is_lines());
+        // The line table may still be in its compressed on-disk form: span hashing works on
+        // offsets and never materializes it. `lines()` does.
         let lines = self.lines();
         // Store the length.
         s.emit_u32(lines.len() as u32);
@@ -2088,6 +2093,7 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
             lines: FreezeLock::new(lines),
             multibyte_chars,
             normalized_pos,
+            line_length_block_hashes: OnceLock::new(),
             stable_id,
             cnum,
         }
@@ -2150,6 +2156,10 @@ impl StableSourceFileId {
     }
 }
 
+/// Number of line lengths covered by one cached block in
+/// [`SourceFile::line_extent_hash`]; bounds the work at extent edges.
+const LINE_LENGTH_BLOCK: usize = 64;
+
 impl SourceFile {
     const MAX_FILE_SIZE: u32 = u32::MAX - 1;
 
@@ -2196,6 +2206,7 @@ impl SourceFile {
             lines: FreezeLock::frozen(SourceFileLines::Lines(lines)),
             multibyte_chars,
             normalized_pos,
+            line_length_block_hashes: OnceLock::new(),
             stable_id,
             cnum: LOCAL_CRATE,
         })
@@ -2271,6 +2282,103 @@ impl SourceFile {
             }
             unreachable!()
         })
+    }
+
+    /// Length in bytes of line `i`: the distance to the next line start, or to the end of
+    /// the file for the last line. Line lengths are invariant under edits elsewhere in the
+    /// file that only shift byte offsets, which makes them the unit of extent hashing.
+    fn line_length(&self, i: usize) -> u32 {
+        let lines = self.lines();
+        match lines.get(i + 1) {
+            Some(next) => next.0 - lines[i].0,
+            None => self.normalized_source_len.0 - lines[i].0,
+        }
+    }
+
+    /// Cached hash of the `block`th full run of [`LINE_LENGTH_BLOCK`] line lengths. All
+    /// blocks are computed in one pass on first use; only full blocks are cached, the
+    /// extent edges hash their lengths directly.
+    fn line_length_block_hash(&self, block: usize) -> Fingerprint {
+        let hashes = self.line_length_block_hashes.get_or_init(|| {
+            let n = self.lines().len();
+            let mut out = Vec::with_capacity(n / LINE_LENGTH_BLOCK);
+            for block in 0..n / LINE_LENGTH_BLOCK {
+                let mut hasher = StableHasher::new();
+                for i in block * LINE_LENGTH_BLOCK..(block + 1) * LINE_LENGTH_BLOCK {
+                    Hash::hash(&self.line_length(i), &mut hasher);
+                }
+                out.push(hasher.finish());
+            }
+            out
+        });
+        hashes[block]
+    }
+
+    /// Hash of everything that determines rendered line/column values for positions in
+    /// `[lo, hi]`: the value backing the `def_lines_hash` query.
+    ///
+    /// `line(pos)` is `line(lo)` plus the number of line starts in `(lo, pos]`, and
+    /// `col(pos)` counts from the last line start at or before `pos`, so the rendered
+    /// values for every position in the extent are fully determined by the line index of
+    /// `lo` together with the lengths of the extent's lines. The character-table sections
+    /// are widened on the left to `lo`'s line start: character columns on the first line
+    /// also depend on multibyte characters between the line start and `lo` (a definition
+    /// may begin mid-line, after a sibling). Lengths and relative table entries are
+    /// invariant under edits before the extent that only shift byte offsets, while edits
+    /// that add or remove line breaks before it change the hashed line index of `lo`.
+    ///
+    /// Runs of [`LINE_LENGTH_BLOCK`] lengths aligned to the file's line index come from a
+    /// per-file cache built in one pass, so large extents cost their edges plus one cached
+    /// fingerprint per covered block.
+    pub fn line_extent_hash(&self, lo: RelativeBytePos, hi: RelativeBytePos) -> Fingerprint {
+        let mut hasher = StableHasher::new();
+        let anchor_line = self.lookup_line(lo);
+        Hash::hash(&anchor_line, &mut hasher);
+        let extent_start = match anchor_line {
+            Some(line) => self.lines()[line],
+            None => RelativeBytePos(0),
+        };
+        if let Some(a) = anchor_line {
+            let e = self.lookup_line(hi).unwrap_or(a).max(a);
+            // The count first, so sections cannot alias each other.
+            Hash::hash(&(e - a), &mut hasher);
+            let mut i = a;
+            while i < e {
+                if i % LINE_LENGTH_BLOCK == 0 && i + LINE_LENGTH_BLOCK <= e {
+                    Hash::hash(&self.line_length_block_hash(i / LINE_LENGTH_BLOCK), &mut hasher);
+                    i += LINE_LENGTH_BLOCK;
+                } else {
+                    Hash::hash(&self.line_length(i), &mut hasher);
+                    i += 1;
+                }
+            }
+        }
+        // The character tables are sorted by position, so the extent is a subslice;
+        // binary-search its bounds rather than scanning. These tables are almost always
+        // empty or tiny.
+        fn in_range<T>(
+            table: &[T],
+            key: impl Fn(&T) -> RelativeBytePos,
+            from: RelativeBytePos,
+            to: RelativeBytePos,
+        ) -> &[T] {
+            let start = table.partition_point(|e| key(e) < from);
+            let end = start + table[start..].partition_point(|e| key(e) <= to);
+            &table[start..end]
+        }
+        let mbcs = in_range(&self.multibyte_chars, |m| m.pos, extent_start, hi);
+        Hash::hash(&mbcs.len(), &mut hasher);
+        for mbc in mbcs {
+            Hash::hash(&(mbc.pos.0 - extent_start.0), &mut hasher);
+            Hash::hash(&mbc.bytes, &mut hasher);
+        }
+        let nps = in_range(&self.normalized_pos, |n| n.pos, extent_start, hi);
+        Hash::hash(&nps.len(), &mut hasher);
+        for np in nps {
+            Hash::hash(&(np.pos.0 - extent_start.0), &mut hasher);
+            Hash::hash(&np.diff, &mut hasher);
+        }
+        hasher.finish()
     }
 
     /// Returns the `BytePos` of the beginning of the current line.

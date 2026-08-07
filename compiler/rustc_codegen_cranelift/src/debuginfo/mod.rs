@@ -219,6 +219,9 @@ impl DebugContext {
         linkage_name: &str,
         function_span: Span,
     ) -> FunctionDebugContext {
+        // Anchors this function's rendered lines (its own position and every body position
+        // within its extent); see `TyCtxt::track_def_lines`.
+        tcx.track_def_lines(instance.def_id());
         let (file_id, line, column) = self.get_span_loc(tcx, function_span, function_span);
 
         if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {

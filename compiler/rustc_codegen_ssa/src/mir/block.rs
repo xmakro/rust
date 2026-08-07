@@ -1959,8 +1959,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         bx: &mut Bx,
         source_info: mir::SourceInfo,
     ) -> OperandRef<'tcx, Bx::Value> {
+        let caller = self.instance.def_id();
         self.mir.caller_location_span(source_info, self.caller_location, bx.tcx(), |span: Span| {
-            let const_loc = bx.tcx().span_as_caller_location(span);
+            let const_loc = bx.tcx().span_as_caller_location(span, caller);
             OperandRef::from_const(bx, const_loc, bx.tcx().caller_location_ty())
         })
     }

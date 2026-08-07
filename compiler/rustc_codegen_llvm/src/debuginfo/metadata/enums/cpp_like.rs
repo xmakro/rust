@@ -766,6 +766,9 @@ fn build_union_fields_for_direct_tag_coroutine<'ll, 'tcx>(
 
             let span = coroutine_layout.variant_source_info[variant_index].span;
             let source_info = if !span.is_dummy() {
+                if let Some(parent) = span.data_untracked().parent {
+                    cx.tcx.track_def_lines(parent.to_def_id());
+                }
                 let loc = cx.lookup_debug_loc(span.lo());
                 Some((file_metadata(cx, &loc.file), loc.line as c_uint))
             } else {

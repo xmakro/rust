@@ -383,6 +383,7 @@ impl SourceMap {
             lines: file_local_lines,
             multibyte_chars,
             normalized_pos,
+            line_length_block_hashes: OnceLock::new(),
             stable_id,
             cnum,
         };
@@ -412,6 +413,11 @@ impl SourceMap {
     }
 
     /// Looks up source information about a `BytePos`.
+    ///
+    /// This is an untracked lookup: the incremental system does not see it. If the line or
+    /// column ends up in a query result or codegen artifact, derive it from
+    /// `TyCtxt::lookup_line_tracked` instead, which records the dependency that
+    /// invalidates it. Diagnostics and other side-channel output may use this freely.
     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {
         let sf = self.lookup_source_file(pos);
         let (line, col, col_display) = sf.lookup_file_pos_with_col_display(pos);
@@ -419,6 +425,8 @@ impl SourceMap {
     }
 
     /// If the corresponding `SourceFile` is empty, does not return a line number.
+    ///
+    /// This is an untracked lookup; see `lookup_char_pos` for when it must not be used.
     pub fn lookup_line(&self, pos: BytePos) -> Result<SourceFileAndLine, Arc<SourceFile>> {
         let f = self.lookup_source_file(pos);
 

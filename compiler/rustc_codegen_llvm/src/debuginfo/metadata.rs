@@ -1833,6 +1833,8 @@ pub(crate) fn file_metadata_from_def_id<'ll>(
         && let span = hygiene::walk_chain_collapsed(cx.tcx.def_span(def_id), DUMMY_SP)
         && !span.is_dummy()
     {
+        // The rendered line anchors to the definition itself.
+        cx.tcx.track_def_lines(def_id);
         let loc = cx.lookup_debug_loc(span.lo());
         (file_metadata(cx, &loc.file), loc.line)
     } else {

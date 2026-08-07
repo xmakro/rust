@@ -135,6 +135,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let tcx = self.tcx;
 
         let def_id = instance.def_id();
+        // Anchors this function's rendered lines (its own decl line and every body position
+        // within its extent); see `TyCtxt::track_def_lines`.
+        tcx.track_def_lines(def_id);
         let (containing_scope, is_method) = get_containing_scope(self, instance);
         let span = tcx.def_span(def_id);
         let loc = self.lookup_debug_loc(span.lo());
@@ -683,6 +686,9 @@ impl<'ll> CodegenCx<'ll, '_> {
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
     fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
+        // This is an untracked lookup: the line-anchoring dependencies that invalidate the
+        // emitted line tables are recorded per function and per span parent in
+        // `rustc_codegen_ssa::mir::debuginfo` and `create_function_debug_context`.
         let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
             Ok(SourceFileAndLine { sf: file, line }) => {
                 let line_pos = file.lines()[line];

@@ -205,6 +205,13 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     assert!(!instance.args.has_infer());
 
     let tcx = cx.tcx();
+    // Anchor this function's rendered lines (its decl line and body positions within its
+    // extent) for incremental invalidation; see `TyCtxt::track_def_lines`. Spans rendered
+    // from other definitions' extents (inlined callees) record their own anchors at the
+    // rendering sites.
+    if cx.sess().opts.debuginfo != rustc_session::config::DebugInfo::None {
+        tcx.track_def_lines(instance.def_id());
+    }
     let llfn = cx.get_fn(instance);
 
     let mut mir = tcx.instance_mir(instance.def);

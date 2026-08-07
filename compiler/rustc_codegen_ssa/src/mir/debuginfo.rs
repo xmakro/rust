@@ -7,7 +7,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty};
 use rustc_middle::{bug, mir, ty};
 use rustc_session::config::{DebugInfo, OptLevel};
@@ -89,7 +89,8 @@ impl<'tcx, S: Copy, L: Copy> DebugScope<S, L> {
         let pos = span.lo();
         if pos < self.file_start_pos || pos >= self.file_end_pos {
             let sm = bx.sess().source_map();
-            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_char_pos(pos).file)
+            // Only the file is observed here, so no line-table dependency is needed.
+            bx.extend_scope_to_file(self.dbg_scope, &sm.lookup_source_file(pos))
         } else {
             self.dbg_scope
         }
@@ -237,7 +238,20 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span)> {
         let scope = &self.debug_context.as_ref()?.scopes[source_info.scope];
         let span = hygiene::walk_chain_collapsed(source_info.span, self.mir.span);
+        self.track_rendered_span_lines(span);
         Some((scope.adjust_dbg_scope_for_span(bx, span), scope.inlined_at, span))
+    }
+
+    /// Records the line-anchoring dependency for a span rendered into this function's
+    /// debuginfo; see `TyCtxt::track_def_lines`. The function's own anchor is recorded
+    /// once in `codegen_mir`, so only spans parented outside it need an edge here
+    /// (inlined callee bodies, in particular).
+    fn track_rendered_span_lines(&self, span: Span) {
+        if let Some(parent) = span.data_untracked().parent
+            && parent.to_def_id() != self.instance.def_id()
+        {
+            self.cx.tcx().track_def_lines(parent.to_def_id());
+        }
     }
 
     fn spill_operand_to_stack(
@@ -772,6 +786,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     .inlined_function_scopes
                     .entry(callee)
                     .or_insert_with(|| {
+                        // The scope renders the callee's own declaration position.
+                        self.cx.tcx().track_def_lines(callee.def_id());
                         let callee_fn_abi = self.cx.fn_abi_of_instance(callee, ty::List::empty());
                         bx.dbg_scope_fn(callee, callee_fn_abi, None)
                     })
@@ -781,6 +797,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
         let inlined_at = scope_data.inlined.map(|(_, callsite_span)| {
             let callsite_span = hygiene::walk_chain_collapsed(callsite_span, self.mir.span);
+            self.track_rendered_span_lines(callsite_span);
             let callsite_scope = parent_scope.adjust_dbg_scope_for_span(bx, callsite_span);
             let loc = bx.dbg_loc(callsite_scope, parent_scope.inlined_at, callsite_span);
 

@@ -7,8 +7,7 @@ use cranelift_codegen::MachSrcLoc;
 use cranelift_codegen::binemit::CodeOffset;
 use gimli::write::{FileId, FileInfo, LineProgram, LineString, LineStringTable};
 use rustc_span::{
-    FileName, Pos, RemapPathScopeComponents, SourceFile, SourceFileAndLine,
-    SourceFileHashAlgorithm, hygiene,
+    FileName, Pos, RemapPathScopeComponents, SourceFile, SourceFileHashAlgorithm, hygiene,
 };
 
 use crate::debuginfo::FunctionDebugContext;
@@ -80,15 +79,26 @@ impl DebugContext {
     ) -> (FileId, u64, u64) {
         // Match behavior of `FunctionCx::adjusted_span_and_dbg_scope`.
         let span = hygiene::walk_chain_collapsed(span, function_span);
-        match tcx.sess.source_map().lookup_line(span.lo()) {
-            Ok(SourceFileAndLine { sf: file, line }) => {
-                let file_id = self.add_source_file(tcx, &file);
+        // The function-level line anchor is recorded in `define_function`; spans parented
+        // outside the current function (inlined callees) anchor to their own parent here.
+        // The lookup itself is untracked.
+        if let Some(parent) = span.data_untracked().parent {
+            tcx.track_def_lines(parent.to_def_id());
+        }
+        let (file, line_index) = {
+            let file = tcx.sess.source_map().lookup_source_file(span.lo());
+            let line = file.lookup_line(file.relative_position(span.lo()));
+            (file, line)
+        };
+        let file_id = self.add_source_file(tcx, &file);
+        match line_index {
+            Some(line) => {
                 let line_pos = file.lines()[line];
                 let col = file.relative_position(span.lo()) - line_pos;
 
                 (file_id, u64::try_from(line).unwrap() + 1, u64::from(col.to_u32()) + 1)
             }
-            Err(file) => (self.add_source_file(tcx, &file), 0, 0),
+            None => (file_id, 0, 0),
         }
     }
 

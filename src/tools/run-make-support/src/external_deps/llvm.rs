@@ -48,6 +48,13 @@ pub fn llvm_bcanalyzer() -> LlvmBcanalyzer {
     LlvmBcanalyzer::new()
 }
 
+/// Construct a new `llvm-cov` invocation. This assumes that `llvm-cov` is available
+/// at `$LLVM_BIN_DIR/llvm-cov`.
+#[track_caller]
+pub fn llvm_cov() -> LlvmCov {
+    LlvmCov::new()
+}
+
 /// Construct a new `llvm-dwarfdump` invocation. This assumes that `llvm-dwarfdump` is available
 /// at `$LLVM_BIN_DIR/llvm-dwarfdump`.
 pub fn llvm_dwarfdump() -> LlvmDwarfdump {
@@ -127,6 +134,13 @@ pub struct LlvmBcanalyzer {
     cmd: Command,
 }
 
+/// A `llvm-cov` invocation builder.
+#[derive(Debug)]
+#[must_use]
+pub struct LlvmCov {
+    cmd: Command,
+}
+
 /// A `llvm-dwarfdump` invocation builder.
 #[derive(Debug)]
 #[must_use]
@@ -169,6 +183,7 @@ crate::macros::impl_common_helpers!(LlvmObjdump);
 crate::macros::impl_common_helpers!(LlvmAr);
 crate::macros::impl_common_helpers!(LlvmNm);
 crate::macros::impl_common_helpers!(LlvmBcanalyzer);
+crate::macros::impl_common_helpers!(LlvmCov);
 crate::macros::impl_common_helpers!(LlvmDwarfdump);
 crate::macros::impl_common_helpers!(LlvmPdbutil);
 crate::macros::impl_common_helpers!(LlvmAs);
@@ -408,6 +423,30 @@ impl LlvmBcanalyzer {
 
     /// Provide an input file.
     pub fn input<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.cmd.arg(path.as_ref());
+        self
+    }
+}
+
+impl LlvmCov {
+    /// Construct a new `llvm-cov` invocation. This assumes that `llvm-cov` is available
+    /// at `$LLVM_BIN_DIR/llvm-cov`.
+    pub fn new() -> Self {
+        let llvm_cov = llvm_bin_dir().join("llvm-cov");
+        let cmd = Command::new(llvm_cov);
+        Self { cmd }
+    }
+
+    /// Show line execution counts for the given binary.
+    pub fn show<P: AsRef<Path>>(&mut self, binary: P) -> &mut Self {
+        self.cmd.arg("show");
+        self.cmd.arg(binary.as_ref());
+        self
+    }
+
+    /// Provide the indexed profile via `-instr-profile`.
+    pub fn instr_profile<P: AsRef<Path>>(&mut self, path: P) -> &mut Self {
+        self.cmd.arg("-instr-profile");
         self.cmd.arg(path.as_ref());
         self
     }

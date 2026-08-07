@@ -289,7 +289,7 @@ impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
 
             sym::caller_location => {
                 let span = self.find_closest_untracked_caller_location();
-                let val = self.tcx.span_as_caller_location(span);
+                let val = self.tcx.span_as_caller_location(span, self.frame().instance().def_id());
                 let val =
                     self.const_val_to_op(val, self.tcx.caller_location_ty(), Some(dest.layout))?;
                 self.copy_op(&val, dest)?;

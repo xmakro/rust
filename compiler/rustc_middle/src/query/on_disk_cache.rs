@@ -18,8 +18,8 @@ use rustc_span::hygiene::{
     ExpnId, HygieneDecodeContext, HygieneEncodeContext, SyntaxContext, SyntaxContextKey,
 };
 use rustc_span::{
-    BlobDecoder, BytePos, ByteSymbol, CachingSourceMapView, ExpnData, ExpnHash, RelativeBytePos,
-    SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
+    BlobDecoder, BytePos, ByteSymbol, ExpnData, ExpnHash, RelativeBytePos, SourceFile, Span,
+    SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
 };
 
 use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
@@ -231,7 +231,7 @@ impl OnDiskCache {
                 type_shorthands: Default::default(),
                 predicate_shorthands: Default::default(),
                 interpret_allocs: Default::default(),
-                caching_source_map_view: CachingSourceMapView::new(tcx.sess.source_map()),
+                last_source_file: None,
                 file_to_file_index,
                 hygiene_context: &hygiene_encode_context,
                 symbol_index_table: Default::default(),
@@ -619,13 +619,25 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
             }
             TAG_FULL_SPAN => {
                 let file_lo_index = SourceFileIndex::decode(self);
-                let line_lo = usize::decode(self);
-                let col_lo = RelativeBytePos::decode(self);
+                let offset_lo = RelativeBytePos::decode(self);
                 let len = BytePos::decode(self);
 
                 let file_lo = self.file_index_to_file(file_lo_index);
-                let lo = file_lo.lines()[line_lo - 1] + col_lo;
-                let lo = file_lo.absolute_position(lo);
+                // The encoder only emits TAG_FULL_SPAN for spans that lie entirely within
+                // the file, so a decoded range past `normalized_source_len` means stale
+                // incremental data referencing a file that shrank. Decoding it anyway would
+                // silently produce a position inside the *next* file; fail instead. Checked
+                // in u64 so corrupt data cannot wrap the addition.
+                assert!(
+                    offset_lo.0 as u64 + len.0 as u64 <= file_lo.normalized_source_len.0 as u64,
+                    "cached span {}..+{} out of range for {:?} (len {}); \
+                     stale incremental data referencing a shrunk file",
+                    offset_lo.0,
+                    len.0,
+                    file_lo.name,
+                    file_lo.normalized_source_len.0,
+                );
+                let lo = file_lo.absolute_position(offset_lo);
                 let hi = lo + len;
                 (lo, hi)
             }
@@ -783,7 +795,9 @@ pub struct CacheEncoder<'a, 'tcx> {
     type_shorthands: FxHashMap<Ty<'tcx>, usize>,
     predicate_shorthands: FxHashMap<ty::PredicateKind<'tcx>, usize>,
     interpret_allocs: FxIndexSet<interpret::AllocId>,
-    caching_source_map_view: CachingSourceMapView<'tcx>,
+    /// One-entry cache for `SourceMap::lookup_source_file`; consecutive encoded spans are
+    /// almost always in the same file.
+    last_source_file: Option<Arc<SourceFile>>,
     file_to_file_index: FxHashMap<*const SourceFile, SourceFileIndex>,
     hygiene_context: &'a HygieneEncodeContext,
     // Used for both `Symbol`s and `ByteSymbol`s.
@@ -899,11 +913,32 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
             return;
         }
 
-        let Some((file_lo, line_lo, col_lo)) =
-            self.caching_source_map_view.byte_pos_to_line_and_col(span_data.lo)
-        else {
-            return TAG_PARTIAL_SPAN.encode(self);
+        // Full spans are encoded as (file, offset within file, length): decoding reconstructs
+        // the exact span, so it re-hashes to the fingerprint its containing value was stored
+        // under (see `stable_hash_span`). As in `stable_hash_span`, empty files contain no
+        // positions.
+        let file_lo = match &self.last_source_file {
+            Some(file) if file.contains(span_data.lo) => Arc::clone(file),
+            _ => {
+                let source_map = self.tcx.sess.source_map();
+                if source_map.files().is_empty() {
+                    return TAG_PARTIAL_SPAN.encode(self);
+                }
+                let file = source_map.lookup_source_file(span_data.lo);
+                if !file.contains(span_data.lo) || file.is_empty() {
+                    return TAG_PARTIAL_SPAN.encode(self);
+                }
+                self.last_source_file = Some(Arc::clone(&file));
+                file
+            }
         };
+
+        if span_data.hi > file_lo.end_position() {
+            // The span crosses a file boundary. `stable_hash_span` hashes it as invalid, so
+            // its position is not covered by any fingerprint; encode the same information
+            // (nothing) rather than an exact span that could go stale unnoticed.
+            return TAG_PARTIAL_SPAN.encode(self);
+        }
 
         if let Some(parent) = parent
             && file_lo.contains(parent.lo)
@@ -914,13 +949,13 @@ impl<'a, 'tcx> SpanEncoder for CacheEncoder<'a, 'tcx> {
             return;
         }
 
+        let offset_lo = file_lo.relative_position(span_data.lo);
         let len = span_data.hi - span_data.lo;
         let source_file_index = self.source_file_index(file_lo);
 
         TAG_FULL_SPAN.encode(self);
         source_file_index.encode(self);
-        line_lo.encode(self);
-        col_lo.encode(self);
+        offset_lo.encode(self);
         len.encode(self);
     }
 

@@ -517,15 +517,20 @@ impl<'tcx> Display for Const<'tcx> {
 // Const-related utilities
 
 impl<'tcx> TyCtxt<'tcx> {
-    pub fn span_as_caller_location(self, span: Span) -> ConstValue {
+    /// `caller` anchors the rendered line when the cause span is parentless (an item-level
+    /// macro invocation): such a span sits at the calling definition's own position, so its
+    /// extent hash covers the rendering.
+    pub fn span_as_caller_location(self, span: Span, caller: DefId) -> ConstValue {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-        let caller = self.sess.source_map().lookup_char_pos(topmost.lo());
+        if topmost.data_untracked().parent.is_none() {
+            self.track_def_lines(caller);
+        }
+        let (file, _line_index) = self.lookup_line_tracked(topmost);
+        let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());
         self.const_caller_location(
-            Symbol::intern(
-                &caller.file.name.display(RemapPathScopeComponents::MACRO).to_string_lossy(),
-            ),
-            caller.line as u32,
-            caller.col_display as u32 + 1,
+            Symbol::intern(&file.name.display(RemapPathScopeComponents::MACRO).to_string_lossy()),
+            line as u32,
+            col_display as u32 + 1,
         )
     }
 }

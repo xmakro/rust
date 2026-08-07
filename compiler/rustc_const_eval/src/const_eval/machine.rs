@@ -210,15 +210,23 @@ impl interpret::MayLeak for ! {
 impl<'tcx> CompileTimeInterpCx<'tcx> {
     fn location_triple_for_span(&self, span: Span) -> (Symbol, u32, u32) {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-        let caller = self.tcx.sess.source_map().lookup_char_pos(topmost.lo());
+        // The triple currently only reaches const-eval error messages, which are never
+        // replayed from a green cache (errors block cache finalization). Use the tracked
+        // lookup anyway so this cannot silently go stale if the triple ever ends up in a
+        // cached value or replayable diagnostic.
+        if topmost.data_untracked().parent.is_none() {
+            self.tcx.track_def_lines(self.frame().instance().def_id());
+        }
+        let (file, _line_index) = self.tcx.lookup_line_tracked(topmost);
+        let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());
 
         use rustc_span::RemapPathScopeComponents;
         (
             Symbol::intern(
-                &caller.file.name.display(RemapPathScopeComponents::DIAGNOSTICS).to_string_lossy(),
+                &file.name.display(RemapPathScopeComponents::DIAGNOSTICS).to_string_lossy(),
             ),
-            u32::try_from(caller.line).unwrap(),
-            u32::try_from(caller.col_display).unwrap().checked_add(1).unwrap(),
+            u32::try_from(line).unwrap(),
+            u32::try_from(col_display).unwrap().checked_add(1).unwrap(),
         )
     }
 
