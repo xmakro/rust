@@ -77,31 +77,17 @@ impl<'a> StableHashState<'a> {
     pub fn stable_hash_controls(&self) -> StableHashControls {
         self.stable_hash_controls
     }
-}
 
-impl<'a> StableHashCtxt for StableHashState<'a> {
-    /// Hashes a span in a stable way. The raw `BytePos` fields are offsets into the `SourceMap`,
-    /// which are not stable across sessions, so we hash the (file, offset within file, length)
-    /// triple instead. Hashing both the start and the length keeps spans that differ only in
-    /// their end position distinct (see issue #74890).
-    ///
-    /// This fingerprint covers a span's *position* but nothing derived from the file's line
-    /// structure: an edit that moves a line break without changing byte offsets leaves it
-    /// unchanged. That is sound only because every consumer that renders line/column
-    /// information from a span into a cached artifact (`#[track_caller]` locations, debuginfo
-    /// line tables, coverage mappings, pretty-printed closure paths in cached diagnostics)
-    /// anchors the rendering to a definition's `def_anchor` (via
-    /// `TyCtxt::lookup_line_tracked`, `TyCtxt::track_def_anchor` or
-    /// `TyCtxt::source_file_tracked`), whose extent covers the rendered position. Code that
-    /// derives line/column data inside a tracked context and stores the result MUST record
-    /// such an anchor. (The dependency covers line indices and character columns, not
-    /// display columns; see `TyCtxt::track_def_anchor`.)
-    ///
-    /// IMPORTANT: `TAG_FULL_SPAN` in the incremental on-disk cache must encode enough to
-    /// reconstruct the exact span, so that a reloaded span re-hashes to the fingerprint its
-    /// containing value was stored under (see `CacheEncoder::encode_span`).
+    /// Shared implementation of [`StableHashCtxt::stable_hash_span`] (`INCLUDE_OFFSET =
+    /// true`) and [`StableHashCtxt::stable_hash_anchor_span`] (`INCLUDE_OFFSET = false`);
+    /// they differ only in whether the absolute arm covers the span's offset within its
+    /// file.
     #[inline]
-    fn stable_hash_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
+    fn hash_span_impl<const INCLUDE_OFFSET: bool>(
+        &mut self,
+        raw_span: RawSpan,
+        hasher: &mut StableHasher,
+    ) {
         const TAG_VALID_SPAN: u8 = 0;
         const TAG_INVALID_SPAN: u8 = 1;
         const TAG_RELATIVE_SPAN: u8 = 2;
@@ -157,47 +143,49 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
 
         Hash::hash(&TAG_VALID_SPAN, hasher);
         Hash::hash(&file.stable_id, hasher);
-        Hash::hash(&file.relative_position(span.lo).to_u32(), hasher);
+        if INCLUDE_OFFSET {
+            Hash::hash(&file.relative_position(span.lo).to_u32(), hasher);
+        }
         Hash::hash(&(span.hi - span.lo).0, hasher);
     }
+}
 
-    /// Hashes a definition's span used as an anchor: (file, length), deliberately excluding
-    /// the offset so that a definition which merely moves keeps its fingerprint. Everything
-    /// position-observable is covered elsewhere: relative spans re-anchor on decode, line
-    /// renderings depend on `def_anchor` (which hashes the rendered line index and column
-    /// of the definition's start), and cross-file moves change the hashed `stable_id`. See
-    /// `rustc_span::AnchorSpan`.
+impl<'a> StableHashCtxt for StableHashState<'a> {
+    /// Hashes a span in a stable way. The raw `BytePos` fields are offsets into the `SourceMap`,
+    /// which are not stable across sessions, so we hash the (file, offset within file, length)
+    /// triple instead. Hashing both the start and the length keeps spans that differ only in
+    /// their end position distinct (see issue #74890).
+    ///
+    /// This fingerprint covers a span's *position* but nothing derived from the file's line
+    /// structure: an edit that moves a line break without changing byte offsets leaves it
+    /// unchanged. That is sound only because every consumer that renders line/column
+    /// information from a span into a cached artifact (`#[track_caller]` locations, debuginfo
+    /// line tables, coverage mappings, pretty-printed closure paths in cached diagnostics)
+    /// anchors the rendering to a definition's `def_anchor` (via
+    /// `TyCtxt::lookup_line_tracked`, `TyCtxt::track_def_anchor` or
+    /// `TyCtxt::source_file_tracked`), whose extent covers the rendered position. Code that
+    /// derives line/column data inside a tracked context and stores the result MUST record
+    /// such an anchor. (The dependency covers line indices and character columns, not
+    /// display columns; see `TyCtxt::track_def_anchor`.)
+    ///
+    /// IMPORTANT: `TAG_FULL_SPAN` in the incremental on-disk cache must encode enough to
+    /// reconstruct the exact span, so that a reloaded span re-hashes to the fingerprint its
+    /// containing value was stored under (see `CacheEncoder::encode_span`).
+    #[inline]
+    fn stable_hash_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
+        self.hash_span_impl::<true>(raw_span, hasher)
+    }
+
+    /// Hashes a span position-independently: identical to `stable_hash_span` except that
+    /// the absolute arm hashes (file, length) instead of (file, offset, length), so a span
+    /// that merely moves keeps its fingerprint. Everything position-observable is covered
+    /// elsewhere: relative spans re-anchor on decode, line renderings depend on
+    /// `def_anchor` and `expn_anchor` (which hash the rendered line index and column of
+    /// the anchoring extent's start), and cross-file moves change the hashed `stable_id`.
+    /// Used for definition anchors (`rustc_span::AnchorSpan`) and the spans in `ExpnData`,
+    /// whose disambiguator keeps identical expansions distinct.
     fn stable_hash_anchor_span(&mut self, raw_span: RawSpan, hasher: &mut StableHasher) {
-        const TAG_VALID_SPAN: u8 = 0;
-        const TAG_INVALID_SPAN: u8 = 1;
-
-        if !self.stable_hash_controls().hash_spans {
-            return;
-        }
-
-        let span = Span::from_raw_span(raw_span);
-        let span = span.data_untracked();
-        span.ctxt.stable_hash(self, hasher);
-        debug_assert_eq!(span.parent, None, "anchor spans must be absolute");
-
-        if span.is_dummy() {
-            Hash::hash(&TAG_INVALID_SPAN, hasher);
-            return;
-        }
-
-        let Some(file) = self.source_file_for_pos(span.lo) else {
-            Hash::hash(&TAG_INVALID_SPAN, hasher);
-            return;
-        };
-
-        if span.hi > file.end_position() {
-            Hash::hash(&TAG_INVALID_SPAN, hasher);
-            return;
-        }
-
-        Hash::hash(&TAG_VALID_SPAN, hasher);
-        Hash::hash(&file.stable_id, hasher);
-        Hash::hash(&(span.hi - span.lo).0, hasher);
+        self.hash_span_impl::<false>(raw_span, hasher)
     }
 
     #[inline]

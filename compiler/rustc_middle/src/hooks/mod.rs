@@ -70,15 +70,17 @@ declare_hooks! {
     /// to trigger this manually when decoding a foreign `Span`
     hook import_source_files(key: CrateNum) -> ();
 
-
     /// Returns the precomputed digest over a foreign crate's encoded source files; see
     /// `CrateRoot::source_files_digest` and the `crate_source_anchor` query.
     hook source_files_digest(key: CrateNum) -> rustc_data_structures::fingerprint::Fingerprint;
+
+    /// Returns `None` when the crate's metadata no longer contains an expansion with this
+    /// hash, which stale incremental data from a previous session can reference.
     hook expn_hash_to_expn_id(
         cnum: CrateNum,
         index_guess: u32,
         hash: ExpnHash
-    ) -> ExpnId;
+    ) -> Option<ExpnId>;
 
     /// Converts a `DefPathHash` to its corresponding `DefId` in the current compilation
     /// session, if it still exists. This is used during incremental compilation to

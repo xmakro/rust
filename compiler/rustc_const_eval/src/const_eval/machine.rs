@@ -217,6 +217,7 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         if topmost.data_untracked().parent.is_none() {
             self.tcx.track_def_anchor(self.frame().instance().def_id());
         }
+        self.tcx.track_expansion_anchors(topmost);
         let (file, _line_index) = self.tcx.lookup_line_tracked(topmost);
         let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());
 

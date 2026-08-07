@@ -1027,6 +1027,13 @@ impl<'hir> LoweringContext<'_, 'hir> {
         span: Span,
         allow_internal_unstable: Option<Arc<[Symbol]>>,
     ) -> Span {
+        // Parent the span before it is captured as the expansion's call site, like
+        // `rustc_expand` parents macro invocation spans: the `ExpnData` fingerprint is then
+        // relative to the enclosing definition, so it is stable when the definition moves
+        // and distinct between same-kind desugarings in different definitions (instead of
+        // falling back to the order-based disambiguator, which renumbers every later
+        // same-kind desugaring when one is inserted).
+        let span = self.lower_span(span);
         self.tcx.with_stable_hashing_context(|hcx| {
             span.mark_with_reason(allow_internal_unstable, reason, span.edition(), hcx)
         })

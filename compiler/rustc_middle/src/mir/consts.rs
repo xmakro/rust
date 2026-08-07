@@ -517,13 +517,36 @@ impl<'tcx> Display for Const<'tcx> {
 // Const-related utilities
 
 impl<'tcx> TyCtxt<'tcx> {
-    /// `caller` anchors the rendered line when the cause span is parentless (an item-level
-    /// macro invocation): such a span sits at the calling definition's own position, so its
-    /// extent hash covers the rendering.
+    /// `caller` anchors the rendered line for a parentless cause span with no expansion:
+    /// such a span sits at the calling definition's own position, so its extent hash
+    /// covers the rendering. A parentless *expansion* cause (an item-level invocation)
+    /// records the expansion's own `expn_anchor` instead.
     pub fn span_as_caller_location(self, span: Span, caller: DefId) -> ConstValue {
-        let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
-        if topmost.data_untracked().parent.is_none() {
+        let cause = span.ctxt().outer_expn().expansion_cause_with_expn();
+        let topmost = cause.map_or(span, |(_, cause_span)| cause_span);
+        // All anchoring precedes the lookups (which notify the line-observation hook):
+        // the parent definition where one exists (definition-keyed nodes are stable
+        // across edits), then the expansion anchors for what remains, which
+        // `track_expansion_anchors` and the cause arm skip when the position is
+        // already covered.
+        let tdata = topmost.data_untracked();
+        if cause.is_none() && tdata.parent.is_none() {
             self.track_def_anchor(caller);
+        }
+        if let Some(parent) = tdata.parent {
+            self.track_def_anchor(parent.to_def_id());
+        }
+        self.track_expansion_anchors(topmost);
+        if let Some((expn, _)) = cause
+            && self.dep_graph.is_fully_enabled()
+            && !tdata.is_dummy()
+            && !self.sess.source_map().files().is_empty()
+        {
+            let f = self.sess.source_map().lookup_source_file(tdata.lo);
+            if f.contains(tdata.lo) && !self.dep_graph.line_extent_covers(f.stable_id, tdata.lo) {
+                let _ = self.expn_anchor(expn.expn_hash());
+                self.register_expn_extent(&expn.expn_data());
+            }
         }
         let (file, _line_index) = self.lookup_line_tracked(topmost);
         let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());

@@ -1586,7 +1586,12 @@ impl CrateMetadata {
         self.def_path_hash_map.def_path_hash_to_def_index(&hash)
     }
 
-    fn expn_hash_to_expn_id(&self, tcx: TyCtxt<'_>, index_guess: u32, hash: ExpnHash) -> ExpnId {
+    fn expn_hash_to_expn_id(
+        &self,
+        tcx: TyCtxt<'_>,
+        index_guess: u32,
+        hash: ExpnHash,
+    ) -> Option<ExpnId> {
         let index_guess = ExpnIndex::from_u32(index_guess);
         let old_hash =
             self.root.expn_hashes.get(self, index_guess).map(|lazy| lazy.decode((self, tcx)));
@@ -1612,11 +1617,14 @@ impl CrateMetadata {
                 }
                 map
             });
-            map[&hash]
+            // The expansion can be gone entirely when the crate was recompiled and a
+            // stale reference to it is being resolved (e.g. an incremental dep node
+            // recovered from a previous session); let the caller decide what that means.
+            *map.get(&hash)?
         };
 
         let data = self.root.expn_data.get(self, index).unwrap().decode((self, tcx));
-        rustc_span::hygiene::register_expn_id(self.cnum, index, data, hash)
+        Some(rustc_span::hygiene::register_expn_id(self.cnum, index, data, hash))
     }
 
     /// Imports the source_map from an external crate into the source_map of the crate

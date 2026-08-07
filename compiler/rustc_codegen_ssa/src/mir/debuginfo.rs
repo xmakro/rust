@@ -11,7 +11,7 @@ use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty};
 use rustc_middle::{bug, mir, ty};
 use rustc_session::config::{DebugInfo, OptLevel};
-use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, hygiene, sym};
+use rustc_span::{BytePos, DUMMY_SP, Span, Symbol, sym};
 
 use super::operand::{OperandRef, OperandValue};
 use super::place::{PlaceRef, PlaceValue};
@@ -237,7 +237,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         source_info: mir::SourceInfo,
     ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span)> {
         let scope = &self.debug_context.as_ref()?.scopes[source_info.scope];
-        let span = hygiene::walk_chain_collapsed(source_info.span, self.mir.span);
+        let span = bx.tcx().walk_chain_collapsed_tracked(source_info.span, self.mir.span);
         self.track_rendered_span_lines(span);
         Some((scope.adjust_dbg_scope_for_span(bx, span), scope.inlined_at, span))
     }
@@ -253,13 +253,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         {
             self.cx.tcx().track_def_anchor(parent.to_def_id());
         }
-        if !data.ctxt.is_root()
-            && let Some(macro_def) = data.ctxt.outer_expn_data().macro_def_id
-        {
-            // A span from an expansion can render def-site positions from the macro's
-            // own file; anchor that definition. (The root expansion also carries a
-            // `macro_def_id`, the crate root, which is not a rendering anchor.)
-            self.cx.tcx().track_def_anchor(macro_def);
+        if !data.ctxt.is_root() {
+            // Expansion output can render input positions from outside its owner's
+            // extent (derive-generated bodies carry the struct's field spans, parented
+            // to the synthetic impl), so the expansion's own anchors are needed even for
+            // parented spans.
+            self.cx.tcx().track_expansion_anchors(span);
         }
     }
 
@@ -810,7 +809,8 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         };
 
         let inlined_at = scope_data.inlined.map(|(_, callsite_span)| {
-            let callsite_span = hygiene::walk_chain_collapsed(callsite_span, self.mir.span);
+            let callsite_span =
+                self.cx.tcx().walk_chain_collapsed_tracked(callsite_span, self.mir.span);
             self.track_rendered_span_lines(callsite_span);
             let callsite_scope = parent_scope.adjust_dbg_scope_for_span(bx, callsite_span);
             let loc = bx.dbg_loc(callsite_scope, parent_scope.inlined_at, callsite_span);

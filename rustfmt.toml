@@ -24,6 +24,8 @@ ignore = [
     # construction; formatting them would destroy the invariant they test.
     "/tests/run-make/incr-anchor-move/main_v1.rs",
     "/tests/run-make/incr-anchor-move/main_v2.rs",
+    "/tests/run-make/incr-macro-static-decl-line/main_v1.rs",
+    "/tests/run-make/incr-macro-static-decl-line/main_v2.rs",
     "/tests/rustdoc-html/",           # Some have syntax errors, some are whitespace-sensitive.
     "/tests/rustdoc-gui/",            # Some tests are sensitive to source code layout.
     "/tests/rustdoc-ui/",             # Some have syntax errors, some are whitespace-sensitive.

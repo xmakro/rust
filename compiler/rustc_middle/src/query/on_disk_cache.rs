@@ -593,7 +593,12 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
             expn_id
         } else {
             let index_guess = self.foreign_expn_data[&hash];
-            self.tcx.expn_hash_to_expn_id(krate, index_guess, hash)
+            // A cached value referencing this expansion can only have been green if the
+            // defining crate still exports it, so a miss here is a broken invariant, not a
+            // stale-data condition.
+            self.tcx.expn_hash_to_expn_id(krate, index_guess, hash).unwrap_or_else(|| {
+                panic!("cached expansion {hash:?} no longer exists in crate {krate:?}")
+            })
         };
 
         debug_assert_eq!(expn_id.krate, krate);

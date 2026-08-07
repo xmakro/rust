@@ -359,7 +359,9 @@ impl DepNode {
         let kind = dep_kind_from_label_string(label)?;
 
         match tcx.key_fingerprint_style(kind) {
-            KeyFingerprintStyle::Opaque | KeyFingerprintStyle::HirId => Err(()),
+            KeyFingerprintStyle::Opaque
+            | KeyFingerprintStyle::HirId
+            | KeyFingerprintStyle::SelfHash => Err(()),
             KeyFingerprintStyle::Unit => Ok(DepNode::new_no_params(tcx, kind)),
             KeyFingerprintStyle::DefPathHash => {
                 Ok(DepNode::from_def_path_hash(tcx, def_path_hash, kind))
