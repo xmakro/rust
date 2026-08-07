@@ -5,8 +5,10 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::{FxIndexMap, FxIndexSet};
 use rustc_data_structures::memmap::{Mmap, MmapMut};
+use rustc_data_structures::stable_hash::StableHasher;
 use rustc_data_structures::sync::{par_for_each_in, par_join};
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_data_structures::thousands::usize_with_underscores;
@@ -535,7 +537,9 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         self.lazy(DefPathHashMapRef::BorrowedFromTcx(self.tcx.def_path_hash_to_def_index_map()))
     }
 
-    fn encode_source_map(&mut self) -> LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>> {
+    fn encode_source_map(
+        &mut self,
+    ) -> (LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>, Fingerprint) {
         let source_map = self.tcx.sess.source_map();
         let all_source_files = source_map.files();
 
@@ -545,6 +549,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let required_source_files = self.required_source_files.take().unwrap();
 
         let mut adapted = TableBuilder::default();
+        let mut digest_entries = Vec::with_capacity(required_source_files.len());
 
         let local_crate_stable_id = self.tcx.stable_crate_id(LOCAL_CRATE);
 
@@ -597,10 +602,17 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
             let on_disk_index: u32 =
                 on_disk_index.try_into().expect("cannot export more than U32_MAX files");
+            digest_entries.push((adapted_source_file.stable_id, adapted_source_file.src_hash));
             adapted.set_some(on_disk_index, self.lazy(adapted_source_file));
         }
 
-        adapted.encode(&mut self.opaque)
+        // The digest covers the content of every encoded file (the content hash covers
+        // its line structure), keyed the way downstream sessions see the files.
+        digest_entries.sort_unstable_by_key(|&(id, _)| id);
+        let mut hasher = StableHasher::new();
+        std::hash::Hash::hash(&digest_entries, &mut hasher);
+
+        (adapted.encode(&mut self.opaque), hasher.finish())
     }
 
     fn encode_crate_root(&mut self) -> LazyValue<CrateRoot> {
@@ -715,7 +727,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
 
         // Encode source_map. This needs to be done last, because encoding `Span`s tells us which
         // `SourceFiles` we actually need to encode.
-        let source_map = stat!("source-map", || self.encode_source_map());
+        let (source_map, source_files_digest) = stat!("source-map", || self.encode_source_map());
         let target_modifiers = stat!("target-modifiers", || self.encode_target_modifiers());
         let denied_partial_mitigations = stat!("denied-partial-mitigations", || self
             .encode_enabled_denied_partial_mitigations());
@@ -761,6 +773,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 native_libraries,
                 foreign_modules,
                 source_map,
+                source_files_digest,
                 target_modifiers,
                 denied_partial_mitigations,
                 traits,

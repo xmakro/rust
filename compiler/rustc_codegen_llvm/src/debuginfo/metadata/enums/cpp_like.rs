@@ -768,11 +768,11 @@ fn build_union_fields_for_direct_tag_coroutine<'ll, 'tcx>(
             let source_info = if !span.is_dummy() {
                 // Variant spans come from the coroutine body; synthesized parentless spans
                 // fall back to the coroutine definition itself as the anchor.
-                let anchored = match span.data_untracked().parent {
+                match span.data_untracked().parent {
                     Some(parent) => cx.tcx.track_def_anchor(parent.to_def_id()),
                     None => cx.tcx.track_def_anchor(coroutine_def_id),
-                };
-                let loc = cx.lookup_debug_loc(span.lo(), anchored);
+                }
+                let loc = cx.lookup_debug_loc(span.lo());
                 Some((file_metadata(cx, &loc.file), loc.line as c_uint))
             } else {
                 None

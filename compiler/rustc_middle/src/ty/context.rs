@@ -1296,14 +1296,6 @@ impl<'tcx> TyCtxtAt<'tcx> {
     }
 }
 
-/// Proof that a `def_anchor` dependency covering a rendering about to happen has been
-/// recorded (see [`TyCtxt::track_def_anchor`]). The untracked line-lookup helpers in the
-/// codegen crates take this as an argument, so a rendering path without an anchor fails to
-/// compile instead of silently going stale. Only the tracked lookup methods on [`TyCtxt`]
-/// construct it.
-#[derive(Clone, Copy, Debug)]
-pub struct DefAnchored(pub(crate) ());
-
 impl<'tcx> TyCtxt<'tcx> {
     /// `tcx`-dependent operations performed for every created definition.
     pub fn create_def(
@@ -1560,16 +1552,107 @@ impl<'tcx> TyCtxt<'tcx> {
     /// rendered line's text (`char_width`), which no fingerprint covers. An edit replacing a
     /// tab with a space, say, changes display columns without invalidating anything; the old
     /// line/column span hashing had the same limitation for byte-identical layouts.
-    pub fn track_def_anchor(self, def: DefId) -> DefAnchored {
+    ///
+    /// Anchoring is not load-bearing for soundness: a line observation inside a dep task
+    /// that no recorded anchor covers makes the task unconditionally red (see
+    /// [`rustc_span::LINE_TABLE_TRACK`]), so a missed or mismatched anchor costs reuse,
+    /// never staleness. Recording the covering anchor up front is what keeps the consumer
+    /// cacheable.
+    pub fn track_def_anchor(self, def: DefId) {
         // The dependency only exists to drive invalidation, so skip the query entirely when
         // there is no dep graph to record it in.
-        if self.dep_graph.is_fully_enabled() {
-            // Coalesce typeck children (closures, coroutines, inline consts) into their
-            // root's node: the root's extent contains theirs, and they codegen into the
-            // root's CGU anyway, so per-child nodes would add count without precision.
-            let _ = self.def_anchor(self.typeck_root_def_id(def));
+        if !self.dep_graph.is_fully_enabled() {
+            return;
         }
-        DefAnchored(())
+        // Coalesce typeck children (closures, coroutines, inline consts) into their
+        // root's node: the root's extent contains theirs, and they codegen into the
+        // root's CGU anyway, so per-child nodes would add count without precision.
+        let root = self.typeck_root_def_id(def);
+        // Register the anchored extent so the line-lookup hook recognizes positions
+        // inside it as covered: the full source_span extent for a local definition, the
+        // whole containing file for a foreign one (whose metadata only carries the
+        // shrunk signature span, and whose anchor is the crate-level digest).
+        match root.as_local() {
+            Some(local) => {
+                let _ = self.def_anchor(root);
+                // Read without a dependency (a tracked read of a `Span` result would
+                // re-fingerprint on position shifts): any extent change that could
+                // affect coverage also changes `def_anchor(root)`, just recorded.
+                let (primary, secondary) =
+                    self.dep_graph.with_ignore(|| self.def_anchor_extent(local));
+                self.register_anchored_extent(primary.data_untracked());
+                if let Some(secondary) = secondary {
+                    self.register_anchored_extent(secondary.data_untracked());
+                }
+                // An expansion-created definition can render def-site positions from
+                // the macro's own file; anchor the macro's definition as well. (Plain
+                // macro definitions terminate the recursion.)
+                let expn = self.expn_that_defined(root);
+                if expn != rustc_span::ExpnId::root()
+                    && let Some(macro_def) = expn.expn_data().macro_def_id
+                    && macro_def != root
+                {
+                    self.track_def_anchor(macro_def);
+                }
+            }
+            None => {
+                let _ = self.crate_source_anchor(root.krate);
+                // Read without a dependency: any file change that could affect coverage
+                // also changes the crate anchor, which was just recorded.
+                let span = self.dep_graph.with_ignore(|| self.def_span(root));
+                self.register_anchored_file(span.data_untracked());
+            }
+        }
+    }
+
+    /// The span whose extent `def_anchor` hashes for a local definition: the HIR item
+    /// span including the body. The stored `source_span` (like `def_span`) is shrunk to
+    /// the signature for functions and to the `mod foo;` declaration for file modules,
+    /// neither of which contains the body positions renderings need covered; modules
+    /// anchor their *inner* span so item-level renderings inside them are covered.
+    pub(crate) fn local_anchor_span(self, local: LocalDefId) -> Span {
+        if self.def_kind(local) == DefKind::Mod {
+            // A file module's source_span is the `mod foo;` declaration; anchor the
+            // *inner* span so item-level renderings inside it are covered.
+            self.hir_get_module(rustc_hir::def_id::LocalModDefId::new_unchecked(local))
+                .0
+                .spans
+                .inner_span
+        } else {
+            self.source_span(local)
+        }
+    }
+
+    /// Marks the extent as covered by an anchor dependency recorded for the current
+    /// task, mirroring the clamping of the anchor providers; see
+    /// `DepGraph::register_line_extent`.
+    pub(crate) fn register_anchored_extent(self, data: rustc_span::SpanData) {
+        if data.is_dummy() || self.sess.source_map().files().is_empty() {
+            return;
+        }
+        let file = self.sess.source_map().lookup_source_file(data.lo);
+        if file.contains(data.lo) {
+            let hi = if data.hi > file.end_position() { file.end_position() } else { data.hi };
+            // Widen to line boundaries: the anchor hash pins the line indices of every
+            // line the extent touches, and consumers observe line-start positions
+            // (rendering a column reads the line's beginning), which for a mid-line
+            // extent lie just before its `lo`.
+            let lo = if let Some(line) = file.lookup_line_untracked(file.relative_position(data.lo))
+            {
+                file.absolute_position(file.lines_untracked()[line])
+            } else {
+                data.lo
+            };
+            let hi = if hi < file.end_position()
+                && let Some(line) = file.lookup_line_untracked(file.relative_position(hi))
+                && let Some(&next) = file.lines_untracked().get(line + 1)
+            {
+                file.absolute_position(next)
+            } else {
+                file.end_position()
+            };
+            self.dep_graph.register_line_extent(file.stable_id, lo, hi);
+        }
     }
 
     /// Returns the source file containing the span's start and the 0-based index of its
@@ -1582,23 +1665,26 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn lookup_line_tracked(self, span: Span) -> (Arc<SourceFile>, Option<usize>) {
         let data = span.data_untracked();
         let file = self.sess.source_map().lookup_source_file(data.lo);
-        let line = file.lookup_line(file.relative_position(data.lo));
-        if let Some(parent) = data.parent {
+        // Record the anchor before the lookup so the notified hook sees the position as
+        // covered instead of applying the conservative fallback; skip it when an
+        // already-recorded finer anchor covers the position (an expansion anchor covers
+        // an invocation-site rendering, sparing the parent's coarser dependency: the
+        // parent of an item-level invocation is its whole module).
+        if let Some(parent) = data.parent
+            && !self.dep_graph.line_extent_covers(file.stable_id, data.lo)
+        {
             self.track_def_anchor(parent.to_def_id());
         }
+        let line = file.lookup_line(file.relative_position(data.lo));
         (file, line)
     }
 
     /// Like [`Self::lookup_line_tracked`], but for consumers that derive line/column data
     /// for positions throughout a definition's extent (coverage mappings): records the
     /// `def_anchor` dependency for `anchor` and returns the file containing `pos`.
-    pub fn source_file_tracked(
-        self,
-        pos: rustc_span::BytePos,
-        anchor: DefId,
-    ) -> (Arc<SourceFile>, DefAnchored) {
-        let anchored = self.track_def_anchor(anchor);
-        (self.sess.source_map().lookup_source_file(pos), anchored)
+    pub fn source_file_tracked(self, pos: rustc_span::BytePos, anchor: DefId) -> Arc<SourceFile> {
+        self.track_def_anchor(anchor);
+        self.sess.source_map().lookup_source_file(pos)
     }
 
     /// Like [`SourceMap::span_to_diagnostic_string`], but records the line-anchoring
@@ -1633,7 +1719,23 @@ impl<'tcx> TyCtxt<'tcx> {
         match span.data_untracked().parent {
             Some(parent) => self.track_def_anchor(parent.to_def_id()),
             None => self.track_def_anchor(anchor),
-        };
+        }
+    }
+
+    /// Marks the whole file containing the span as covered, mirroring the file-granular
+    /// anchors (foreign definitions).
+    pub(crate) fn register_anchored_file(self, data: rustc_span::SpanData) {
+        if data.is_dummy() || self.sess.source_map().files().is_empty() {
+            return;
+        }
+        let file = self.sess.source_map().lookup_source_file(data.lo);
+        if file.contains(data.lo) {
+            self.dep_graph.register_line_extent(
+                file.stable_id,
+                file.start_pos,
+                file.end_position(),
+            );
+        }
     }
 
     /// Returns `&'static core::panic::Location<'static>`.
@@ -2922,24 +3024,162 @@ pub fn provide(providers: &mut Providers) {
         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
     };
     providers.def_anchor = def_anchor;
+    providers.def_anchor_extent = def_anchor_extent;
+    providers.crate_source_anchor = crate_source_anchor;
     providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
 }
 
 fn def_anchor(tcx: TyCtxt<'_>, def: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
+    match def.as_local() {
+        Some(local) => {
+            let (primary, secondary) = tcx.def_anchor_extent(local);
+            let mut hash = span_anchor_hash(tcx, primary.data_untracked());
+            if let Some(secondary) = secondary {
+                hash = hash.combine(span_anchor_hash(tcx, secondary.data_untracked()));
+            }
+            hash
+        }
+        // Foreign metadata only carries the shrunk signature span, so a foreign
+        // definition anchors at crate granularity; `track_def_anchor` records the
+        // `crate_source_anchor` node directly and this arm only serves nodes recovered
+        // from an earlier session's graph.
+        None => tcx.crate_source_anchor(def.krate),
+    }
+}
+
+fn def_anchor_extent(tcx: TyCtxt<'_>, local: LocalDefId) -> (Span, Option<Span>) {
+    let expn = tcx.expn_that_defined(local.to_def_id());
+    if expn == rustc_span::ExpnId::root() {
+        // The recorded extent of a plain definition is trustworthy.
+        return (tcx.local_anchor_span(local), None);
+    }
+    // An expansion-created definition carries whatever spans the macro synthesized, so
+    // derive the extent that actually determines its rendered positions from the
+    // expansion's input. `source_callsite` walks nested call sites to user code where
+    // the chain is intact.
+    let expn_data = expn.expn_data();
+    let cs = expn_data.call_site.source_callsite();
+    let cs_data = cs.data_untracked();
+    if cs_data.is_dummy() || tcx.sess.source_map().files().is_empty() {
+        return (tcx.local_anchor_span(local), None);
+    }
+    let file = tcx.sess.source_map().lookup_source_file(cs_data.lo);
+    if !file.contains(cs_data.lo) {
+        return (tcx.local_anchor_span(local), None);
+    }
+    match expn_data.kind {
+        // A bang macro's output mixes passthrough input tokens, whose spans are the real
+        // user positions (so the definition's own recorded span is meaningful: a whole
+        // function passed through a `cfg`-style wrapper keeps its extent), with tokens
+        // from the macro's own body. Anchor the definition's own extent and the
+        // invocation's; def-site renderings from the macro's file are covered by the
+        // macro definition's anchor, which `track_def_anchor` records alongside.
+        rustc_span::ExpnKind::Macro(rustc_span::MacroKind::Bang, _) => {
+            (tcx.local_anchor_span(local), Some(cs))
+        }
+        // A derive's body renders the annotated type's positions, and the type is a
+        // plain definition with a trustworthy extent. Union the call site (the derive's
+        // path inside the attribute): the generated items' collapsed decl positions
+        // render there, and item spans do not include outer attributes.
+        rustc_span::ExpnKind::Macro(rustc_span::MacroKind::Derive, _)
+            if let Some(impl_def) = tcx.opt_parent(local.to_def_id())
+                && matches!(tcx.def_kind(impl_def), DefKind::Impl { .. })
+                && let ty::Adt(adt, _) =
+                    tcx.type_of(impl_def).instantiate_identity().skip_norm_wip().kind()
+                && let Some(adt_local) = adt.did().as_local() =>
+        {
+            let adt = tcx.local_anchor_span(adt_local).data_untracked();
+            if !adt.is_dummy() && file.contains(adt.lo) && adt.hi <= file.end_position() {
+                (
+                    Span::new(
+                        cs_data.lo.min(adt.lo),
+                        cs_data.hi.max(adt.hi),
+                        rustc_span::SyntaxContext::root(),
+                        None,
+                    ),
+                    None,
+                )
+            } else {
+                (tcx.local_anchor_span(adt_local), Some(cs))
+            }
+        }
+        // An attribute invocation records only the attribute as its call site, but the
+        // re-emitted item's body reuses the original item's positions; compute their
+        // hull from the definition's HIR. This is the one tier that walks HIR, and
+        // attribute-macro items are rare next to derives.
+        rustc_span::ExpnKind::Macro(rustc_span::MacroKind::Attr, _) => {
+            // The re-emitted item's body reuses the original item's positions; compute
+            // their hull from the definition's HIR, in the file of the definition's own
+            // recorded span (the attribute can live in a different file, e.g. an inert
+            // tool attribute on an enclosing module). This is the one tier that walks
+            // HIR, and attribute-macro items are rare next to derives.
+            let own = tcx.local_anchor_span(local).data_untracked();
+            let hull_file = if !own.is_dummy() {
+                tcx.sess.source_map().lookup_source_file(own.lo)
+            } else {
+                file
+            };
+            let (fstart, fend) = (hull_file.start_pos, hull_file.end_position());
+            let (mut lo, mut hi) = if !own.is_dummy() && hull_file.contains(own.lo) {
+                (own.lo, if own.hi > fend { fend } else { own.hi })
+            } else {
+                (cs_data.lo, if cs_data.hi > fend { fend } else { cs_data.hi })
+            };
+            if tcx.hir_node_by_def_id(local).as_owner().is_some() {
+                let owner = rustc_hir::OwnerId { def_id: local };
+                let owner_nodes = tcx.hir_owner_nodes(owner);
+                for (local_id, parented) in owner_nodes.nodes.iter_enumerated() {
+                    if matches!(parented.node, rustc_hir::Node::Synthetic) {
+                        continue;
+                    }
+                    let data = tcx
+                        .hir_span_with_body(rustc_hir::HirId { owner, local_id })
+                        .data_untracked();
+                    if !data.is_dummy() && data.lo >= fstart && data.hi <= fend {
+                        lo = lo.min(data.lo);
+                        hi = hi.max(data.hi);
+                    }
+                }
+            }
+            (Span::new(lo, hi, rustc_span::SyntaxContext::root(), None), Some(cs))
+        }
+        // Definitions from other expansion classes anchor their whole containing file
+        // and their own recorded extent.
+        _ => {
+            let (fstart, fend) = (file.start_pos, file.end_position());
+            (
+                Span::new(fstart, fend, rustc_span::SyntaxContext::root(), None),
+                Some(tcx.local_anchor_span(local)),
+            )
+        }
+    }
+}
+
+fn crate_source_anchor(
+    tcx: TyCtxt<'_>,
+    cnum: CrateNum,
+) -> rustc_data_structures::fingerprint::Fingerprint {
+    debug_assert_ne!(cnum, LOCAL_CRATE);
+    // Precomputed at encode time by the upstream compiler, so depending on a foreign
+    // crate's source structure costs a single metadata read: no file needs importing and
+    // no line table needs decoding, which matters because this node is re-executed during
+    // try-mark-green in every later session.
+    tcx.source_files_digest(cnum)
+}
+
+/// Hash of everything that determines rendered line/column values for positions within
+/// `data`: the value backing `def_anchor` and `expn_anchor`. Zero for dummy or unmapped
+/// spans; the constant still differs from every real extent hash, so a span gaining a
+/// real position invalidates.
+
+fn span_anchor_hash(
+    tcx: TyCtxt<'_>,
+    data: rustc_span::SpanData,
+) -> rustc_data_structures::fingerprint::Fingerprint {
     use rustc_data_structures::fingerprint::Fingerprint;
-    // For a foreign `def`, `def_span` decodes the span from metadata, which imports the
-    // containing file into the source map. That matters when this query is forced during
-    // try-mark-green with a key recovered from a previous session's dep node, before any
-    // other decode has imported the file (debuginfo for locally instantiated upstream code
-    // records these nodes for upstream definitions). A deleted definition never gets here:
-    // its `DefId` cannot be recovered from the dep node, which marks dependents red.
-    let span = tcx.def_span(def);
-    if span.is_dummy() || tcx.sess.source_map().files().is_empty() {
-        // Synthesized definitions have no rendered positions; the constant still differs
-        // from every real extent hash, so a definition gaining a real span invalidates.
+    if data.is_dummy() || tcx.sess.source_map().files().is_empty() {
         return Fingerprint::ZERO;
     }
-    let data = span.data_untracked();
     let file = tcx.sess.source_map().lookup_source_file(data.lo);
     if !file.contains(data.lo) || file.is_empty() {
         return Fingerprint::ZERO;

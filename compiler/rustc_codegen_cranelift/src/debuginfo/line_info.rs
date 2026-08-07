@@ -76,15 +76,22 @@ impl DebugContext {
         tcx: TyCtxt<'_>,
         function_span: Span,
         span: Span,
-        _anchored: rustc_middle::ty::DefAnchored,
     ) -> (FileId, u64, u64) {
         // Match behavior of `FunctionCx::adjusted_span_and_dbg_scope`.
         let span = hygiene::walk_chain_collapsed(span, function_span);
-        // The passed witness covers the enclosing rendered definition; spans parented
-        // outside it (inlined callees) anchor to their own parent here. The lookup itself
-        // is untracked.
-        if let Some(parent) = span.data_untracked().parent {
+        // The function-level anchor is recorded in `define_function`; spans parented
+        // outside the current function (inlined callees) anchor to their own parent, and
+        // parentless spans from non-collapsed expansions anchor the macro's definition.
+        // The lookup notifies `LINE_TABLE_TRACK`, so an uncovered position makes the
+        // codegen task unconditionally red.
+        let data = span.data_untracked();
+        if let Some(parent) = data.parent {
             tcx.track_def_anchor(parent.to_def_id());
+        }
+        if !data.ctxt.is_root()
+            && let Some(macro_def) = data.ctxt.outer_expn_data().macro_def_id
+        {
+            tcx.track_def_anchor(macro_def);
         }
         let (file, line_index) = {
             let file = tcx.sess.source_map().lookup_source_file(span.lo());
@@ -94,7 +101,7 @@ impl DebugContext {
         let file_id = self.add_source_file(tcx, &file);
         match line_index {
             Some(line) => {
-                let line_pos = file.lines()[line];
+                let line_pos = file.lines_untracked()[line];
                 let col = file.relative_position(span.lo()) - line_pos;
 
                 (file_id, u64::try_from(line).unwrap() + 1, u64::from(col.to_u32()) + 1)

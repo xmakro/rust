@@ -233,10 +233,41 @@ rustc_queries! {
     /// the value unchanged. Do not read this query directly: use
     /// [`TyCtxt::lookup_line_tracked`], [`TyCtxt::source_file_tracked`] or
     /// [`TyCtxt::track_def_anchor`], which pair the data with the dependency.
+    /// The extent whose line structure `def_anchor` hashes for a local definition: the
+    /// recorded source_span for plain definitions (module inner spans for file modules),
+    /// and for expansion-created definitions (whose recorded spans are whatever the macro
+    /// synthesized) the hull of their HIR spans within the expansion's call-site file
+    /// together with the call site itself. Session-memoized; positions are session-local,
+    /// so consumers read it without a dependency (any change that affects coverage also
+    /// changes `def_anchor`).
+    query def_anchor_extent(key: LocalDefId) -> (Span, Option<Span>) {
+        // Pure session memoization: the only consumers read the result without a
+        // dependency (`eval_always` records no reads, keeping one dep-graph node per
+        // anchored definition out of the graph), and the result carries session-local
+        // absolute positions that must not be hashed (`no_hash`).
+        eval_always
+        no_hash
+        desc { "computing the anchor extent of `{}`", tcx.def_path_str(key) }
+    }
+
     query def_anchor(key: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
         // Accesses untracked data
         eval_always
         desc { "hashing the line structure of a definition's extent" }
+    }
+
+    /// The anchor for foreign positions: hash of (file id, content hash) of every source
+    /// file of a foreign crate, precomputed at encode time by the upstream compiler
+    /// (`CrateRoot::source_files_digest`). Foreign metadata only carries shrunk
+    /// signature spans, so foreign renderings anchor at crate granularity: foreign line
+    /// tables only change with their file's content, the content hashes cover them, and
+    /// the single metadata read costs nothing to re-execute during try-mark-green. Also
+    /// the fallback for a foreign line observation that no anchor covers (lexical blocks
+    /// of inlined foreign code whose macro-internal spans arrive with root context).
+    query crate_source_anchor(key: CrateNum) -> rustc_data_structures::fingerprint::Fingerprint {
+        // Accesses untracked data
+        eval_always
+        desc { "hashing the source files of a foreign crate" }
     }
 
     query lower_to_hir(def_id: LocalDefId) -> hir::MaybeOwner<'tcx> {

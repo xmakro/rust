@@ -1989,8 +1989,9 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         self.unnormalized_source_len.encode(s);
 
         // The line table may still be in its compressed on-disk form: span hashing works on
-        // offsets and never materializes it. `lines()` does.
-        let lines = self.lines();
+        // offsets and never materializes it. This does; the encoded table cannot outlive
+        // the session unobserved, so it needs no `LINE_TABLE_TRACK` notification.
+        let lines = self.lines_untracked();
         // Store the length.
         s.emit_u32(lines.len() as u32);
 
@@ -2271,6 +2272,14 @@ impl SourceFile {
     }
 
     pub fn lines(&self) -> &[RelativeBytePos] {
+        (*LINE_TABLE_TRACK)(self, None, None);
+        self.lines_untracked()
+    }
+
+    /// Like [`Self::lines`] without notifying [`LINE_TABLE_TRACK`]: for observations
+    /// already covered by a recorded dependency (the `def_anchor` provider hashes the
+    /// table itself) or that cannot outlive the session (metadata encoding).
+    pub fn lines_untracked(&self) -> &[RelativeBytePos] {
         if let Some(SourceFileLines::Lines(lines)) = self.lines.get() {
             return &lines[..];
         }
@@ -2288,7 +2297,7 @@ impl SourceFile {
     /// the file for the last line. Line lengths are invariant under edits elsewhere in the
     /// file that only shift byte offsets, which makes them the unit of extent hashing.
     fn line_length(&self, i: usize) -> u32 {
-        let lines = self.lines();
+        let lines = self.lines_untracked();
         match lines.get(i + 1) {
             Some(next) => next.0 - lines[i].0,
             None => self.normalized_source_len.0 - lines[i].0,
@@ -2300,7 +2309,7 @@ impl SourceFile {
     /// extent edges hash their lengths directly.
     fn line_length_block_hash(&self, block: usize) -> Fingerprint {
         let hashes = self.line_length_block_hashes.get_or_init(|| {
-            let n = self.lines().len();
+            let n = self.lines_untracked().len();
             let mut out = Vec::with_capacity(n / LINE_LENGTH_BLOCK);
             for block in 0..n / LINE_LENGTH_BLOCK {
                 let mut hasher = StableHasher::new();
@@ -2333,10 +2342,10 @@ impl SourceFile {
     /// fingerprint per covered block.
     pub fn line_extent_hash(&self, lo: RelativeBytePos, hi: RelativeBytePos) -> Fingerprint {
         let mut hasher = StableHasher::new();
-        let anchor_line = self.lookup_line(lo);
+        let anchor_line = self.lookup_line_untracked(lo);
         Hash::hash(&anchor_line, &mut hasher);
         let extent_start = match anchor_line {
-            Some(line) => self.lines()[line],
+            Some(line) => self.lines_untracked()[line],
             None => RelativeBytePos(0),
         };
         // The extent's column on its first line: a first-line position renders as this plus
@@ -2344,7 +2353,7 @@ impl SourceFile {
         // line length or table entry changing.
         Hash::hash(&(lo.0 - extent_start.0), &mut hasher);
         if let Some(a) = anchor_line {
-            let e = self.lookup_line(hi).unwrap_or(a).max(a);
+            let e = self.lookup_line_untracked(hi).unwrap_or(a).max(a);
             // The count first, so sections cannot alias each other.
             Hash::hash(&(e - a), &mut hasher);
             let mut i = a;
@@ -2390,7 +2399,7 @@ impl SourceFile {
     pub fn line_begin_pos(&self, pos: BytePos) -> BytePos {
         let pos = self.relative_position(pos);
         let line_index = self.lookup_line(pos).unwrap();
-        let line_start_pos = self.lines()[line_index];
+        let line_start_pos = self.lines_untracked()[line_index];
         self.absolute_position(line_start_pos)
     }
 
@@ -2450,7 +2459,9 @@ impl SourceFile {
         }
 
         let begin = {
-            let line = self.lines().get(line_number).copied()?;
+            let line = self.lines_untracked().get(line_number).copied()?;
+            // The sliced text observes where this line starts and ends.
+            (*LINE_TABLE_TRACK)(self, Some(line), None);
             line.to_usize()
         };
 
@@ -2497,7 +2508,13 @@ impl SourceFile {
     /// number. If the source_file is empty or the position is located before the
     /// first line, `None` is returned.
     pub fn lookup_line(&self, pos: RelativeBytePos) -> Option<usize> {
-        self.lines().partition_point(|x| x <= &pos).checked_sub(1)
+        (*LINE_TABLE_TRACK)(self, Some(pos), None);
+        self.lookup_line_untracked(pos)
+    }
+
+    /// See [`Self::lines_untracked`] for when bypassing [`LINE_TABLE_TRACK`] is sound.
+    pub fn lookup_line_untracked(&self, pos: RelativeBytePos) -> Option<usize> {
+        self.lines_untracked().partition_point(|x| x <= &pos).checked_sub(1)
     }
 
     pub fn line_bounds(&self, line_index: usize) -> Range<BytePos> {
@@ -2505,8 +2522,9 @@ impl SourceFile {
             return self.start_pos..self.start_pos;
         }
 
-        let lines = self.lines();
+        let lines = self.lines_untracked();
         assert!(line_index < lines.len());
+        (*LINE_TABLE_TRACK)(self, Some(lines[line_index]), None);
         if line_index == (lines.len() - 1) {
             self.absolute_position(lines[line_index])..self.end_position()
         } else {
@@ -2595,7 +2613,7 @@ impl SourceFile {
         match self.lookup_line(pos) {
             Some(a) => {
                 let line = a + 1; // Line numbers start at 1
-                let linebpos = self.lines()[a];
+                let linebpos = self.lines_untracked()[a];
                 let linechpos = self.bytepos_to_file_charpos(linebpos);
                 let col = chpos - linechpos;
                 debug!("byte pos {:?} is on the line at byte pos {:?}", pos, linebpos);
@@ -2891,6 +2909,22 @@ pub struct FileLines {
 }
 
 pub static SPAN_TRACK: AtomicRef<fn(LocalDefId)> = AtomicRef::new(&((|_| {}) as fn(_)));
+
+/// Called on every line-structure observation (`SourceFile::lookup_line` and the accessors
+/// built on it), so the compiler can record an incremental dependency covering the
+/// observed line data: span fingerprints cover only byte offsets, and rendered line and
+/// column values need their own invalidation channel (see `TyCtxt::track_def_anchor`).
+/// The installed callback (see `rustc_interface::callbacks`) records the covering
+/// `def_anchor` dependency when one is known, and otherwise marks the observing dep task
+/// unconditionally red, so an unanchored observation costs reuse instead of going stale.
+///
+/// Arguments: the file, the observed position (`None` when the whole line table is
+/// observed), and the parent definition of the observing span when the caller knows it.
+fn line_table_track_default(_: &SourceFile, _: Option<RelativeBytePos>, _: Option<LocalDefId>) {}
+
+pub static LINE_TABLE_TRACK: AtomicRef<
+    fn(&SourceFile, Option<RelativeBytePos>, Option<LocalDefId>),
+> = AtomicRef::new(&(line_table_track_default as fn(&SourceFile, _, _)));
 
 // _____________________________________________________________________________
 // SpanLinesError, SpanSnippetError, DistinctSources, MalformedSourceMapPositions

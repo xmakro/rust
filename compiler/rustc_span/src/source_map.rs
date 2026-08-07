@@ -414,10 +414,11 @@ impl SourceMap {
 
     /// Looks up source information about a `BytePos`.
     ///
-    /// This is an untracked lookup: the incremental system does not see it. If the line or
-    /// column ends up in a query result or codegen artifact, derive it from
-    /// `TyCtxt::lookup_line_tracked` instead, which records the dependency that
-    /// invalidates it. Diagnostics and other side-channel output may use this freely.
+    /// The lookup notifies [`LINE_TABLE_TRACK`]: inside a dep task, an observation not
+    /// covered by a recorded anchor makes the task unconditionally red. Consumers that
+    /// store the line or column in a query result or codegen artifact should derive it
+    /// from `TyCtxt::lookup_line_tracked` or an explicit `TyCtxt::track_def_anchor`,
+    /// which record the precise dependency instead.
     pub fn lookup_char_pos(&self, pos: BytePos) -> Loc {
         let sf = self.lookup_source_file(pos);
         let (line, col, col_display) = sf.lookup_file_pos_with_col_display(pos);
@@ -426,7 +427,7 @@ impl SourceMap {
 
     /// If the corresponding `SourceFile` is empty, does not return a line number.
     ///
-    /// This is an untracked lookup; see `lookup_char_pos` for when it must not be used.
+    /// See `lookup_char_pos` for how the incremental system observes the lookup.
     pub fn lookup_line(&self, pos: BytePos) -> Result<SourceFileAndLine, Arc<SourceFile>> {
         let f = self.lookup_source_file(pos);
 
@@ -478,6 +479,7 @@ impl SourceMap {
             return (None, 0, 0, 0, 0);
         }
 
+        self.notify_parented_line_observation(sp);
         let lo = self.lookup_char_pos(sp.lo());
         let hi = self.lookup_char_pos(sp.hi());
         (Some(lo.file), lo.line, lo.col.to_usize() + 1, hi.line, hi.col.to_usize() + 1)
@@ -507,11 +509,32 @@ impl SourceMap {
         let f = Arc::clone(&(*self.files.borrow().source_files)[lo]);
         let lo = f.relative_position(sp.lo());
         let hi = f.relative_position(sp.hi());
+        if let Some(parent) = sp.data_untracked().parent {
+            (*LINE_TABLE_TRACK)(&f, Some(lo), Some(parent));
+        }
         f.lookup_line(lo) != f.lookup_line(hi)
+    }
+
+    /// Passes a parented span's parent to [`LINE_TABLE_TRACK`] before its line lookups
+    /// run, so an in-task observation records the precise per-definition dependency
+    /// instead of the conservative fallback. Parentless spans need no hint: the
+    /// per-position hook fires during the lookups themselves. Only parented spans pay
+    /// the extra file lookup, and spans only carry parents in incremental builds.
+    fn notify_parented_line_observation(&self, sp: Span) {
+        let data = sp.data_untracked();
+        if let Some(parent) = data.parent {
+            let file = self.lookup_source_file(data.lo);
+            if file.contains(data.lo) {
+                (*LINE_TABLE_TRACK)(&file, Some(file.relative_position(data.lo)), Some(parent));
+            }
+        }
     }
 
     #[instrument(skip(self), level = "trace")]
     pub fn is_valid_span(&self, sp: Span) -> Result<(Loc, Loc), SpanLinesError> {
+        if !sp.is_dummy() && !self.files.borrow().source_files.is_empty() {
+            self.notify_parented_line_observation(sp);
+        }
         let lo = self.lookup_char_pos(sp.lo());
         trace!(?lo);
         let hi = self.lookup_char_pos(sp.hi());

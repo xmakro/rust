@@ -746,6 +746,8 @@ fn provide_cstore_hooks(providers: &mut Providers) {
         let cstore = CStore::from_tcx(tcx);
         cstore.get_crate_data(cnum).expn_hash_to_expn_id(tcx, index_guess, hash)
     };
+    providers.hooks.source_files_digest =
+        |tcx, cnum| CStore::from_tcx(tcx).get_crate_data(cnum).root.source_files_digest;
     providers.hooks.import_source_files = |tcx, cnum| {
         let cstore = CStore::from_tcx(tcx);
         let cdata = cstore.get_crate_data(cnum);

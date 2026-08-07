@@ -54,11 +54,6 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
 
     mir: &'tcx mir::Body<'tcx>,
 
-    /// Witness that this function's `def_anchor` dependency is recorded (in `codegen_mir`,
-    /// when debuginfo is enabled); it covers renderings of every body position within the
-    /// function's extent.
-    def_anchored: Option<ty::DefAnchored>,
-
     debug_context: Option<FunctionDebugContext<'tcx, Bx::DIScope, Bx::DILocation>>,
 
     llfn: Bx::Function,
@@ -214,8 +209,9 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // extent) for incremental invalidation; see `TyCtxt::track_def_anchor`. Spans rendered
     // from other definitions' extents (inlined callees) record their own anchors at the
     // rendering sites.
-    let def_anchored = (cx.sess().opts.debuginfo != rustc_session::config::DebugInfo::None)
-        .then(|| tcx.track_def_anchor(instance.def_id()));
+    if cx.sess().opts.debuginfo != rustc_session::config::DebugInfo::None {
+        tcx.track_def_anchor(instance.def_id());
+    }
     let llfn = cx.get_fn(instance);
 
     let mut mir = tcx.instance_mir(instance.def);
@@ -258,7 +254,6 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     let mut fx = FunctionCx {
         instance,
         mir,
-        def_anchored,
         llfn,
         fn_abi,
         cx,

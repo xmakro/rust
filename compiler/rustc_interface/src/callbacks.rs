@@ -34,6 +34,60 @@ fn track_span_parent(def_id: rustc_span::def_id::LocalDefId) {
     })
 }
 
+/// Callback for [`rustc_span::LINE_TABLE_TRACK`]: a line-structure observation inside a
+/// dep task must be covered by a recorded `def_anchor` dependency, because span
+/// fingerprints cover only byte offsets (see `TyCtxt::track_def_anchor`). An observation
+/// at a position no anchor covers falls back to the forever-red node: the observing task
+/// re-executes every session instead of risking a stale rendered line.
+fn track_line_table_lookup(
+    file: &rustc_span::SourceFile,
+    pos: Option<rustc_span::RelativeBytePos>,
+    parent: Option<rustc_span::def_id::LocalDefId>,
+) {
+    tls::with_context_opt(|icx| {
+        let Some(icx) = icx else { return };
+        // Only tasks that record reads matter: `EvalAlways` tasks discard them, and
+        // diagnostic rendering runs under `Ignore` (see `track_diagnostic`).
+        if !matches!(icx.task_deps, TaskDepsRef::Allow(..)) {
+            return;
+        }
+        let tcx = icx.tcx;
+        if !tcx.dep_graph.is_fully_enabled() {
+            return;
+        }
+        let Some(pos) = pos else {
+            // Whole-table observation with no attributable position.
+            tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+            return;
+        };
+        if pos == rustc_span::RelativeBytePos(0) {
+            // The rendered values at a file's first byte (line 1, column 1) are
+            // constants; this is also where dummy spans point their renderings.
+            return;
+        }
+        let pos = file.absolute_position(pos);
+        if tcx.dep_graph.line_extent_covers(file.stable_id, pos) {
+            return;
+        }
+        if let Some(parent) = parent {
+            // A parented span's rendered lines anchor to its parent definition when the
+            // observed position lies within the parent's extent.
+            tcx.track_def_anchor(parent.to_def_id());
+            if tcx.dep_graph.line_extent_covers(file.stable_id, pos) {
+                return;
+            }
+        }
+        if file.cnum != rustc_hir::def_id::LOCAL_CRATE {
+            // Foreign position with no recoverable definition or expansion anchor: the
+            // coarse per-crate tier still beats going unconditionally red.
+            let _ = tcx.crate_source_anchor(file.cnum);
+            tcx.dep_graph.register_line_extent(file.stable_id, file.start_pos, file.end_position());
+            return;
+        }
+        tcx.dep_graph.read_index(DepNodeIndex::FOREVER_RED_NODE);
+    })
+}
+
 /// This is a callback from `rustc_errors` as it cannot access the implicit state
 /// in `rustc_middle` otherwise. It is used when diagnostic messages are
 /// emitted and stores them in the current query, if there is one.
@@ -88,6 +142,8 @@ fn def_id_debug(def_id: rustc_hir::def_id::DefId, f: &mut fmt::Formatter<'_>) ->
 /// TyCtxt in.
 pub fn setup_callbacks() {
     rustc_span::SPAN_TRACK.swap(&(track_span_parent as fn(_)));
+    rustc_span::LINE_TABLE_TRACK
+        .swap(&(track_line_table_lookup as fn(&rustc_span::SourceFile, _, _)));
     rustc_hir::def_id::DEF_ID_DEBUG.swap(&(def_id_debug as fn(_, &mut fmt::Formatter<'_>) -> _));
     rustc_errors::TRACK_DIAGNOSTIC.swap(&(track_diagnostic as _));
     rustc_feature::TRACK_FEATURE.swap(&(track_feature as _));

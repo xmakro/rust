@@ -70,6 +70,10 @@ declare_hooks! {
     /// to trigger this manually when decoding a foreign `Span`
     hook import_source_files(key: CrateNum) -> ();
 
+
+    /// Returns the precomputed digest over a foreign crate's encoded source files; see
+    /// `CrateRoot::source_files_digest` and the `crate_source_anchor` query.
+    hook source_files_digest(key: CrateNum) -> rustc_data_structures::fingerprint::Fingerprint;
     hook expn_hash_to_expn_id(
         cnum: CrateNum,
         index_guess: u32,

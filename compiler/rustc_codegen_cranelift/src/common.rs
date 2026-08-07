@@ -408,9 +408,8 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
 
     pub(crate) fn set_debug_loc(&mut self, source_info: mir::SourceInfo) {
         if let Some(debug_context) = &mut self.debug_context {
-            let anchored = self.func_debug_cx.as_ref().unwrap().anchored;
             let (file_id, line, column) =
-                debug_context.get_span_loc(self.tcx, self.mir.span, source_info.span, anchored);
+                debug_context.get_span_loc(self.tcx, self.mir.span, source_info.span);
 
             let source_loc =
                 self.func_debug_cx.as_mut().unwrap().add_dbg_loc(file_id, line, column);

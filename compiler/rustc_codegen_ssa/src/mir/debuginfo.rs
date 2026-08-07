@@ -227,34 +227,39 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     }
 
     fn dbg_loc(&self, bx: &mut Bx, source_info: mir::SourceInfo) -> Option<Bx::DILocation> {
-        let (dbg_scope, inlined_at, span, anchored) =
-            self.adjusted_span_and_dbg_scope(bx, source_info)?;
-        Some(bx.dbg_loc(dbg_scope, inlined_at, span, anchored))
+        let (dbg_scope, inlined_at, span) = self.adjusted_span_and_dbg_scope(bx, source_info)?;
+        Some(bx.dbg_loc(dbg_scope, inlined_at, span))
     }
 
     fn adjusted_span_and_dbg_scope(
         &self,
         bx: &mut Bx,
         source_info: mir::SourceInfo,
-    ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span, ty::DefAnchored)> {
+    ) -> Option<(Bx::DIScope, Option<Bx::DILocation>, Span)> {
         let scope = &self.debug_context.as_ref()?.scopes[source_info.scope];
         let span = hygiene::walk_chain_collapsed(source_info.span, self.mir.span);
-        let anchored = self.track_rendered_span_lines(span);
-        Some((scope.adjust_dbg_scope_for_span(bx, span), scope.inlined_at, span, anchored))
+        self.track_rendered_span_lines(span);
+        Some((scope.adjust_dbg_scope_for_span(bx, span), scope.inlined_at, span))
     }
 
     /// Records the line-anchoring dependency for a span rendered into this function's
     /// debuginfo; see `TyCtxt::track_def_anchor`. The function's own anchor is recorded
     /// once in `codegen_mir`, so only spans parented outside it need an edge here
     /// (inlined callee bodies, in particular).
-    fn track_rendered_span_lines(&self, span: Span) -> ty::DefAnchored {
-        if let Some(parent) = span.data_untracked().parent
+    fn track_rendered_span_lines(&self, span: Span) {
+        let data = span.data_untracked();
+        if let Some(parent) = data.parent
             && parent.to_def_id() != self.instance.def_id()
         {
-            self.cx.tcx().track_def_anchor(parent.to_def_id())
-        } else {
-            self.def_anchored
-                .expect("rendering a span while debuginfo is off; no `def_anchor` recorded")
+            self.cx.tcx().track_def_anchor(parent.to_def_id());
+        }
+        if !data.ctxt.is_root()
+            && let Some(macro_def) = data.ctxt.outer_expn_data().macro_def_id
+        {
+            // A span from an expansion can render def-site positions from the macro's
+            // own file; anchor that definition. (The root expansion also carries a
+            // `macro_def_id`, the crate root, which is not a rendering anchor.)
+            self.cx.tcx().track_def_anchor(macro_def);
         }
     }
 
@@ -357,13 +362,13 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let decl = &self.mir.local_decls[local];
                 let dbg_var = if full_debug_info {
                     self.adjusted_span_and_dbg_scope(bx, decl.source_info).map(
-                        |(dbg_scope, _, span, anchored)| {
+                        |(dbg_scope, _, span)| {
                             // FIXME(eddyb) is this `+ 1` needed at all?
                             let kind = VariableKind::ArgumentVariable(arg_index + 1);
 
                             let arg_ty = self.monomorphize(decl.ty);
 
-                            bx.create_dbg_var(name, arg_ty, dbg_scope, kind, span, anchored)
+                            bx.create_dbg_var(name, arg_ty, dbg_scope, kind, span)
                         },
                     )
                 } else {
@@ -617,7 +622,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             };
 
-            let dbg_var = dbg_scope_and_span.map(|(dbg_scope, _, span, anchored)| {
+            let dbg_var = dbg_scope_and_span.map(|(dbg_scope, _, span)| {
                 let var_kind = if let Some(arg_index) = var.argument_index
                     && var.composite.is_none()
                     && let mir::VarDebugInfoContents::Place(place) = var.value
@@ -647,13 +652,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     match params_seen.entry((dbg_scope, arg_index)) {
                         Entry::Occupied(o) => o.get().clone(),
                         Entry::Vacant(v) => v
-                            .insert(bx.create_dbg_var(
-                                var.name, var_ty, dbg_scope, var_kind, span, anchored,
-                            ))
+                            .insert(bx.create_dbg_var(var.name, var_ty, dbg_scope, var_kind, span))
                             .clone(),
                     }
                 } else {
-                    bx.create_dbg_var(var.name, var_ty, dbg_scope, var_kind, span, anchored)
+                    bx.create_dbg_var(var.name, var_ty, dbg_scope, var_kind, span)
                 }
             });
 
@@ -801,16 +804,16 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             None => {
                 // A non-inlined scope's span comes from this body or an enclosing inlined
                 // callee's; either way its rendered position anchors like any other span.
-                let anchored = self.track_rendered_span_lines(scope_data.span);
-                bx.dbg_create_lexical_block(scope_data.span.lo(), parent_scope.dbg_scope, anchored)
+                self.track_rendered_span_lines(scope_data.span);
+                bx.dbg_create_lexical_block(scope_data.span.lo(), parent_scope.dbg_scope)
             }
         };
 
         let inlined_at = scope_data.inlined.map(|(_, callsite_span)| {
             let callsite_span = hygiene::walk_chain_collapsed(callsite_span, self.mir.span);
-            let anchored = self.track_rendered_span_lines(callsite_span);
+            self.track_rendered_span_lines(callsite_span);
             let callsite_scope = parent_scope.adjust_dbg_scope_for_span(bx, callsite_span);
-            let loc = bx.dbg_loc(callsite_scope, parent_scope.inlined_at, callsite_span, anchored);
+            let loc = bx.dbg_loc(callsite_scope, parent_scope.inlined_at, callsite_span);
 
             // NB: In order to produce proper debug info for variables (particularly
             // arguments) in multiply-inlined functions, LLVM expects to see a single
@@ -837,7 +840,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     // in at least some circumstances (see issue #135322) so if the required
                     // discriminant cannot be encoded fall back to the dummy location.
                     bx.dbg_location_clone_with_discriminator(loc, *o.get()).unwrap_or_else(|| {
-                        bx.dbg_loc(callsite_scope, parent_scope.inlined_at, DUMMY_SP, anchored)
+                        bx.dbg_loc(callsite_scope, parent_scope.inlined_at, DUMMY_SP)
                     })
                 }
                 Entry::Vacant(v) => {

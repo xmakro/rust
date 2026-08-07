@@ -17,7 +17,8 @@ use rustc_index::IndexVec;
 use rustc_macros::{Decodable, Encodable};
 use rustc_serialize::opaque::{FileEncodeResult, FileEncoder};
 use rustc_session::Session;
-use rustc_span::Symbol;
+use rustc_span::{BytePos, StableSourceFileId, Symbol};
+use smallvec::SmallVec;
 use tracing::instrument;
 #[cfg(debug_assertions)]
 use {super::debug::EdgeFilter, std::env};
@@ -546,6 +547,40 @@ impl DepGraph {
                 }
             })
         }
+    }
+
+    /// Marks `[lo, hi]` in `file` as covered by a line-anchoring dependency recorded for
+    /// the current task; see `TaskDeps::line_extents`.
+    pub fn register_line_extent(&self, file: StableSourceFileId, lo: BytePos, hi: BytePos) {
+        if self.data.is_some() {
+            read_deps(|task_deps| {
+                if let TaskDepsRef::Allow(deps) = task_deps {
+                    let mut deps = deps.lock();
+                    let entry = (file, lo, hi);
+                    if !deps.line_extents.contains(&entry) {
+                        deps.line_extents.push(entry);
+                    }
+                }
+            })
+        }
+    }
+
+    /// Whether a line observation at `pos` in `file` is covered by an extent recorded for
+    /// the current task; see `TaskDeps::line_extents`.
+    pub fn line_extent_covers(&self, file: StableSourceFileId, pos: BytePos) -> bool {
+        let mut covered = false;
+        if self.data.is_some() {
+            read_deps(|task_deps| {
+                if let TaskDepsRef::Allow(deps) = task_deps {
+                    covered = deps
+                        .lock()
+                        .line_extents
+                        .iter()
+                        .any(|&(f, lo, hi)| f == file && lo <= pos && pos <= hi);
+                }
+            })
+        }
+        covered
     }
 
     /// This encodes a side effect by creating a node with an unique index and associating
@@ -1303,6 +1338,13 @@ pub struct TaskDeps {
     /// `reads` is always the canonical edges representation; this field is just to speed up the
     /// seen-before test.
     read_set: FxHashSet<DepNodeIndex>,
+
+    /// Extents whose rendered line/column values are covered by a `def_anchor` (or
+    /// equivalent) dependency already recorded for this task; see
+    /// `TyCtxt::track_def_anchor`. The `LINE_TABLE_TRACK` hook treats a line observation
+    /// inside one of them as tracked and applies the conservative always-red fallback
+    /// otherwise. Session-local byte positions; never persisted.
+    line_extents: SmallVec<[(StableSourceFileId, BytePos, BytePos); 2]>,
 }
 
 impl TaskDeps {
@@ -1316,6 +1358,7 @@ impl TaskDeps {
             node,
             reads: EdgesVec::new(),
             read_set: FxHashSet::with_capacity_and_hasher(read_set_capacity, Default::default()),
+            line_extents: SmallVec::new(),
         }
     }
 }

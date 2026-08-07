@@ -23,13 +23,16 @@
 use run_make_support::{llvm_dwarfdump, rfs, run, rustc};
 
 /// Generates `main.rs`. `split_pad` selects whether `pad` spells its constant over two
-/// lines or over one line of the same total byte length. Returns the source, the 1-based
-/// line of the `line_of_caller()` call, and the 1-based line of `fn observed`.
-fn source(split_pad: bool) -> (String, usize, usize) {
+/// lines or over one line of the same total byte length; `split_body` does the same for
+/// a statement *inside* `observed`'s body, before the tracked call. Returns the source,
+/// the 1-based line of the `line_of_caller()` call, and the 1-based line of `fn observed`.
+fn source(split_pad: bool, split_body: bool) -> (String, usize, usize) {
     let mut lines = vec![
         "#![feature(rustc_attrs)]".to_string(),
         "#![rustc_partition_reused(module = \"main-stable\", cfg = \"rpass2\")]".to_string(),
         "#![rustc_partition_codegened(module = \"main-inner\", cfg = \"rpass2\")]".to_string(),
+        "#![rustc_partition_reused(module = \"main-stable\", cfg = \"rpass3\")]".to_string(),
+        "#![rustc_partition_codegened(module = \"main-inner\", cfg = \"rpass3\")]".to_string(),
         "#![allow(dead_code)]".to_string(),
         "mod stable {".to_string(),
         "    #[inline(never)]".to_string(),
@@ -58,6 +61,12 @@ fn source(split_pad: bool) -> (String, usize, usize) {
     lines.push("    }".to_string());
     let decl_line = lines.len() + 1;
     lines.push("    pub fn observed() -> u32 {".to_string());
+    if split_body {
+        lines.push("        let _y: u8 =".to_string());
+        lines.push("            0;".to_string());
+    } else {
+        lines.push("        let _y: u8 = 0; //xxxxxxxxx".to_string());
+    }
     let call_line = lines.len() + 1;
     lines.push("        line_of_caller()".to_string());
     lines.push("    }".to_string());
@@ -81,15 +90,22 @@ fn main() {
             .run()
     };
 
-    let (v1, call_v1, decl_v1) = source(true);
-    let (v2, call_v2, decl_v2) = source(false);
-    // The edit must move line numbers without moving byte offsets; if this drifts, the
+    let (v1, call_v1, decl_v1) = source(true, true);
+    let (v2, call_v2, decl_v2) = source(false, true);
+    // The third version moves a line break *inside* `observed`'s body: the byte-parity
+    // edit that only the extent-relative entries of the definition's own anchor cover.
+    let (v3, call_v3, decl_v3) = source(false, false);
+    // The edits must move line numbers without moving byte offsets; if this drifts, the
     // test stops exercising line-table invalidation and passes vacuously through span
     // fingerprints.
     assert_eq!(v1.len(), v2.len(), "versions must have identical byte length");
+    assert_eq!(v2.len(), v3.len(), "versions must have identical byte length");
     assert_eq!(v1.find("mod inner").unwrap(), v2.find("mod inner").unwrap());
+    assert_eq!(v2.find("mod inner").unwrap(), v3.find("mod inner").unwrap());
     assert_eq!(call_v1, call_v2 + 1);
     assert_eq!(decl_v1, decl_v2 + 1);
+    assert_eq!(call_v2, call_v3 + 1);
+    assert_eq!(decl_v2, decl_v3);
 
     let check_decl_line = |line: usize| {
         llvm_dwarfdump()
@@ -108,4 +124,9 @@ fn main() {
     build("rpass2");
     run("main");
     check_decl_line(decl_v2);
+
+    rfs::write("main.rs", &v3);
+    build("rpass3");
+    run("main");
+    check_decl_line(decl_v3);
 }

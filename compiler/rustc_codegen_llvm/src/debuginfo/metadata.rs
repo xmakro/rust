@@ -1834,8 +1834,8 @@ pub(crate) fn file_metadata_from_def_id<'ll>(
         && !span.is_dummy()
     {
         // The rendered line anchors to the definition itself.
-        let anchored = cx.tcx.track_def_anchor(def_id);
-        let loc = cx.lookup_debug_loc(span.lo(), anchored);
+        cx.tcx.track_def_anchor(def_id);
+        let loc = cx.lookup_debug_loc(span.lo());
         (file_metadata(cx, &loc.file), loc.line)
     } else {
         (unknown_file_metadata(cx), UNKNOWN_LINE_NUMBER)

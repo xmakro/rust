@@ -38,12 +38,7 @@ impl Coords {
 /// but it's hard to rule out entirely (especially in the presence of complex macros
 /// or other expansions), and if it does happen then skipping a span or function is
 /// better than an ICE or `llvm-cov` failure that the user might have no way to avoid.
-pub(crate) fn make_coords(
-    source_map: &SourceMap,
-    file: &SourceFile,
-    span: Span,
-    _anchored: rustc_middle::ty::DefAnchored,
-) -> Option<Coords> {
+pub(crate) fn make_coords(source_map: &SourceMap, file: &SourceFile, span: Span) -> Option<Coords> {
     if span.is_empty() {
         debug_assert!(false, "can't make coords from empty span: {span:?}");
         return None;
@@ -65,7 +60,7 @@ pub(crate) fn make_coords(
     let line_and_byte_column = |pos: BytePos| -> Option<(usize, usize)> {
         let rpos = file.relative_position(pos);
         let line_index = file.lookup_line(rpos)?;
-        let line_start = file.lines()[line_index];
+        let line_start = file.lines_untracked()[line_index];
         // Line numbers and column numbers are 1-based, so add 1 to each.
         Some((line_index + 1, (rpos - line_start).to_usize() + 1))
     };

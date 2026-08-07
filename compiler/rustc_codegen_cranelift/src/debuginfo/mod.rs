@@ -52,9 +52,6 @@ pub(crate) struct FunctionDebugContext {
     entry_id: Option<UnitEntryId>,
     function_source_loc: (FileId, u64, u64),
     source_loc_set: IndexSet<(FileId, u64, u64)>,
-    /// Witness that this function's `def_anchor` dependency is recorded; needed for the
-    /// per-instruction line lookups in `set_debug_loc`.
-    pub(crate) anchored: rustc_middle::ty::DefAnchored,
 }
 
 impl DebugContext {
@@ -224,16 +221,14 @@ impl DebugContext {
     ) -> FunctionDebugContext {
         // Anchors this function's rendered lines (its own position and every body position
         // within its extent); see `TyCtxt::track_def_anchor`.
-        let anchored = tcx.track_def_anchor(instance.def_id());
-        let (file_id, line, column) =
-            self.get_span_loc(tcx, function_span, function_span, anchored);
+        tcx.track_def_anchor(instance.def_id());
+        let (file_id, line, column) = self.get_span_loc(tcx, function_span, function_span);
 
         if tcx.sess.opts.debuginfo == DebugInfo::LineTablesOnly {
             return FunctionDebugContext {
                 entry_id: None,
                 function_source_loc: (file_id, line, column),
                 source_loc_set: IndexSet::new(),
-                anchored,
             };
         }
 
@@ -300,7 +295,6 @@ impl DebugContext {
             entry_id: Some(entry_id),
             function_source_loc: (file_id, line, column),
             source_loc_set: IndexSet::new(),
-            anchored,
         }
     }
 
@@ -324,9 +318,9 @@ impl DebugContext {
         let scope = self.item_namespace(tcx, tcx.parent(def_id));
 
         // The static's rendered decl line anchors to the definition itself.
-        let anchored = tcx.track_def_anchor(def_id);
+        tcx.track_def_anchor(def_id);
         let span = tcx.def_span(def_id);
-        let (file_id, line, _column) = self.get_span_loc(tcx, span, span, anchored);
+        let (file_id, line, _column) = self.get_span_loc(tcx, span, span);
 
         let static_type = Instance::mono(tcx, def_id).ty(tcx, ty::TypingEnv::fully_monomorphized());
         let static_layout = tcx

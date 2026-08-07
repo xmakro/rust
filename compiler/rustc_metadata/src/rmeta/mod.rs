@@ -9,6 +9,7 @@ pub use encoder::{EncodedMetadata, encode_metadata, rendered_const};
 pub(crate) use parameterized::ParameterizedOverTcx;
 use rustc_abi::{FieldIdx, ReprOptions, VariantIdx};
 use rustc_ast as ast;
+use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::svh::Svh;
 use rustc_hir as hir;
@@ -292,6 +293,10 @@ pub(crate) struct CrateRoot {
     def_path_hash_map: LazyValue<DefPathHashMapRef<'static>>,
 
     source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
+    /// Hash of (file id, content hash) of every `SourceFile` encoded above, precomputed
+    /// so downstream incremental sessions can depend on this crate's source structure
+    /// (`crate_source_anchor`) without decoding any of the files.
+    source_files_digest: Fingerprint,
     target_modifiers: LazyArray<TargetModifier>,
     denied_partial_mitigations: LazyArray<DeniedPartialMitigation>,
 
