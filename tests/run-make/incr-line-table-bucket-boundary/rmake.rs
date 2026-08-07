@@ -1,18 +1,19 @@
 //@ ignore-cross-compile
 
-// Regression test for stale `#[track_caller]` lines at line-table bucket boundaries.
+// Regression test for stale `#[track_caller]` lines when an edit on the SAME source line
+// inserts a line start without moving byte offsets.
 //
-// Line lookup for a position on line L is a partition point over the line-start table: it
-// reads entries up to L *and* entry L + 1, which bounds the line from above. The
-// `file_lines_prefix_hash` dependency must therefore cover entry L + 1 as well. The
-// observed call sits on line 64, the last line of the first 64-entry bucket; the edit
-// turns a space inside a *sibling* module on the same source line into a line break, so
-// every byte offset is unchanged and only a line start is inserted right at the bucket
-// boundary. With the dependency keyed one bucket short, the second build reuses object
-// code with the stale caller line baked in.
+// `m2` begins mid-line after its sibling `m1`; the edit splits `m1` across two lines, so
+// every byte offset is unchanged and `m2`'s definition merely starts one line further
+// down. `def_anchor` hashes the line index of each definition's start, which is exactly
+// the rendered quantity, so this edit must go red for `m2` even though `m2`'s extent,
+// contents and relative spans are all untouched. The edit also sits at a 64-entry
+// boundary of the cached line-length blocks (`LINE_LENGTH_BLOCK`), pinning the
+// block-edge arithmetic.
 //
 // The `rustc_partition_*` assertions prove the invalidation is targeted: `m2`, which
-// bakes the caller line, is re-codegened, while the byte-identical `m1` is reused.
+// bakes the caller line, is re-codegened, while the byte-identical `m1`, which renders no
+// line data, is reused.
 
 use run_make_support::{rfs, run, rustc};
 

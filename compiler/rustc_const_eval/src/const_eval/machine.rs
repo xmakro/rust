@@ -215,7 +215,7 @@ impl<'tcx> CompileTimeInterpCx<'tcx> {
         // lookup anyway so this cannot silently go stale if the triple ever ends up in a
         // cached value or replayable diagnostic.
         if topmost.data_untracked().parent.is_none() {
-            self.tcx.track_def_lines(self.frame().instance().def_id());
+            self.tcx.track_def_anchor(self.frame().instance().def_id());
         }
         let (file, _line_index) = self.tcx.lookup_line_tracked(topmost);
         let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());

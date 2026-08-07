@@ -9,15 +9,16 @@
 // without changing the file's length, so every byte offset in `inner` is identical across
 // the two versions while `inner`'s line numbers shift by one. Span fingerprints only cover
 // (file, offset, length), so nothing about `inner` re-fingerprints across this edit; its
-// codegen must be invalidated through the explicit `file_lines_prefix_hash` dependency
-// instead. Without that dependency the second build would reuse object code with a stale
-// `#[track_caller]` caller line and stale debuginfo line tables baked in (the in-binary
-// assertion and the `DW_AT_decl_line` checks both catch that). See issue #74890.
+// codegen must be invalidated through the explicit `def_anchor` dependency instead (the
+// edit changes the hashed line index of `inner`'s start). Without that dependency the
+// second build would reuse object code with a stale `#[track_caller]` caller line and
+// stale debuginfo line tables baked in (the in-binary assertion and the `DW_AT_decl_line`
+// checks both catch that). See issue #74890.
 //
 // The `rustc_partition_*` assertions prove both directions: `inner` (whose bytes are
-// identical and only whose lines moved) is re-codegened, while `stable`, which observes
-// only lines in the first 64-entry line-table bucket, before the edit, is reused. The
-// latter distinguishes targeted invalidation from everything having gone red.
+// identical and only whose lines moved) is re-codegened, while `stable`, whose extent
+// lies entirely before the edit, is reused. The latter distinguishes targeted
+// invalidation from everything having gone red.
 
 use run_make_support::{llvm_dwarfdump, rfs, run, rustc};
 
@@ -37,8 +38,8 @@ fn source(split_pad: bool) -> (String, usize, usize) {
         "    }".to_string(),
         "}".to_string(),
     ];
-    // Push the edit site past the first 64 line starts, so that `stable`'s line-table
-    // bucket does not cover it.
+    // Push the edit site past the first 64 line starts, so the edit also crosses a
+    // 64-entry cached line-length block boundary.
     while lines.len() < 70 {
         lines.push("// filler".to_string());
     }

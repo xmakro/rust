@@ -1,10 +1,11 @@
 //@ ignore-cross-compile
 
 // The character columns rendered into `#[track_caller]` locations are derived from the
-// file's multibyte-character table, which `file_lines_prefix_hash` folds into every
-// bucket. Replacing a two-byte character with two one-byte characters earlier on the call
-// line changes that table without changing any byte offset or line start, so only the
-// table dependency invalidates the baked column; a stale reuse reports the old column.
+// file's multibyte-character table, whose in-extent entries `def_anchor` folds into each
+// definition's hash (widened left to the extent's first line start). Replacing a two-byte
+// character with two one-byte characters earlier on the call line changes that table
+// without changing any byte offset or line start, so only the anchor dependency
+// invalidates the baked column; a stale reuse reports the old column.
 
 use run_make_support::{rfs, run, rustc};
 

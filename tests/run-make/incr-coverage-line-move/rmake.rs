@@ -1,11 +1,12 @@
 //@ ignore-cross-compile
 //@ needs-profiler-runtime
 
-// Coverage mappings store line/column coordinates for positions throughout a file, so
-// coverage codegen records a dependency on the file's *entire* line table
+// Coverage mappings store line/column coordinates for positions throughout a function's
+// extent, so coverage codegen records the function's `def_anchor` dependency
 // (`TyCtxt::source_file_tracked`). This test moves a line break without changing byte
-// offsets: span fingerprints do not change, and only that dependency invalidates the
-// coverage mapping. A stale mapping would report the executed function at its old line.
+// offsets, shifting the covered function's anchor line: span fingerprints do not change,
+// and only that dependency invalidates the coverage mapping. A stale mapping would report
+// the executed function at its old line.
 
 use run_make_support::{
     cwd, has_extension, has_prefix, llvm_cov, llvm_profdata, rfs, run, rustc, shallow_find_files,

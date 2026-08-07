@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use rustc_abi::Size;
-use rustc_middle::ty::{ExistentialTraitRef, Instance, Ty};
+use rustc_middle::ty::{DefAnchored, ExistentialTraitRef, Instance, Ty};
 use rustc_span::{BytePos, SourceFile, Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
@@ -27,10 +27,14 @@ pub trait DebugInfoBuilderMethods<'tcx>: BackendTypes {
         maybe_definition_llfn: Option<Self::Function>,
     ) -> Self::DIScope;
 
+    // Methods taking a `DefAnchored` render line/column data derived from a span; the
+    // witness proves the caller recorded the `def_anchor` dependency covering the rendered
+    // position (see `TyCtxt::track_def_anchor`).
     fn dbg_create_lexical_block(
         &mut self,
         pos: BytePos,
         parent_scope: Self::DIScope,
+        anchored: DefAnchored,
     ) -> Self::DIScope;
 
     fn dbg_location_clone_with_discriminator(
@@ -44,6 +48,7 @@ pub trait DebugInfoBuilderMethods<'tcx>: BackendTypes {
         scope: Self::DIScope,
         inlined_at: Option<Self::DILocation>,
         span: Span,
+        anchored: DefAnchored,
     ) -> Self::DILocation;
 
     fn extend_scope_to_file(
@@ -61,6 +66,7 @@ pub trait DebugInfoBuilderMethods<'tcx>: BackendTypes {
         scope_metadata: Self::DIScope,
         variable_kind: VariableKind,
         span: Span,
+        anchored: DefAnchored,
     ) -> Self::DIVariable;
 
     // FIXME(eddyb) find a common convention for all of the debuginfo-related

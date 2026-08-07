@@ -76,14 +76,15 @@ impl DebugContext {
         tcx: TyCtxt<'_>,
         function_span: Span,
         span: Span,
+        _anchored: rustc_middle::ty::DefAnchored,
     ) -> (FileId, u64, u64) {
         // Match behavior of `FunctionCx::adjusted_span_and_dbg_scope`.
         let span = hygiene::walk_chain_collapsed(span, function_span);
-        // The function-level line anchor is recorded in `define_function`; spans parented
-        // outside the current function (inlined callees) anchor to their own parent here.
-        // The lookup itself is untracked.
+        // The passed witness covers the enclosing rendered definition; spans parented
+        // outside it (inlined callees) anchor to their own parent here. The lookup itself
+        // is untracked.
         if let Some(parent) = span.data_untracked().parent {
-            tcx.track_def_lines(parent.to_def_id());
+            tcx.track_def_anchor(parent.to_def_id());
         }
         let (file, line_index) = {
             let file = tcx.sess.source_map().lookup_source_file(span.lo());

@@ -135,9 +135,10 @@ fn fill_region_tables<'tcx>(
         return;
     };
     // Coverage mappings store line/column coordinates for positions throughout this
-    // function's extent, so anchor them to the function's `def_lines_hash`; see
-    // `TyCtxt::track_def_lines`.
-    let source_file = tcx.source_file_tracked(first_span.lo(), covfun.instance.def_id());
+    // function's extent, so anchor them to the function's `def_anchor`; see
+    // `TyCtxt::track_def_anchor`.
+    let (source_file, anchored) =
+        tcx.source_file_tracked(first_span.lo(), covfun.instance.def_id());
 
     let local_file_id = covfun.virtual_file_mapping.push_file(&source_file);
 
@@ -147,7 +148,11 @@ fn fill_region_tables<'tcx>(
     // `-Zcoverage-options=discard-all-spans-in-codegen` to force it to occur.
     let discard_all = tcx.sess.coverage_options().discard_all_spans_in_codegen;
     let make_coords = |span: Span| {
-        if discard_all { None } else { spans::make_coords(source_map, &source_file, span) }
+        if discard_all {
+            None
+        } else {
+            spans::make_coords(source_map, &source_file, span, anchored)
+        }
     };
 
     let llvm_cov::Regions {

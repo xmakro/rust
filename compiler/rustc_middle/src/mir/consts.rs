@@ -523,7 +523,7 @@ impl<'tcx> TyCtxt<'tcx> {
     pub fn span_as_caller_location(self, span: Span, caller: DefId) -> ConstValue {
         let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
         if topmost.data_untracked().parent.is_none() {
-            self.track_def_lines(caller);
+            self.track_def_anchor(caller);
         }
         let (file, _line_index) = self.lookup_line_tracked(topmost);
         let (line, _col, col_display) = file.lookup_file_pos_with_col_display(topmost.lo());

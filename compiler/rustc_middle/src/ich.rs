@@ -90,12 +90,12 @@ impl<'a> StableHashCtxt for StableHashState<'a> {
     /// unchanged. That is sound only because every consumer that renders line/column
     /// information from a span into a cached artifact (`#[track_caller]` locations, debuginfo
     /// line tables, coverage mappings, pretty-printed closure paths in cached diagnostics)
-    /// anchors the rendering to a definition's `def_lines_hash` (via
-    /// `TyCtxt::lookup_line_tracked`, `TyCtxt::track_def_lines` or
+    /// anchors the rendering to a definition's `def_anchor` (via
+    /// `TyCtxt::lookup_line_tracked`, `TyCtxt::track_def_anchor` or
     /// `TyCtxt::source_file_tracked`), whose extent covers the rendered position. Code that
     /// derives line/column data inside a tracked context and stores the result MUST record
     /// such an anchor. (The dependency covers line indices and character columns, not
-    /// display columns; see `TyCtxt::track_def_lines`.)
+    /// display columns; see `TyCtxt::track_def_anchor`.)
     ///
     /// IMPORTANT: `TAG_FULL_SPAN` in the incremental on-disk cache must encode enough to
     /// reconstruct the exact span, so that a reloaded span re-hashes to the fingerprint its

@@ -5,7 +5,7 @@ use gccjit::{Function, Location, RValue};
 use rustc_abi::Size;
 use rustc_codegen_ssa::mir::debuginfo::VariableKind;
 use rustc_codegen_ssa::traits::{DebugInfoBuilderMethods, DebugInfoCodegenMethods};
-use rustc_middle::ty::{ExistentialTraitRef, Instance, Ty};
+use rustc_middle::ty::{DefAnchored, ExistentialTraitRef, Instance, Ty};
 use rustc_span::{BytePos, Pos, SourceFile, Span, Symbol};
 use rustc_target::callconv::FnAbi;
 
@@ -29,6 +29,7 @@ impl<'a, 'gcc, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         &mut self,
         _pos: BytePos,
         _parent_scope: Self::DIScope,
+        _anchored: DefAnchored,
     ) -> Self::DIScope {
     }
 
@@ -53,9 +54,10 @@ impl<'a, 'gcc, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         _scope: Self::DIScope,
         _inlined_at: Option<Self::DILocation>,
         span: Span,
+        anchored: DefAnchored,
     ) -> Self::DILocation {
         let pos = span.lo();
-        let DebugLoc { file, line, col } = self.lookup_debug_loc(pos);
+        let DebugLoc { file, line, col } = self.lookup_debug_loc(pos, anchored);
         match file.name {
             rustc_span::FileName::Real(ref name) => self.context.new_location(
                 name.path(rustc_span::RemapPathScopeComponents::DEBUGINFO).to_string_lossy(),
@@ -73,6 +75,7 @@ impl<'a, 'gcc, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'a, 'gcc, 'tcx> {
         _scope_metadata: Self::DIScope,
         _variable_kind: VariableKind,
         _span: Span,
+        _anchored: DefAnchored,
     ) -> Self::DIVariable {
     }
 
@@ -140,10 +143,9 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
     // Source of Origin: cg_llvm
-    pub fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
-        // Untracked lookup; the line-anchoring dependencies that invalidate the emitted
-        // line tables are recorded per function and per span parent in
-        // `rustc_codegen_ssa::mir::debuginfo` and `create_function_debug_context`.
+    pub fn lookup_debug_loc(&self, pos: BytePos, _anchored: DefAnchored) -> DebugLoc {
+        // Untracked lookup; the `DefAnchored` witness proves the caller recorded the
+        // `def_anchor` dependency that invalidates the emitted line table entry.
         let (file, line_index) = {
             let file = self.sess().source_map().lookup_source_file(pos);
             let line = file.lookup_line(file.relative_position(pos));

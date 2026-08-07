@@ -1296,6 +1296,14 @@ impl<'tcx> TyCtxtAt<'tcx> {
     }
 }
 
+/// Proof that a `def_anchor` dependency covering a rendering about to happen has been
+/// recorded (see [`TyCtxt::track_def_anchor`]). The untracked line-lookup helpers in the
+/// codegen crates take this as an argument, so a rendering path without an anchor fails to
+/// compile instead of silently going stale. Only the tracked lookup methods on [`TyCtxt`]
+/// construct it.
+#[derive(Clone, Copy, Debug)]
+pub struct DefAnchored(pub(crate) ());
+
 impl<'tcx> TyCtxt<'tcx> {
     /// `tcx`-dependent operations performed for every created definition.
     pub fn create_def(
@@ -1539,7 +1547,7 @@ impl<'tcx> TyCtxt<'tcx> {
         self.sess.target.llvm_target.starts_with("nvptx")
     }
 
-    /// Records a dependency on `def_lines_hash(def)`, which covers the rendered line and
+    /// Records a dependency on `def_anchor(def)`, which covers the rendered line and
     /// column values of every position within `def`'s span extent. Line/column data stored
     /// into a query result or codegen artifact (`#[track_caller]` locations, debuginfo line
     /// tables, coverage mappings, pretty-printed paths in cached diagnostics) must be
@@ -1552,22 +1560,23 @@ impl<'tcx> TyCtxt<'tcx> {
     /// rendered line's text (`char_width`), which no fingerprint covers. An edit replacing a
     /// tab with a space, say, changes display columns without invalidating anything; the old
     /// line/column span hashing had the same limitation for byte-identical layouts.
-    pub fn track_def_lines(self, def: DefId) {
+    pub fn track_def_anchor(self, def: DefId) -> DefAnchored {
         // The dependency only exists to drive invalidation, so skip the query entirely when
         // there is no dep graph to record it in.
         if self.dep_graph.is_fully_enabled() {
             // Coalesce typeck children (closures, coroutines, inline consts) into their
             // root's node: the root's extent contains theirs, and they codegen into the
             // root's CGU anyway, so per-child nodes would add count without precision.
-            let _ = self.def_lines_hash(self.typeck_root_def_id(def));
+            let _ = self.def_anchor(self.typeck_root_def_id(def));
         }
+        DefAnchored(())
     }
 
     /// Returns the source file containing the span's start and the 0-based index of its
-    /// line (`None` if the file has no lines), recording a `def_lines_hash` dependency for
-    /// the span's parent definition; see [`Self::track_def_lines`]. A parentless span
+    /// line (`None` if the file has no lines), recording a `def_anchor` dependency for
+    /// the span's parent definition; see [`Self::track_def_anchor`]. A parentless span
     /// records no dependency here: its position is pinned by its own absolute fingerprint,
-    /// and the caller must anchor the *line* rendering by also calling `track_def_lines`
+    /// and the caller must anchor the *line* rendering by also calling `track_def_anchor`
     /// for the definition whose extent covers the rendered position (codegen does this once
     /// per function; definition-level renderings pass the definition itself).
     pub fn lookup_line_tracked(self, span: Span) -> (Arc<SourceFile>, Option<usize>) {
@@ -1575,17 +1584,21 @@ impl<'tcx> TyCtxt<'tcx> {
         let file = self.sess.source_map().lookup_source_file(data.lo);
         let line = file.lookup_line(file.relative_position(data.lo));
         if let Some(parent) = data.parent {
-            self.track_def_lines(parent.to_def_id());
+            self.track_def_anchor(parent.to_def_id());
         }
         (file, line)
     }
 
     /// Like [`Self::lookup_line_tracked`], but for consumers that derive line/column data
     /// for positions throughout a definition's extent (coverage mappings): records the
-    /// `def_lines_hash` dependency for `anchor` and returns the file containing `pos`.
-    pub fn source_file_tracked(self, pos: rustc_span::BytePos, anchor: DefId) -> Arc<SourceFile> {
-        self.track_def_lines(anchor);
-        self.sess.source_map().lookup_source_file(pos)
+    /// `def_anchor` dependency for `anchor` and returns the file containing `pos`.
+    pub fn source_file_tracked(
+        self,
+        pos: rustc_span::BytePos,
+        anchor: DefId,
+    ) -> (Arc<SourceFile>, DefAnchored) {
+        let anchored = self.track_def_anchor(anchor);
+        (self.sess.source_map().lookup_source_file(pos), anchored)
     }
 
     /// Like [`SourceMap::span_to_diagnostic_string`], but records the line-anchoring
@@ -1618,9 +1631,9 @@ impl<'tcx> TyCtxt<'tcx> {
             return;
         }
         match span.data_untracked().parent {
-            Some(parent) => self.track_def_lines(parent.to_def_id()),
-            None => self.track_def_lines(anchor),
-        }
+            Some(parent) => self.track_def_anchor(parent.to_def_id()),
+            None => self.track_def_anchor(anchor),
+        };
     }
 
     /// Returns `&'static core::panic::Location<'static>`.
@@ -2908,11 +2921,11 @@ pub fn provide(providers: &mut Providers) {
         // We want to check if the panic handler was defined in this crate
         tcx.lang_items().panic_impl().is_some_and(|did| did.is_local())
     };
-    providers.def_lines_hash = def_lines_hash;
+    providers.def_anchor = def_anchor;
     providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
 }
 
-fn def_lines_hash(tcx: TyCtxt<'_>, def: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
+fn def_anchor(tcx: TyCtxt<'_>, def: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
     use rustc_data_structures::fingerprint::Fingerprint;
     // For a foreign `def`, `def_span` decodes the span from metadata, which imports the
     // containing file into the source map. That matters when this query is forced during

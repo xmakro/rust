@@ -1,14 +1,14 @@
 //@ ignore-cross-compile
 
-// An incremental rebuild must be able to re-execute `file_lines_prefix_hash` dep nodes
-// recorded for *upstream* files. `helper` is an `#[inline]` function from another crate,
+// An incremental rebuild must be able to re-execute `def_anchor` dep nodes recorded for
+// *upstream* definitions. `helper` is an `#[inline]` function from another crate,
 // codegened locally into this crate's CGU with `dep.rs` in its debuginfo line tables, so
-// the first build records a line-table dep node for `dep.rs`. During try-mark-green that
-// node is forced before any span pointing into `dep.rs` has been decoded, i.e. before the
-// file has been imported into the source map; the provider must import upstream file
-// tables on a miss. If it cannot resolve the file, every such node counts as changed on
-// every rebuild and all reuse is lost, which the `rustc_partition_reused` assertion
-// catches.
+// the first build records `helper`'s anchor node. During try-mark-green that node is
+// forced before any span pointing into `dep.rs` has been decoded, i.e. before the file
+// has been imported into the source map; decoding the recovered definition's `def_span`
+// must import it as a side effect. If the provider cannot resolve the definition or its
+// file, every such node counts as changed on every rebuild and all reuse is lost, which
+// the `rustc_partition_reused` assertion catches.
 
 use run_make_support::{rfs, run, rustc};
 

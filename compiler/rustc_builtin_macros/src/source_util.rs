@@ -31,7 +31,7 @@ use crate::util::{
 /// This and `expand_column` below observe line/column data through untracked `SourceMap`
 /// lookups, which is sound only because expansion re-executes every session and the
 /// expanded literal feeds content-hashed tokens downstream. Any future caching of expansion
-/// output across sessions must record a line-table dependency (`def_lines_hash`)
+/// output across sessions must record a line-table dependency (`def_anchor`)
 /// for these observations.
 pub(crate) fn expand_line(
     cx: &mut ExtCtxt<'_>,

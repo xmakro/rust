@@ -218,6 +218,19 @@ fn line_extent_hash_covers_first_line_prefix_tables() {
 }
 
 #[test]
+fn line_extent_hash_covers_first_line_column() {
+    // The definition moves within its line while every line length and table entry stays
+    // the same (the sibling before it shrinks, trailing padding keeps the length):
+    // rendered columns of first-line positions change, so the hash must change.
+    let a = file_for_extent_hash("const AB: u8 = 1; fn f() {}\n");
+    let b = file_for_extent_hash("const A: u8 = 1; fn f() {} \n");
+    let (lo_a, hi_a) = extent_of(&a, "fn f", 9);
+    let (lo_b, hi_b) = extent_of(&b, "fn f", 9);
+    assert_ne!(lo_a, lo_b);
+    assert_ne!(a.line_extent_hash(lo_a, hi_a), b.line_extent_hash(lo_b, hi_b));
+}
+
+#[test]
 fn line_extent_hash_empty_file() {
     let empty = file_for_extent_hash("");
     assert_eq!(

@@ -216,10 +216,10 @@ rustc_queries! {
     }
 
     /// Hash of everything that determines rendered line/column values for positions within
-    /// a definition's extent: the file, the line index of the definition's start, and the
-    /// line-start, multibyte-character and position-normalization table entries inside the
-    /// extent, in shift-invariant form: line lengths and extent-relative positions (see
-    /// `SourceFile::line_extent_hash`). It does not
+    /// a definition's extent: the file, the line index and column of the definition's
+    /// start, and the line-start, multibyte-character and position-normalization table
+    /// entries inside the extent, in shift-invariant form: line lengths and extent-relative
+    /// positions (see `SourceFile::line_extent_hash`). It does not
     /// cover the file's text, so *display* columns (`char_width` over the rendered line)
     /// are protected only against edits that change one of the tables; see
     /// [`TyCtxt::lookup_line_tracked`].
@@ -232,8 +232,8 @@ rustc_queries! {
     /// and edits before it that shift bytes without adding or removing line breaks, leave
     /// the value unchanged. Do not read this query directly: use
     /// [`TyCtxt::lookup_line_tracked`], [`TyCtxt::source_file_tracked`] or
-    /// [`TyCtxt::track_def_lines`], which pair the data with the dependency.
-    query def_lines_hash(key: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
+    /// [`TyCtxt::track_def_anchor`], which pair the data with the dependency.
+    query def_anchor(key: DefId) -> rustc_data_structures::fingerprint::Fingerprint {
         // Accesses untracked data
         eval_always
         desc { "hashing the line structure of a definition's extent" }

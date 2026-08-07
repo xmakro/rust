@@ -15,7 +15,9 @@ use rustc_codegen_ssa::traits::*;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir::def_id::{DefId, DefIdMap};
 use rustc_middle::ty::layout::{HasTypingEnv, LayoutOf};
-use rustc_middle::ty::{self, GenericArgsRef, Instance, Ty, TypeVisitableExt, Unnormalized};
+use rustc_middle::ty::{
+    self, DefAnchored, GenericArgsRef, Instance, Ty, TypeVisitableExt, Unnormalized,
+};
 use rustc_session::Session;
 use rustc_session::config::{self, DebugInfo};
 use rustc_span::{
@@ -136,11 +138,11 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
 
         let def_id = instance.def_id();
         // Anchors this function's rendered lines (its own decl line and every body position
-        // within its extent); see `TyCtxt::track_def_lines`.
-        tcx.track_def_lines(def_id);
+        // within its extent); see `TyCtxt::track_def_anchor`.
+        let anchored = tcx.track_def_anchor(def_id);
         let (containing_scope, is_method) = get_containing_scope(self, instance);
         let span = tcx.def_span(def_id);
-        let loc = self.lookup_debug_loc(span.lo());
+        let loc = self.lookup_debug_loc(span.lo(), anchored);
         let file_metadata = file_metadata(self, &loc.file);
 
         let function_type_metadata =
@@ -375,8 +377,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         &mut self,
         pos: BytePos,
         parent_scope: &'ll DIScope,
+        anchored: DefAnchored,
     ) -> &'ll DIScope {
-        let loc = self.lookup_debug_loc(pos);
+        let loc = self.lookup_debug_loc(pos, anchored);
         let file_metadata = file_metadata(self, &loc.file);
         unsafe {
             llvm::LLVMDIBuilderCreateLexicalBlock(
@@ -402,6 +405,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         scope: &'ll DIScope,
         inlined_at: Option<&'ll DILocation>,
         span: Span,
+        anchored: DefAnchored,
     ) -> &'ll DILocation {
         // When emitting debugging information, DWARF (i.e. everything but MSVC)
         // treats line 0 as a magic value meaning that the code could not be
@@ -411,7 +415,7 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         let (line, col) = if span.is_dummy() && !self.sess().target.is_like_msvc {
             (0, 0)
         } else {
-            let DebugLoc { line, col, .. } = self.lookup_debug_loc(span.lo());
+            let DebugLoc { line, col, .. } = self.lookup_debug_loc(span.lo(), anchored);
             (line, col)
         };
 
@@ -435,8 +439,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         scope_metadata: &'ll DIScope,
         variable_kind: VariableKind,
         span: Span,
+        anchored: DefAnchored,
     ) -> &'ll DIVariable {
-        let loc = self.lookup_debug_loc(span.lo());
+        let loc = self.lookup_debug_loc(span.lo(), anchored);
         let file_metadata = file_metadata(self, &loc.file);
 
         let type_metadata = spanned_type_di_node(self, variable_type, span);
@@ -647,8 +652,9 @@ impl<'ll, 'tcx> DebugInfoBuilderMethods<'tcx> for Builder<'_, 'll, 'tcx> {
         // - scope: the compiler_move/compiler_copy function
         // - inlined_at: the current location (where the move/copy actually occurs)
         // - span: use the function's definition span
+        let anchored = self.cx().tcx.track_def_anchor(instance.def_id());
         let fn_span = self.cx().tcx.def_span(instance.def_id());
-        let inlined_loc = self.dbg_loc(di_scope, saved_loc, fn_span);
+        let inlined_loc = self.dbg_loc(di_scope, saved_loc, fn_span, anchored);
 
         // Set the temporary debug location
         self.set_dbg_loc(inlined_loc);
@@ -685,10 +691,10 @@ impl<'ll> CodegenCx<'ll, '_> {
     // FIXME(eddyb) rename this to better indicate it's a duplicate of
     // `lookup_char_pos` rather than `dbg_loc`, perhaps by making
     // `lookup_char_pos` return the right information instead.
-    fn lookup_debug_loc(&self, pos: BytePos) -> DebugLoc {
-        // This is an untracked lookup: the line-anchoring dependencies that invalidate the
-        // emitted line tables are recorded per function and per span parent in
-        // `rustc_codegen_ssa::mir::debuginfo` and `create_function_debug_context`.
+    fn lookup_debug_loc(&self, pos: BytePos, _anchored: DefAnchored) -> DebugLoc {
+        // This is an untracked lookup: the `DefAnchored` witness proves the caller recorded
+        // the `def_anchor` dependency that invalidates the emitted line table entry (per
+        // function, per span parent, or per rendered definition).
         let (file, line, col) = match self.sess().source_map().lookup_line(pos) {
             Ok(SourceFileAndLine { sf: file, line }) => {
                 let line_pos = file.lines()[line];

@@ -2315,17 +2315,18 @@ impl SourceFile {
     }
 
     /// Hash of everything that determines rendered line/column values for positions in
-    /// `[lo, hi]`: the value backing the `def_lines_hash` query.
+    /// `[lo, hi]`: the value backing the `def_anchor` query.
     ///
     /// `line(pos)` is `line(lo)` plus the number of line starts in `(lo, pos]`, and
     /// `col(pos)` counts from the last line start at or before `pos`, so the rendered
     /// values for every position in the extent are fully determined by the line index of
-    /// `lo` together with the lengths of the extent's lines. The character-table sections
-    /// are widened on the left to `lo`'s line start: character columns on the first line
-    /// also depend on multibyte characters between the line start and `lo` (a definition
-    /// may begin mid-line, after a sibling). Lengths and relative table entries are
-    /// invariant under edits before the extent that only shift byte offsets, while edits
-    /// that add or remove line breaks before it change the hashed line index of `lo`.
+    /// `lo`, `lo`'s own column on that line, and the lengths of the extent's lines. The
+    /// character-table sections are widened on the left to `lo`'s line start: character
+    /// columns on the first line also depend on multibyte characters between the line
+    /// start and `lo` (a definition may begin mid-line, after a sibling). Lengths,
+    /// columns and relative table entries are invariant under edits before the extent
+    /// that only shift byte offsets, while edits that add or remove line breaks before
+    /// it change the hashed line index of `lo`.
     ///
     /// Runs of [`LINE_LENGTH_BLOCK`] lengths aligned to the file's line index come from a
     /// per-file cache built in one pass, so large extents cost their edges plus one cached
@@ -2338,6 +2339,10 @@ impl SourceFile {
             Some(line) => self.lines()[line],
             None => RelativeBytePos(0),
         };
+        // The extent's column on its first line: a first-line position renders as this plus
+        // its extent-relative offset, and the extent can move within its line without any
+        // line length or table entry changing.
+        Hash::hash(&(lo.0 - extent_start.0), &mut hasher);
         if let Some(a) = anchor_line {
             let e = self.lookup_line(hi).unwrap_or(a).max(a);
             // The count first, so sections cannot alias each other.
