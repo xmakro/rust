@@ -209,7 +209,11 @@ rustc_queries! {
     /// Contrary to `def_span` below, this query returns the full absolute span of the definition.
     /// This span is meant for dep-tracking rather than diagnostics. It should not be used outside
     /// of rustc_middle::hir::source_map.
-    query source_span(key: LocalDefId) -> Span {
+    ///
+    /// The result is wrapped in [`rustc_span::AnchorSpan`] so that its fingerprint excludes
+    /// the definition's position: a definition that merely moves within its file keeps a
+    /// green anchor. Position renderings depend on `def_anchor` below instead.
+    query source_span(key: LocalDefId) -> rustc_span::AnchorSpan {
         // Accesses untracked data
         eval_always
         desc { "getting the source span" }
@@ -225,12 +229,15 @@ rustc_queries! {
     /// [`TyCtxt::lookup_line_tracked`].
     ///
     /// Span fingerprints only cover positions, relative to the enclosing definition where
-    /// parented; see `stable_hash_span`. Code that derives line/column information from a
-    /// span and stores the result in a query result or codegen artifact must depend on this
-    /// query for the definition anchoring the span, so that edits which move line breaks
-    /// without changing byte offsets invalidate the derived data. Edits after the extent,
-    /// and edits before it that shift bytes without adding or removing line breaks, leave
-    /// the value unchanged. Do not read this query directly: use
+    /// parented (see `stable_hash_span`), and the `source_span` anchor fingerprint above
+    /// deliberately excludes the definition's position. Code that derives line/column
+    /// information from a span and stores the result in a query result or codegen artifact
+    /// must therefore depend on this query for the definition anchoring the span: it is
+    /// the only dependency that invalidates the derived data, both when an edit moves line
+    /// breaks without changing byte offsets and when the definition itself moves (the
+    /// hashed line index and column of its start are exactly the rendered quantities).
+    /// Edits after the extent, and edits before it that shift bytes without adding or
+    /// removing line breaks, leave the value unchanged. Do not read this query directly: use
     /// [`TyCtxt::lookup_line_tracked`], [`TyCtxt::source_file_tracked`] or
     /// [`TyCtxt::track_def_anchor`], which pair the data with the dependency.
     /// The extent whose line structure `def_anchor` hashes for a local definition: the

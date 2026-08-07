@@ -1543,9 +1543,12 @@ impl<'tcx> TyCtxt<'tcx> {
     /// column values of every position within `def`'s span extent. Line/column data stored
     /// into a query result or codegen artifact (`#[track_caller]` locations, debuginfo line
     /// tables, coverage mappings, pretty-printed paths in cached diagnostics) must be
-    /// anchored this way, because span fingerprints alone do not cover line structure (see
-    /// `stable_hash_span`): an edit that moves a line break without changing byte offsets
-    /// re-fingerprints nothing, and only this dependency invalidates the derived data.
+    /// anchored this way, because span fingerprints alone cover neither line structure nor
+    /// the definition's position (parented spans hash relative to their parent, and the
+    /// parent's `source_span` fingerprint deliberately excludes its offset; see
+    /// `stable_hash_span` and `rustc_span::AnchorSpan`): an edit that moves a line break
+    /// without changing byte offsets, or moves the definition wholesale, re-fingerprints
+    /// nothing, and only this dependency invalidates the derived data.
     ///
     /// The dependency covers line indices and character columns (the line-start, multibyte
     /// and normalization tables), but not *display* columns: those additionally depend on the
@@ -1619,7 +1622,7 @@ impl<'tcx> TyCtxt<'tcx> {
                 .spans
                 .inner_span
         } else {
-            self.source_span(local)
+            self.source_span(local).0
         }
     }
 
@@ -3026,7 +3029,9 @@ pub fn provide(providers: &mut Providers) {
     providers.def_anchor = def_anchor;
     providers.def_anchor_extent = def_anchor_extent;
     providers.crate_source_anchor = crate_source_anchor;
-    providers.source_span = |tcx, def_id| tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP);
+    providers.source_span = |tcx, def_id| {
+        rustc_span::AnchorSpan(tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP))
+    };
 }
 
 fn def_anchor(tcx: TyCtxt<'_>, def: DefId) -> rustc_data_structures::fingerprint::Fingerprint {

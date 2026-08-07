@@ -138,6 +138,10 @@ fn fill_region_tables<'tcx>(
     // function's extent, so anchor them to the function's `def_anchor`; see
     // `TyCtxt::track_def_anchor`.
     let source_file = tcx.source_file_tracked(first_span.lo(), covfun.instance.def_id());
+    // That single anchor covers every mapping span only because lowering parents all of a
+    // body's spans to definitions sharing the instance's typeck root (whose extent contains
+    // theirs). A mapping span outside the anchored extent trips the line-lookup hook's
+    // conservative fallback, so it costs reuse rather than staleness.
 
     let local_file_id = covfun.virtual_file_mapping.push_file(&source_file);
 

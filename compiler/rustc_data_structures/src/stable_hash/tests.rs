@@ -11,6 +11,9 @@ impl StableHashCtxt for () {
     fn stable_hash_span(&mut self, _: RawSpan, _: &mut StableHasher) {
         panic!();
     }
+    fn stable_hash_anchor_span(&mut self, _: RawSpan, _: &mut StableHasher) {
+        panic!();
+    }
     fn def_path_hash(&self, _: RawDefId) -> RawDefPathHash {
         panic!();
     }

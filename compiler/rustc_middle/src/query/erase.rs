@@ -254,6 +254,7 @@ impl_erasable_for_types_with_no_type_params! {
     rustc_session::config::OptLevel,
     rustc_session::config::SymbolManglingVersion,
     rustc_session::cstore::CrateDepKind,
+    rustc_span::AnchorSpan,
     rustc_span::ExpnId,
     rustc_span::Span,
     rustc_span::Symbol,

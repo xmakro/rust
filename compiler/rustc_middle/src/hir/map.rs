@@ -1227,7 +1227,9 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
                 .definitions()
                 .map(|def_id| {
                     let def_path_hash = definitions.def_path_hash(def_id);
-                    let span = tcx.source_span(def_id);
+                    // Hash the inner span (position included): the SVH deliberately keeps
+                    // its position sensitivity even though the anchor fingerprint does not.
+                    let span = tcx.source_span(def_id).0;
                     debug_assert_eq!(span.parent(), None);
                     (def_path_hash, span)
                 })
