@@ -24,9 +24,11 @@ pub trait StableHashCtxt {
     /// The main event: stable hashing of a span.
     fn stable_hash_span(&mut self, span: RawSpan, hasher: &mut StableHasher);
 
-    /// Stable hashing of a definition's span used as an *anchor* for relative spans: covers
-    /// everything observable from the span except its position in the file, so that a
-    /// definition which merely moves keeps its fingerprint. See `AnchorSpan` in `rustc_span`.
+    /// Position-independent stable hashing of a span: covers everything observable from the
+    /// span except its position, so that code which merely moves keeps its fingerprint.
+    /// Parented spans hash relative to their parent (already position-independent); absolute
+    /// spans hash as (file, length) instead of (file, offset, length). Used for definition
+    /// anchors (see `AnchorSpan` in `rustc_span`) and for the spans inside `ExpnData`.
     fn stable_hash_anchor_span(&mut self, span: RawSpan, hasher: &mut StableHasher);
 
     /// Compute a `DefPathHash`.

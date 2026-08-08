@@ -321,7 +321,11 @@ pub fn change_return_impl_trait() -> impl Clone {
 #[cfg(not(any(bpass1,bpass4)))]
 #[rustc_clean(cfg = "bpass2", except = "hir_owner")]
 #[rustc_clean(cfg = "bpass3")]
-#[rustc_clean(cfg = "bpass5", except = "hir_owner, typeck_root")]
+// `typeck_root` used to be dirty here (but clean in the identical `bpass2` edit): the
+// desugaring expansions in this file were disambiguated by expansion order, so their hashes
+// depended on session history. With desugaring call sites parented, the two revisions agree.
+// The bound change itself is checked by `check_well_formed` on the opaque, which stays dirty.
+#[rustc_clean(cfg = "bpass5", except = "hir_owner")]
 #[rustc_clean(cfg = "bpass6")]
 pub fn change_return_impl_trait() -> impl  Copy {
     0u32

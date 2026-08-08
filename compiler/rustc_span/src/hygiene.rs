@@ -158,6 +158,18 @@ impl ExpnHash {
     fn new(stable_crate_id: StableCrateId, local_hash: Hash64) -> ExpnHash {
         ExpnHash(Fingerprint::new(stable_crate_id.0, local_hash))
     }
+
+    #[inline]
+    pub fn as_fingerprint(self) -> Fingerprint {
+        self.0
+    }
+
+    /// Reconstitutes an [ExpnHash] from its raw fingerprint bits. Only for recovering a
+    /// dep-node key whose fingerprint was produced by [`Self::as_fingerprint`].
+    #[inline]
+    pub fn from_fingerprint(fingerprint: Fingerprint) -> ExpnHash {
+        ExpnHash(fingerprint)
+    }
 }
 
 /// A property of a macro expansion that determines how identifiers
@@ -316,7 +328,15 @@ impl ExpnId {
     /// Returns span for the macro which originally caused this expansion to happen.
     ///
     /// Stops backtracing at include! boundary.
-    pub fn expansion_cause(mut self) -> Option<Span> {
+    pub fn expansion_cause(self) -> Option<Span> {
+        self.expansion_cause_with_expn().map(|(_, span)| span)
+    }
+
+    /// Like [`Self::expansion_cause`], but also returns the expansion whose call site the
+    /// cause span is. Consumers that render the cause's position into a cached artifact
+    /// need the expansion to record a position dependency for it when the span has no
+    /// parent definition; see `TyCtxt::span_as_caller_location`.
+    pub fn expansion_cause_with_expn(mut self) -> Option<(ExpnId, Span)> {
         let mut last_macro = None;
         loop {
             // Fast path to avoid locking.
@@ -328,8 +348,9 @@ impl ExpnId {
             if expn_data.kind == ExpnKind::Macro(MacroKind::Bang, sym::include) {
                 break;
             }
+            let cause_expn = self;
             self = expn_data.call_site.ctxt().outer_expn();
-            last_macro = Some(expn_data.call_site);
+            last_macro = Some((cause_expn, expn_data.call_site));
         }
         last_macro
     }
@@ -486,11 +507,18 @@ impl HygieneData {
         span
     }
 
-    fn walk_chain_collapsed(&self, mut span: Span, to: Span) -> Span {
+    fn walk_chain_collapsed(&self, span: Span, to: Span) -> Span {
+        self.walk_chain_collapsed_with_expn(span, to).0
+    }
+
+    /// Like `walk_chain_collapsed`, but also returns the expansion whose call site the
+    /// returned span is (`None` if nothing was collapsed). Consumers that render the
+    /// returned span's position into a cached artifact need the expansion to record a
+    /// position dependency for it; see `TyCtxt::walk_chain_collapsed_tracked`.
+    fn walk_chain_collapsed_with_expn(&self, mut span: Span, to: Span) -> (Span, Option<ExpnId>) {
         let orig_span = span;
-        let mut ret_span = span;
+        let mut ret = (span, None);
         debug!("walk_chain_collapsed({:?}, {:?})", span, to);
-        debug!("walk_chain_collapsed: span ctxt = {:?}", span.ctxt());
         while let ctxt = span.ctxt()
             && !ctxt.is_root()
             && ctxt != to.ctxt()
@@ -498,14 +526,13 @@ impl HygieneData {
             let outer_expn = self.outer_expn(ctxt);
             debug!("walk_chain_collapsed({:?}): outer_expn={:?}", span, outer_expn);
             let expn_data = self.expn_data(outer_expn);
-            debug!("walk_chain_collapsed({:?}): expn_data={:?}", span, expn_data);
             span = expn_data.call_site;
             if expn_data.collapse_debuginfo {
-                ret_span = span;
+                ret = (span, Some(outer_expn));
             }
         }
-        debug!("walk_chain_collapsed: for span {:?} >>> return span = {:?}", orig_span, ret_span);
-        ret_span
+        debug!("walk_chain_collapsed: for span {:?} >>> return span = {:?}", orig_span, ret.0);
+        ret
     }
 
     fn adjust(&self, ctxt: &mut SyntaxContext, expn_id: ExpnId) -> Option<ExpnId> {
@@ -623,6 +650,11 @@ pub fn walk_chain(span: Span, to: SyntaxContext) -> Span {
 /// The returned span can then be used in emitted debuginfo.
 pub fn walk_chain_collapsed(span: Span, to: Span) -> Span {
     HygieneData::with(|data| data.walk_chain_collapsed(span, to))
+}
+
+/// See `HygieneData::walk_chain_collapsed_with_expn`.
+pub fn walk_chain_collapsed_with_expn(span: Span, to: Span) -> (Span, Option<ExpnId>) {
+    HygieneData::with(|data| data.walk_chain_collapsed_with_expn(span, to))
 }
 
 pub fn update_dollar_crate_names(mut get_name: impl FnMut(SyntaxContext) -> Symbol) {
@@ -965,7 +997,7 @@ impl Span {
 
 /// A subset of properties from both macro definition and macro call available through global data.
 /// Avoid using this if you have access to the original definition or call structures.
-#[derive(Clone, Debug, Encodable, Decodable, StableHash)]
+#[derive(Clone, Debug, Encodable, Decodable)]
 pub struct ExpnData {
     // --- The part unique to each expansion.
     pub kind: ExpnKind,
@@ -1026,6 +1058,46 @@ pub struct ExpnData {
 
 impl !PartialEq for ExpnData {}
 impl !Hash for ExpnData {}
+
+impl StableHash for ExpnData {
+    fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
+        let ExpnData {
+            kind,
+            parent,
+            call_site,
+            disambiguator,
+            def_site,
+            allow_internal_unstable,
+            edition,
+            macro_def_id,
+            parent_module,
+            allow_internal_unsafe,
+            local_inner_macros,
+            collapse_debuginfo,
+            hide_backtrace,
+        } = self;
+        kind.stable_hash(hcx, hasher);
+        parent.stable_hash(hcx, hasher);
+        // The call and definition sites are hashed position-independently, so an expansion
+        // whose call site merely moves (because text above it was edited) keeps its
+        // `ExpnHash` and everything expanded from it stays green. Textually identical
+        // invocations, which previously differed only by position, are kept distinct by the
+        // existing `disambiguator` mechanism: `update_disambiguator` indexes colliding
+        // expansions in expansion order, so an identical invocation keeps its hash unless an
+        // expansion of the same shape is inserted or removed before it.
+        hcx.stable_hash_anchor_span(call_site.to_raw_span(), hasher);
+        disambiguator.stable_hash(hcx, hasher);
+        hcx.stable_hash_anchor_span(def_site.to_raw_span(), hasher);
+        allow_internal_unstable.stable_hash(hcx, hasher);
+        edition.stable_hash(hcx, hasher);
+        macro_def_id.stable_hash(hcx, hasher);
+        parent_module.stable_hash(hcx, hasher);
+        allow_internal_unsafe.stable_hash(hcx, hasher);
+        local_inner_macros.stable_hash(hcx, hasher);
+        collapse_debuginfo.stable_hash(hcx, hasher);
+        hide_backtrace.stable_hash(hcx, hasher);
+    }
+}
 
 impl ExpnData {
     pub fn new(

@@ -37,6 +37,9 @@ pub enum KeyFingerprintStyle {
     HirId,
     /// Query key was `()` or equivalent, so fingerprint is just zero.
     Unit,
+    /// The key packs losslessly into the 128-bit fingerprint, so recovery is a bit-copy.
+    /// Used for `ExpnHash` keys.
+    SelfHash,
     /// The fingerprint is an opaque hash, and a key cannot be reconstructed from it.
     Opaque,
 }
@@ -51,7 +54,8 @@ impl KeyFingerprintStyle {
         match self {
             KeyFingerprintStyle::DefPathHash
             | KeyFingerprintStyle::Unit
-            | KeyFingerprintStyle::HirId => true,
+            | KeyFingerprintStyle::HirId
+            | KeyFingerprintStyle::SelfHash => true,
             KeyFingerprintStyle::Opaque => false,
         }
     }

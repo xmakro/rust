@@ -1725,8 +1725,51 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
+    /// Records the anchors that cover renderings of a parentless span produced by the
+    /// expansion `ctxt`: the expansion's call-site extent (expansion output reuses input
+    /// positions, e.g. derive-generated bodies carry the struct's field spans) and the
+    /// macro's own definition (def-site tokens render into the macro's file).
+    pub fn track_expansion_anchors(self, span: Span) {
+        let sdata = span.data_untracked();
+        if sdata.ctxt.is_root() || !self.dep_graph.is_fully_enabled() {
+            return;
+        }
+        // Skip when a recorded anchor already covers the rendered position: an
+        // `ExpnHash`-keyed node is fragile across edits (inserting any invocation
+        // shifts the disambiguators of later identical invocations, making the old
+        // hashes unrecoverable and their dependents unconditionally red), so prefer
+        // the definition-keyed anchors wherever they suffice.
+        if !sdata.is_dummy() && !self.sess.source_map().files().is_empty() {
+            let file = self.sess.source_map().lookup_source_file(sdata.lo);
+            if file.contains(sdata.lo)
+                && self.dep_graph.line_extent_covers(file.stable_id, sdata.lo)
+            {
+                return;
+            }
+        }
+        let expn = sdata.ctxt.outer_expn();
+        let _ = self.expn_anchor(expn.expn_hash());
+        let data = expn.expn_data();
+        self.register_expn_extent(&data);
+        if let Some(macro_def) = data.macro_def_id {
+            self.track_def_anchor(macro_def);
+        }
+    }
+
+    /// Marks the extent covered by a just-recorded `expn_anchor` dependency, mirroring
+    /// its provider: the call-site extent for bang macros, the whole containing file
+    /// otherwise.
+    pub(crate) fn register_expn_extent(self, data: &rustc_span::ExpnData) {
+        let cs = data.call_site.data_untracked();
+        if expn_extent_is_call_site(data) {
+            self.register_anchored_extent(cs);
+        } else {
+            self.register_anchored_file(cs);
+        }
+    }
+
     /// Marks the whole file containing the span as covered, mirroring the file-granular
-    /// anchors (foreign definitions).
+    /// anchors (`expn_anchor`, foreign definitions).
     pub(crate) fn register_anchored_file(self, data: rustc_span::SpanData) {
         if data.is_dummy() || self.sess.source_map().files().is_empty() {
             return;
@@ -1739,6 +1782,36 @@ impl<'tcx> TyCtxt<'tcx> {
                 file.end_position(),
             );
         }
+    }
+
+    /// Collapses a span to the outermost `#[collapse_debuginfo]` call site (like
+    /// `rustc_span::hygiene::walk_chain_collapsed`), recording the dependency that
+    /// invalidates artifacts rendering the result's position. A parented call site is
+    /// covered by its parent's `def_anchor`, which the caller's tracked lookup records; a
+    /// parentless one (an item-level invocation) has no definition to anchor to, so the
+    /// expansion's own `expn_anchor` is recorded, with the call site registered as the
+    /// covered extent. Use this, never the untracked walk, when the resulting span feeds
+    /// a cached artifact.
+    pub fn walk_chain_collapsed_tracked(self, span: Span, to: Span) -> Span {
+        let (walked, expn) = rustc_span::hygiene::walk_chain_collapsed_with_expn(span, to);
+        if let Some(expn) = expn
+            && walked.data_untracked().parent.is_none()
+            && self.dep_graph.is_fully_enabled()
+        {
+            // Skip the fragile `ExpnHash`-keyed node when a recorded anchor already
+            // covers the collapsed position; see `track_expansion_anchors`.
+            let wdata = walked.data_untracked();
+            let covered = !wdata.is_dummy() && !self.sess.source_map().files().is_empty() && {
+                let file = self.sess.source_map().lookup_source_file(wdata.lo);
+                file.contains(wdata.lo)
+                    && self.dep_graph.line_extent_covers(file.stable_id, wdata.lo)
+            };
+            if !covered {
+                let _ = self.expn_anchor(expn.expn_hash());
+                self.register_expn_extent(&expn.expn_data());
+            }
+        }
+        walked
     }
 
     /// Returns `&'static core::panic::Location<'static>`.
@@ -3029,6 +3102,7 @@ pub fn provide(providers: &mut Providers) {
     providers.def_anchor = def_anchor;
     providers.def_anchor_extent = def_anchor_extent;
     providers.crate_source_anchor = crate_source_anchor;
+    providers.expn_anchor = expn_anchor;
     providers.source_span = |tcx, def_id| {
         rustc_span::AnchorSpan(tcx.untracked.source_span.get(def_id).unwrap_or(DUMMY_SP))
     };
@@ -3172,10 +3246,58 @@ fn crate_source_anchor(
     tcx.source_files_digest(cnum)
 }
 
+fn expn_anchor(
+    tcx: TyCtxt<'_>,
+    hash: rustc_span::ExpnHash,
+) -> rustc_data_structures::fingerprint::Fingerprint {
+    let expn = rustc_span::ExpnId::from_hash(hash).or_else(|| {
+        // Foreign expansions register lazily when something decodes them, and forcing a
+        // node recovered from a previous session can come first; resolve through the
+        // defining crate's metadata. A vanished crate or expansion keeps the sentinel,
+        // which re-executes dependents.
+        let stable_crate_id = hash.stable_crate_id();
+        if stable_crate_id == tcx.stable_crate_id(LOCAL_CRATE) {
+            return None;
+        }
+        let cnum = *tcx.untracked.stable_crate_ids.read().get(&stable_crate_id)?;
+        tcx.expn_hash_to_expn_id(cnum, 0, hash)
+    });
+    match expn {
+        Some(expn) => {
+            let data = expn.expn_data().call_site.data_untracked();
+            if data.is_dummy() || tcx.sess.source_map().files().is_empty() {
+                return rustc_data_structures::fingerprint::Fingerprint::ZERO;
+            }
+            if expn_extent_is_call_site(&expn.expn_data()) {
+                // A bang invocation's call site is the whole `foo!(...)` span, a
+                // trustworthy extent containing every input position its output can
+                // render.
+                span_anchor_hash(tcx, data)
+            } else {
+                // A derive or attribute invocation records only the path as its call
+                // site (the cause span of a `#[derive]` starts at the attribute), so
+                // the anchor covers the whole containing file.
+                let file = tcx.sess.source_map().lookup_source_file(data.lo);
+                span_anchor_hash(
+                    tcx,
+                    rustc_span::SpanData { lo: file.start_pos, hi: file.end_position(), ..data },
+                )
+            }
+        }
+        None => rustc_data_structures::fingerprint::Fingerprint::ZERO,
+    }
+}
+
 /// Hash of everything that determines rendered line/column values for positions within
 /// `data`: the value backing `def_anchor` and `expn_anchor`. Zero for dummy or unmapped
 /// spans; the constant still differs from every real extent hash, so a span gaining a
 /// real position invalidates.
+/// Whether an expansion's recorded call site is a trustworthy extent for its rendered
+/// positions (see `expn_anchor`): true for bang macros, whose call site is the whole
+/// invocation.
+fn expn_extent_is_call_site(data: &rustc_span::ExpnData) -> bool {
+    matches!(data.kind, rustc_span::ExpnKind::Macro(rustc_span::MacroKind::Bang, _))
+}
 
 fn span_anchor_hash(
     tcx: TyCtxt<'_>,
@@ -3196,8 +3318,8 @@ fn span_anchor_hash(
     } else {
         file.relative_position(data.hi)
     };
-    // The file id pins the rendered filename and catches a definition moving between
-    // files without changing its extent-relative line structure.
+    // The file id pins the rendered filename and catches the span moving between files
+    // without changing its extent-relative line structure.
     let mut hasher = rustc_data_structures::stable_hash::StableHasher::new();
     std::hash::Hash::hash(&file.stable_id, &mut hasher);
     std::hash::Hash::hash(&file.line_extent_hash(lo, hi), &mut hasher);

@@ -19,7 +19,7 @@ use rustc_middle::ty::{
     Unnormalized, Visibility,
 };
 use rustc_session::config::{self, DebugInfo, Lto};
-use rustc_span::{DUMMY_SP, FileName, RemapPathScopeComponents, SourceFile, Span, Symbol, hygiene};
+use rustc_span::{DUMMY_SP, FileName, RemapPathScopeComponents, SourceFile, Span, Symbol};
 use rustc_symbol_mangling::typeid_for_trait_ref;
 use rustc_target::spec::{Arch, DebuginfoKind};
 use smallvec::smallvec;
@@ -1830,12 +1830,15 @@ pub(crate) fn file_metadata_from_def_id<'ll>(
     def_id: Option<DefId>,
 ) -> DefinitionLocation<'ll> {
     if let Some(def_id) = def_id
-        && let span = hygiene::walk_chain_collapsed(cx.tcx.def_span(def_id), DUMMY_SP)
+        && let span = cx.tcx.walk_chain_collapsed_tracked(cx.tcx.def_span(def_id), DUMMY_SP)
         && !span.is_dummy()
     {
-        // The rendered line anchors to the definition itself.
+        // The rendered line anchors to the definition itself, or to the collapsed call
+        // site's expansion when the definition is macro-generated (the tracked walk
+        // above records that anchor).
         cx.tcx.track_def_anchor(def_id);
         let loc = cx.lookup_debug_loc(span.lo());
+
         (file_metadata(cx, &loc.file), loc.line)
     } else {
         (unknown_file_metadata(cx), UNKNOWN_LINE_NUMBER)

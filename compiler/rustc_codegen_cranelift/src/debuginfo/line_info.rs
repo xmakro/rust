@@ -6,9 +6,7 @@ use std::path::{Component, Path};
 use cranelift_codegen::MachSrcLoc;
 use cranelift_codegen::binemit::CodeOffset;
 use gimli::write::{FileId, FileInfo, LineProgram, LineString, LineStringTable};
-use rustc_span::{
-    FileName, Pos, RemapPathScopeComponents, SourceFile, SourceFileHashAlgorithm, hygiene,
-};
+use rustc_span::{FileName, Pos, RemapPathScopeComponents, SourceFile, SourceFileHashAlgorithm};
 
 use crate::debuginfo::FunctionDebugContext;
 use crate::debuginfo::emit::address_for_func;
@@ -77,8 +75,9 @@ impl DebugContext {
         function_span: Span,
         span: Span,
     ) -> (FileId, u64, u64) {
-        // Match behavior of `FunctionCx::adjusted_span_and_dbg_scope`.
-        let span = hygiene::walk_chain_collapsed(span, function_span);
+        // Match behavior of `FunctionCx::adjusted_span_and_dbg_scope`. The tracked walk
+        // records the expansion anchor when it collapses to a parentless call site.
+        let span = tcx.walk_chain_collapsed_tracked(span, function_span);
         // The function-level anchor is recorded in `define_function`; spans parented
         // outside the current function (inlined callees) anchor to their own parent, and
         // parentless spans from non-collapsed expansions anchor the macro's definition.
@@ -88,10 +87,8 @@ impl DebugContext {
         if let Some(parent) = data.parent {
             tcx.track_def_anchor(parent.to_def_id());
         }
-        if !data.ctxt.is_root()
-            && let Some(macro_def) = data.ctxt.outer_expn_data().macro_def_id
-        {
-            tcx.track_def_anchor(macro_def);
+        if !data.ctxt.is_root() {
+            tcx.track_expansion_anchors(span);
         }
         let (file, line_index) = {
             let file = tcx.sess.source_map().lookup_source_file(span.lo());

@@ -227,3 +227,20 @@ impl<'tcx> DepNodeKey<'tcx> for LocalModDefId {
         LocalDefId::try_recover_key(tcx, dep_node).map(LocalModDefId::new_unchecked)
     }
 }
+
+impl<'tcx> DepNodeKey<'tcx> for rustc_span::ExpnHash {
+    #[inline(always)]
+    fn key_fingerprint_style() -> KeyFingerprintStyle {
+        KeyFingerprintStyle::SelfHash
+    }
+
+    #[inline(always)]
+    fn to_fingerprint(&self, _: TyCtxt<'tcx>) -> Fingerprint {
+        self.as_fingerprint()
+    }
+
+    #[inline(always)]
+    fn try_recover_key(_: TyCtxt<'tcx>, dep_node: &DepNode) -> Option<Self> {
+        Some(rustc_span::ExpnHash::from_fingerprint(dep_node.key_fingerprint.into()))
+    }
+}

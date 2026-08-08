@@ -277,6 +277,23 @@ rustc_queries! {
         desc { "hashing the source files of a foreign crate" }
     }
 
+    /// The expansion-side twin of `def_anchor`: hash of everything that determines
+    /// rendered line/column values for positions within an expansion's call-site span
+    /// (file id, line index and column of the call site's start, extent line structure).
+    /// Zero when the expansion or its file no longer exists.
+    ///
+    /// `ExpnData`'s fingerprint deliberately ignores its spans' positions, so a consumer
+    /// that renders a collapsed call site's position into a cached artifact (debuginfo for
+    /// macro-generated definitions, `#[track_caller]` locations whose expansion cause has
+    /// no parent definition) records this dependency to be invalidated when the rendered
+    /// values change. Parented call sites are covered by `def_anchor` instead; see
+    /// [`TyCtxt::walk_chain_collapsed_tracked`] and [`TyCtxt::span_as_caller_location`].
+    query expn_anchor(key: rustc_span::ExpnHash) -> rustc_data_structures::fingerprint::Fingerprint {
+        // Accesses untracked data
+        eval_always
+        desc { "hashing the rendered position of an expansion's call site" }
+    }
+
     query lower_to_hir(def_id: LocalDefId) -> hir::MaybeOwner<'tcx> {
         eval_always
         desc { "lowering HIR for `{}`", tcx.def_path_str(def_id) }
