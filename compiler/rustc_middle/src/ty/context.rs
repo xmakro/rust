@@ -753,6 +753,14 @@ pub struct GlobalCtxt<'tcx> {
 
     pub canonical_param_env_cache: CanonicalParamEnvCache<'tcx>,
 
+    /// Caches the per-clause relevance masks used to filter param-envs down to
+    /// the subset of caller bounds relevant to a canonical query's goal.
+    pub env_clause_relevance_cache: Lock<FxHashMap<ty::Clauses<'tcx>, ty::EnvClauseRelevance>>,
+
+    /// Caches filtered param-envs by (original caller bounds, goal param mask)
+    /// so repeated queries pay only a hash lookup.
+    pub env_filtered_cache: Lock<FxHashMap<(ty::Clauses<'tcx>, u128), ty::ParamEnv<'tcx>>>,
+
     /// Caches the index of the highest bound var in clauses in a canonical binder.
     pub highest_var_in_clauses_cache: Lock<FxHashMap<ty::Clauses<'tcx>, usize>>,
     /// Caches the instantiation of a canonical binder given a set of args.
@@ -974,6 +982,8 @@ impl<'tcx> TyCtxt<'tcx> {
             new_solver_evaluation_cache: Default::default(),
             new_solver_canonical_param_env_cache: Default::default(),
             canonical_param_env_cache: Default::default(),
+            env_clause_relevance_cache: Default::default(),
+            env_filtered_cache: Default::default(),
             highest_var_in_clauses_cache: Default::default(),
             clauses_cache: Default::default(),
             data_layout,

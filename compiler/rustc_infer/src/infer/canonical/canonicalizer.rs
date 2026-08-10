@@ -75,6 +75,30 @@ impl<'tcx> InferCtxt<'tcx> {
         CanonicalQueryInput { canonical, typing_mode: TypingModeEqWrapper(self.typing_mode_raw()) }
     }
 
+    /// Like [`Self::canonicalize_query`], but first filters the param-env's
+    /// caller bounds down to the subset relevant to `value`, so that
+    /// identical goals canonicalized under different-but-irrelevant
+    /// where-clauses share a canonical key (and thus a query cache entry).
+    ///
+    /// This must only be used for queries which do not manufacture new
+    /// inference variables in positions that are matched against caller
+    /// bounds beyond what solving `value` itself requires (true for the
+    /// trait-solving query family; *not* true for e.g. method probing,
+    /// which invents inference variables for trait arguments and matches
+    /// them against the environment).
+    pub fn canonicalize_query_with_env_filter<V>(
+        &self,
+        value: ty::ParamEnvAnd<'tcx, V>,
+        query_state: &mut OriginalQueryValues<'tcx>,
+    ) -> CanonicalQueryInput<'tcx, ty::ParamEnvAnd<'tcx, V>>
+    where
+        V: TypeFoldable<TyCtxt<'tcx>>,
+    {
+        let ty::ParamEnvAnd { param_env, value } = value;
+        let param_env = super::env_filter::filter_param_env_for_goal(self.tcx, param_env, &value);
+        self.canonicalize_query(param_env.and(value), query_state)
+    }
+
     /// Canonicalizes a query *response* `V`. When we canonicalize a
     /// query response, we only canonicalize unbound inference
     /// variables, and we leave other free regions alone. So,

@@ -322,7 +322,8 @@ impl<'a, 'tcx> QueryNormalizer<'a, 'tcx> {
         let term = term.try_fold_with(self)?;
 
         let mut orig_values = OriginalQueryValues::default();
-        let c_term = infcx.canonicalize_query(self.param_env.and(term), &mut orig_values);
+        let c_term =
+            infcx.canonicalize_query_with_env_filter(self.param_env.and(term), &mut orig_values);
         debug!("QueryNormalizer: c_term = {:#?}", c_term);
         debug!("QueryNormalizer: orig_values = {:#?}", orig_values);
         let result = match term.kind {

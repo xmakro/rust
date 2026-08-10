@@ -52,7 +52,8 @@ fn implied_outlives_bounds<'a, 'tcx>(
 
     let mut canonical_var_values = OriginalQueryValues::default();
     let input = ImpliedOutlivesBounds { ty };
-    let canonical = infcx.canonicalize_query(param_env.and(input), &mut canonical_var_values);
+    let canonical =
+        infcx.canonicalize_query_with_env_filter(param_env.and(input), &mut canonical_var_values);
     let implied_bounds_result =
         infcx.tcx.implied_outlives_bounds((canonical, disable_implied_bounds_hack));
     let Ok(canonical_result) = implied_bounds_result else {
