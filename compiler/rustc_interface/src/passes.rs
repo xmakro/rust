@@ -271,7 +271,7 @@ fn configure_and_expand(
 
     if crate::frontend_cache::enabled(tcx) && !fecache_restored {
         sess.time("fecache_write", || {
-            crate::frontend_cache::write_snapshot(tcx, resolver, &krate, fecache_mark)
+            crate::frontend_cache::write_snapshot(tcx, resolver, &mut krate, fecache_mark)
         });
     }
 

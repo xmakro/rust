@@ -393,10 +393,45 @@ fn decode_file_rows(dec: &mut FeDecoder<'_, '_>) -> Vec<FileRow> {
 // ------------------------------------------------------------------------
 // Snapshot writing
 
+/// Drops the lazy token captures the parser attached for possible proc-macro
+/// use: nothing consumes them after expansion, they cannot be encoded, and on
+/// a cache hit the restored AST will not have them either. Stripping them on
+/// the recording session too keeps both sessions on identical state.
+struct TokenStripper;
+
+impl rustc_ast::mut_visit::MutVisitor for TokenStripper {
+    fn visit_item(&mut self, item: &mut ast::Item) {
+        item.tokens = None;
+        rustc_ast::mut_visit::walk_item(self, item);
+    }
+    fn visit_assoc_item(&mut self, item: &mut ast::AssocItem, ctxt: rustc_ast::visit::AssocCtxt) {
+        item.tokens = None;
+        rustc_ast::mut_visit::walk_assoc_item(self, item, ctxt);
+    }
+    fn visit_foreign_item(&mut self, item: &mut ast::ForeignItem) {
+        item.tokens = None;
+        rustc_ast::mut_visit::walk_item(self, item);
+    }
+    fn visit_expr(&mut self, expr: &mut ast::Expr) {
+        expr.tokens = None;
+        rustc_ast::mut_visit::walk_expr(self, expr);
+    }
+    fn visit_local(&mut self, local: &mut ast::Local) {
+        local.tokens = None;
+        rustc_ast::mut_visit::walk_local(self, local);
+    }
+    fn visit_attribute(&mut self, attr: &mut ast::Attribute) {
+        if let ast::AttrKind::Normal(normal) = &mut attr.kind {
+            normal.tokens = None;
+        }
+        rustc_ast::mut_visit::walk_attribute(self, attr);
+    }
+}
+
 pub(crate) fn write_snapshot(
     tcx: TyCtxt<'_>,
     resolver: &mut Resolver<'_, '_>,
-    krate: &ast::Crate,
+    krate: &mut ast::Crate,
     hygiene_mark: hygiene_fecache::HygieneMark,
 ) {
     let sess = tcx.sess;
@@ -412,6 +447,8 @@ pub(crate) fn write_snapshot(
         debug!("fecache: not writing snapshot: unclassifiable source files");
         return;
     };
+
+    rustc_ast::mut_visit::MutVisitor::visit_crate(&mut TokenStripper, krate);
 
     let mut enc = FeEncoder::new();
 
