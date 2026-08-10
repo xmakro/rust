@@ -109,6 +109,18 @@ impl<'tcx> InferCtxt<'tcx> {
         errors
     }
 
+    /// Returns whether any region obligations, assumptions, or constraints
+    /// are registered on this inference context.
+    ///
+    /// Must check the same state `scrape_region_constraints` drains: type
+    /// op fast paths assert emptiness instead of running the drain.
+    pub fn has_pending_region_state(&self) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        !inner.region_obligations.is_empty()
+            || !inner.region_assumptions.is_empty()
+            || !inner.unwrap_region_constraints().data().is_empty()
+    }
+
     /// Obtains (and clears) the current set of region
     /// constraints. The inference context is still usable: further
     /// unifications will simply add new constraints.

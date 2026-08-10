@@ -62,6 +62,9 @@ impl<F> fmt::Debug for CustomTypeOp<F> {
 
 /// Executes `op` and then scrapes out all the "old style" region
 /// constraints that result, creating query-region-constraints.
+///
+/// N.B.: the state drained here must stay in sync with
+/// `InferCtxt::has_pending_region_state`.
 pub fn scrape_region_constraints<'tcx, Op, R>(
     infcx: &InferCtxt<'tcx>,
     root_def_id: LocalDefId,

@@ -160,7 +160,12 @@ impl<'a, 'b, 'tcx> NllTypeRelating<'a, 'b, 'tcx> {
                 "expected at least one opaque type in `relate_opaques`, got {a} and {b}."
             ),
         };
-        self.register_goals(infcx.handle_opaque_type(a, b, self.span(), self.param_env())?);
+        // A failed hidden type equation can leave eagerly registered region
+        // constraints behind; roll them back, as type op fast paths rely on
+        // no region state being pending between ops.
+        let goals = infcx
+            .commit_if_ok(|_| infcx.handle_opaque_type(a, b, self.span(), self.param_env()))?;
+        self.register_goals(goals);
         Ok(())
     }
 
