@@ -68,6 +68,16 @@ pub(crate) fn enabled(tcx: TyCtxt<'_>) -> bool {
         && !tcx.crate_types().contains(&CrateType::ProcMacro)
 }
 
+fn sorted_cfgs(sess: &rustc_session::Session) -> Vec<(String, Option<String>)> {
+    let mut cfgs: Vec<(String, Option<String>)> = sess
+        .config
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.map(|value| value.to_string())))
+        .collect();
+    cfgs.sort();
+    cfgs
+}
+
 fn snapshot_path(tcx: TyCtxt<'_>) -> Option<PathBuf> {
     let incr_dir = tcx.sess.opts.incremental.as_ref()?;
     let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
@@ -473,6 +483,23 @@ pub(crate) fn write_snapshot(
     enc.emit_u64(sess.opts.dep_tracking_hash(true).as_u64());
     enc.emit_str(tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str());
 
+    // The crate cfg set drives cfg stripping but is not fully covered by the
+    // options dep-tracking hash, so validate it explicitly.
+    {
+        let cfgs = sorted_cfgs(sess);
+        enc.emit_usize(cfgs.len());
+        for (name, value) in cfgs {
+            enc.emit_str(&name);
+            match value {
+                None => enc.emit_u8(0),
+                Some(value) => {
+                    enc.emit_u8(1);
+                    enc.emit_str(&value);
+                }
+            }
+        }
+    }
+
     // Environment reads made by expansion.
     {
         let env_deps = sess.env_depinfo.borrow();
@@ -702,6 +729,29 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> R
     if dec.read_str() != tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str() {
         fedbg!("miss: crate name");
         return RestoreOutcome::Miss;
+    }
+
+    {
+        let cfgs = sorted_cfgs(sess);
+        let n = dec.read_usize();
+        if n != cfgs.len() {
+            fedbg!("miss: cfg count changed");
+            return RestoreOutcome::Miss;
+        }
+        for (name, value) in cfgs {
+            if dec.read_str() != name {
+                fedbg!("miss: cfg set changed");
+                return RestoreOutcome::Miss;
+            }
+            let rec_value = match dec.read_u8() {
+                0 => None,
+                _ => Some(dec.read_str().to_owned()),
+            };
+            if rec_value.as_deref() != value.as_deref() {
+                fedbg!("miss: cfg value changed");
+                return RestoreOutcome::Miss;
+            }
+        }
     }
 
     let n_env = dec.read_usize();
