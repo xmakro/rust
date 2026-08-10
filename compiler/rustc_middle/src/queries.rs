@@ -2058,20 +2058,31 @@ rustc_queries! {
         separate_provide_extern
     }
 
-    /// Given a crate and a trait, look up all impls of that trait in the crate.
-    /// Return `(impl_id, self_ty)`.
-    query implementations_of_trait(_: (CrateNum, DefId)) -> &'tcx [(DefId, Option<SimplifiedType>)] {
-        desc { "looking up implementations of a trait in a crate" }
-        separate_provide_extern
+    /// Collects an index of all trait impls from external crates, keyed by
+    /// trait, without decoding the impl lists themselves.
+    ///
+    /// Do not call this directly, but instead use the
+    /// `foreign_implementations_of_trait` query.
+    query foreign_trait_impls_index(_: ()) -> &'tcx ty::trait_def::ForeignTraitImplsIndex {
+        arena_cache
+        desc { "indexing trait impls from all dependency crates" }
     }
 
-    /// Collects all incoherent impls for the given crate and type.
+    /// Given a trait, look up all impls of that trait in all external crates.
+    /// Return `(impl_id, self_ty)`.
+    ///
+    /// Do not call this directly, but instead use the `trait_impls_of` query.
+    query foreign_implementations_of_trait(trait_id: DefId) -> &'tcx [(DefId, Option<SimplifiedType>)] {
+        desc { "looking up foreign implementations of a trait" }
+    }
+
+    /// Collects all incoherent inherent impls from external crates, keyed by self type.
     ///
     /// Do not call this directly, but instead use the `incoherent_impls` query.
     /// This query is only used to get the data necessary for that query.
-    query crate_incoherent_impls(key: (CrateNum, SimplifiedType)) -> &'tcx [DefId] {
-        desc { "collecting all impls for a type in a crate" }
-        separate_provide_extern
+    query foreign_incoherent_impls(_: ()) -> &'tcx ty::trait_def::ForeignIncoherentImpls {
+        arena_cache
+        desc { "gathering incoherent impls from all dependency crates" }
     }
 
     /// Get the corresponding native library from the `native_libraries` query

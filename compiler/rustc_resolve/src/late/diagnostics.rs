@@ -12,7 +12,6 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust::{path_to_string, where_bound_predicate_to_string};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap, FxIndexSet};
-use rustc_data_structures::unord::UnordItems;
 use rustc_errors::codes::*;
 use rustc_errors::{
     Applicability, Diag, Diagnostic, ErrorGuaranteed, MultiSpan, SuggestionStyle, pluralize,
@@ -2718,23 +2717,25 @@ impl<'ast, 'ra, 'tcx> LateResolutionVisitor<'_, 'ast, 'ra, 'tcx> {
         let Some(default_trait) = default_trait else {
             return;
         };
-        if self
-            .r
-            .extern_crate_map
-            .items()
-            // FIXME: This doesn't include impls like `impl Default for String`.
-            .flat_map(|(_, crate_)| {
-                UnordItems::new(
-                    self.r.tcx.implementations_of_trait((*crate_, default_trait)).into_iter(),
-                )
-            })
-            .filter_map(|(_, simplified_self_ty)| *simplified_self_ty)
-            .filter_map(|simplified_self_ty| match simplified_self_ty {
-                SimplifiedType::Adt(did) => Some(did),
-                _ => None,
-            })
-            .any(|did| did == def_id)
-        {
+        // This deliberately avoids queries that would snapshot and freeze the
+        // loaded-crate list, as the resolver may still load crates after this.
+        // FIXME: This doesn't include impls like `impl Default for String`,
+        // because only direct extern crates are considered.
+        let cstore = self.r.cstore();
+        let has_default_impl = self.r.extern_crate_map.items().any(|(_, crate_)| {
+            let mut found = false;
+            cstore.for_each_trait_impl_in_crate_untracked(
+                self.r.tcx,
+                *crate_,
+                |trait_def_id, _impl_def_id, simplified_self_ty| {
+                    found |= trait_def_id == default_trait
+                        && matches!(simplified_self_ty, Some(SimplifiedType::Adt(did)) if did == def_id);
+                },
+            );
+            found
+        });
+        drop(cstore);
+        if has_default_impl {
             err.multipart_suggestion(
                 "consider using the `Default` trait",
                 vec![
