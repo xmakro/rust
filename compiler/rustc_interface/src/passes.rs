@@ -160,6 +160,22 @@ fn configure_and_expand(
         )
     });
 
+    // If a previous session recorded the expanded crate and every frontend
+    // input is unchanged, replay it: expansion below then only rebuilds the
+    // resolver state over the restored AST without finding any macro to expand.
+    let fecache_mark = rustc_span::hygiene::fecache::mark();
+    let mut fecache_restored = false;
+    if crate::frontend_cache::enabled(tcx) {
+        if let Some(restored) =
+            sess.time("fecache_restore", || crate::frontend_cache::try_restore(tcx, resolver))
+        {
+            krate = restored;
+            fecache_restored = true;
+        } else {
+            resolver.fecache_start_recording();
+        }
+    }
+
     // Expand all macros
     krate = sess.time("macro_expand_crate", || {
         // Windows dlls do not have rpaths, so they don't know how to find their
@@ -225,9 +241,13 @@ fn configure_and_expand(
             buffered_lints.append(&mut ecx.buffered_early_lint);
         });
 
-        sess.time("check_unused_macros", || {
-            ecx.check_unused_macros();
-        });
+        // On a frontend cache hit the usage recording that feeds this check was
+        // skipped along with expansion, so it would report false positives.
+        if !fecache_restored {
+            sess.time("check_unused_macros", || {
+                ecx.check_unused_macros();
+            });
+        }
 
         // If we hit a recursion limit, exit early to avoid later passes getting overwhelmed
         // with a large AST
@@ -248,6 +268,12 @@ fn configure_and_expand(
 
         krate
     });
+
+    if crate::frontend_cache::enabled(tcx) && !fecache_restored {
+        sess.time("fecache_write", || {
+            crate::frontend_cache::write_snapshot(tcx, resolver, &krate, fecache_mark)
+        });
+    }
 
     sess.time("maybe_building_test_harness", || {
         rustc_builtin_macros::test_harness::inject(&mut krate, sess, features, resolver)

@@ -1,0 +1,776 @@
+//! Persistent frontend cache (`-Zfrontend-cache`).
+//!
+//! Macro expansion is deterministic given its inputs: the source files, the
+//! loaded dependency crates, the consulted environment variables and the
+//! compiler configuration. Every incremental session today re-runs all of it
+//! (matching, transcription, fragment parsing, proc macro execution) only to
+//! produce a bit-identical expanded AST. This module snapshots the expanded
+//! crate together with the session state expansion created (hygiene tables,
+//! def table, source map additions, crate load order) and replays it in later
+//! sessions whose frontend inputs are bit-identical.
+//!
+//! Everything is encoded with *raw* session-local ids (`BytePos`,
+//! `SyntaxContext`, `ExpnId`, `DefIndex`, `CrateNum`, `NodeId`). This is valid
+//! because the replay reconstructs the id spaces exactly: parsing reproduces
+//! the source map prefix, dependency crates are re-loaded in recorded order,
+//! hygiene rows are appended onto a verified table prefix, and the def
+//! creation log is replayed through the regular `create_def` machinery. If any
+//! validation step fails the cache is ignored and expansion runs normally.
+//!
+//! Known prototype limitations, on purpose for now:
+//! - buffered lints from expansion are not snapshotted, so some
+//!   expansion-emitted warnings disappear on cache hits (`unused_macros` is
+//!   handled by skipping the check on hits);
+//! - proc macros that read untracked state (files without `tracked_path`,
+//!   network, time) are assumed deterministic, like the query system already
+//!   assumes for incremental reuse of their downstream products;
+//! - proc-macro crates themselves are not cached.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use rustc_ast as ast;
+use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
+use rustc_hir::def::DefKind;
+use rustc_hir::def_id::{CrateNum, DefIndex, LocalDefId};
+use rustc_metadata::creader::CStore;
+use rustc_middle::ty::TyCtxt;
+use rustc_resolve::Resolver;
+use rustc_resolve::fecache::FeDefRow;
+use rustc_serialize::opaque::MemDecoder;
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
+use rustc_session::config::CrateType;
+use rustc_session::cstore::CrateDepKind;
+use rustc_span::hygiene::{ExpnId, ExpnIndex, fecache as hygiene_fecache};
+use rustc_span::{
+    AttrId, BlobDecoder, BytePos, ByteSymbol, FileName, SourceFile, SourceFileHash, SourceFileHashAlgorithm,
+    Span, SpanData, SpanDecoder, SpanEncoder, Symbol, SyntaxContext,
+};
+use tracing::debug;
+
+const MAGIC: u32 = 0x52464543; // "RFEC"
+const VERSION: u32 = 1;
+
+pub(crate) fn enabled(tcx: TyCtxt<'_>) -> bool {
+    let sess = tcx.sess;
+    sess.opts.incremental.is_some()
+        && sess.opts.unstable_opts.frontend_cache.unwrap_or(true)
+        && !tcx.crate_types().contains(&CrateType::ProcMacro)
+}
+
+fn snapshot_path(tcx: TyCtxt<'_>) -> Option<PathBuf> {
+    let incr_dir = tcx.sess.opts.incremental.as_ref()?;
+    let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+    let stable_id = tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE);
+    Some(incr_dir.join(format!("fecache-{crate_name}-{:016x}.bin", stable_id.as_u64())))
+}
+
+// ------------------------------------------------------------------------
+// Encoder / decoder with raw span encoding and symbol side tables
+
+struct FeEncoder {
+    data: Vec<u8>,
+    syms: FxIndexSet<Symbol>,
+    byte_syms: FxIndexSet<ByteSymbol>,
+}
+
+impl FeEncoder {
+    fn new() -> Self {
+        FeEncoder { data: Vec::new(), syms: FxIndexSet::default(), byte_syms: FxIndexSet::default() }
+    }
+}
+
+macro_rules! delegate_emit {
+    ($($name:ident($ty:ty);)*) => {
+        $(fn $name(&mut self, v: $ty) {
+            self.data.extend_from_slice(&v.to_le_bytes());
+        })*
+    };
+}
+
+impl Encoder for FeEncoder {
+    delegate_emit! {
+        emit_u128(u128); emit_u64(u64); emit_u32(u32); emit_u16(u16);
+        emit_i128(i128); emit_i64(i64); emit_i32(i32); emit_i16(i16);
+    }
+
+    fn emit_usize(&mut self, v: usize) {
+        self.emit_u64(v as u64);
+    }
+
+    fn emit_isize(&mut self, v: isize) {
+        self.emit_i64(v as i64);
+    }
+
+    fn emit_u8(&mut self, v: u8) {
+        self.data.push(v);
+    }
+
+    fn emit_str(&mut self, v: &str) {
+        self.emit_usize(v.len());
+        self.data.extend_from_slice(v.as_bytes());
+    }
+
+    fn emit_raw_bytes(&mut self, v: &[u8]) {
+        self.data.extend_from_slice(v);
+    }
+}
+
+impl SpanEncoder for FeEncoder {
+    fn encode_span(&mut self, span: Span) {
+        let data = span.data();
+        self.emit_u32(data.lo.0);
+        self.emit_u32(data.hi.0);
+        self.encode_syntax_context(data.ctxt);
+        match data.parent {
+            None => self.emit_u32(u32::MAX),
+            Some(parent) => {
+                assert!(parent.local_def_index.as_u32() != u32::MAX);
+                self.emit_u32(parent.local_def_index.as_u32())
+            }
+        }
+    }
+
+    fn encode_symbol(&mut self, sym: Symbol) {
+        let (idx, _) = self.syms.insert_full(sym);
+        self.emit_u32(idx as u32);
+    }
+
+    fn encode_byte_symbol(&mut self, byte_sym: ByteSymbol) {
+        let (idx, _) = self.byte_syms.insert_full(byte_sym);
+        self.emit_u32(idx as u32);
+    }
+
+    fn encode_expn_id(&mut self, expn_id: ExpnId) {
+        self.emit_u32(expn_id.krate.as_u32());
+        self.emit_u32(expn_id.local_id.as_u32());
+    }
+
+    fn encode_syntax_context(&mut self, syntax_context: SyntaxContext) {
+        self.emit_u32(syntax_context.as_u32());
+    }
+
+    fn encode_crate_num(&mut self, crate_num: CrateNum) {
+        self.emit_u32(crate_num.as_u32());
+    }
+
+    fn encode_def_index(&mut self, def_index: DefIndex) {
+        self.emit_u32(def_index.as_u32());
+    }
+
+    fn encode_def_id(&mut self, def_id: rustc_hir::def_id::DefId) {
+        self.encode_crate_num(def_id.krate);
+        self.encode_def_index(def_id.index);
+    }
+}
+
+struct FeDecoder<'a, 'psess> {
+    mem: MemDecoder<'a>,
+    syms: Vec<Symbol>,
+    byte_syms: Vec<ByteSymbol>,
+    psess: &'psess rustc_session::parse::ParseSess,
+}
+
+impl<'a, 'psess> Decoder for FeDecoder<'a, 'psess> {
+    fn read_usize(&mut self) -> usize {
+        self.read_u64() as usize
+    }
+    fn read_u128(&mut self) -> u128 {
+        self.mem.read_u128()
+    }
+    fn read_u64(&mut self) -> u64 {
+        self.mem.read_u64()
+    }
+    fn read_u32(&mut self) -> u32 {
+        self.mem.read_u32()
+    }
+    fn read_u16(&mut self) -> u16 {
+        self.mem.read_u16()
+    }
+    fn read_u8(&mut self) -> u8 {
+        self.mem.read_u8()
+    }
+    fn read_isize(&mut self) -> isize {
+        self.read_i64() as isize
+    }
+    fn read_i128(&mut self) -> i128 {
+        self.mem.read_i128()
+    }
+    fn read_i64(&mut self) -> i64 {
+        self.mem.read_i64()
+    }
+    fn read_i32(&mut self) -> i32 {
+        self.mem.read_i32()
+    }
+    fn read_i16(&mut self) -> i16 {
+        self.mem.read_i16()
+    }
+    fn read_str(&mut self) -> &str {
+        let len = self.read_usize();
+        let bytes = self.mem.read_raw_bytes(len);
+        std::str::from_utf8(bytes).unwrap()
+    }
+    fn read_raw_bytes(&mut self, len: usize) -> &[u8] {
+        self.mem.read_raw_bytes(len)
+    }
+    fn peek_byte(&self) -> u8 {
+        self.mem.peek_byte()
+    }
+    fn position(&self) -> usize {
+        self.mem.position()
+    }
+}
+
+impl<'a, 'psess> rustc_span::BlobDecoder for FeDecoder<'a, 'psess> {
+    fn decode_symbol(&mut self) -> Symbol {
+        let idx = self.read_u32() as usize;
+        self.syms[idx]
+    }
+
+    fn decode_byte_symbol(&mut self) -> ByteSymbol {
+        let idx = self.read_u32() as usize;
+        self.byte_syms[idx]
+    }
+
+    fn decode_def_index(&mut self) -> DefIndex {
+        DefIndex::from_u32(self.read_u32())
+    }
+}
+
+impl<'a, 'psess> SpanDecoder for FeDecoder<'a, 'psess> {
+    fn decode_span(&mut self) -> Span {
+        let lo = BytePos(self.read_u32());
+        let hi = BytePos(self.read_u32());
+        let ctxt = self.decode_syntax_context();
+        let parent = match self.read_u32() {
+            u32::MAX => None,
+            raw => Some(LocalDefId { local_def_index: DefIndex::from_u32(raw) }),
+        };
+        SpanData { lo, hi, ctxt, parent }.span()
+    }
+
+    fn decode_expn_id(&mut self) -> ExpnId {
+        let krate = CrateNum::from_u32(self.read_u32());
+        let local_id = ExpnIndex::from_u32(self.read_u32());
+        ExpnId { krate, local_id }
+    }
+
+    fn decode_syntax_context(&mut self) -> SyntaxContext {
+        SyntaxContext::from_u32(self.read_u32())
+    }
+
+    fn decode_crate_num(&mut self) -> CrateNum {
+        CrateNum::from_u32(self.read_u32())
+    }
+
+    fn decode_def_id(&mut self) -> rustc_hir::def_id::DefId {
+        let krate = CrateNum::from_u32(self.read_u32());
+        let index = DefIndex::from_u32(self.read_u32());
+        rustc_hir::def_id::DefId { krate, index }
+    }
+
+    fn decode_attr_id(&mut self) -> AttrId {
+        // Attribute ids are session-local diagnostics bookkeeping and are never
+        // compared across sessions: mint fresh ones, like metadata decoding does.
+        self.psess.attr_id_generator.mk_attr_id()
+    }
+}
+
+// ------------------------------------------------------------------------
+// Source file rows
+
+enum FileRow {
+    /// A file read from disk this session, reloadable from its path.
+    Local { path: PathBuf, src_hash: SourceFileHash, start_pos: u32, len: u32 },
+    /// A file imported from a dependency's metadata.
+    Imported { cnum: u32, index: u32, start_pos: u32, len: u32 },
+    /// A file synthesized in memory (e.g. proc macro sources); content inlined.
+    Virtual { name: FileName, src: String, start_pos: u32, len: u32 },
+}
+
+fn classify_files(tcx: TyCtxt<'_>) -> Option<Vec<FileRow>> {
+    let source_map = tcx.sess.source_map();
+    let cstore = CStore::from_tcx(tcx);
+    // Map (cnum, local start_pos) -> index in the foreign crate's source map.
+    let mut import_idx: FxHashMap<(CrateNum, BytePos), u32> = FxHashMap::default();
+    for (cnum, _, _, _) in cstore.fecache_crates() {
+        for (idx, file) in cstore.fecache_imported_files(cnum) {
+            import_idx.insert((cnum, file.start_pos), idx);
+        }
+    }
+
+    let files = source_map.files();
+    let mut rows = Vec::with_capacity(files.len());
+    for file in files.iter() {
+        let start_pos = file.start_pos.0;
+        let len = file.normalized_source_len.0;
+        if file.cnum != rustc_hir::def_id::LOCAL_CRATE {
+            let &index = import_idx.get(&(file.cnum, file.start_pos))?;
+            rows.push(FileRow::Imported { cnum: file.cnum.as_u32(), index, start_pos, len });
+        } else if let FileName::Real(real) = &file.name
+            && let Some(path) = real.local_path()
+        {
+            rows.push(FileRow::Local {
+                path: path.to_path_buf(),
+                src_hash: file.src_hash,
+                start_pos,
+                len,
+            });
+        } else if let Some(src) = &file.src {
+            rows.push(FileRow::Virtual {
+                name: file.name.clone(),
+                src: (**src).clone(),
+                start_pos,
+                len,
+            });
+        } else {
+            // A local file we can neither reload nor inline: give up on caching.
+            return None;
+        }
+    }
+    Some(rows)
+}
+
+fn encode_file_rows(enc: &mut FeEncoder, rows: &[FileRow]) {
+    enc.emit_usize(rows.len());
+    for row in rows {
+        match row {
+            FileRow::Local { path, src_hash, start_pos, len } => {
+                enc.emit_u8(0);
+                enc.emit_str(&path.to_string_lossy());
+                src_hash.encode(enc);
+                enc.emit_u32(*start_pos);
+                enc.emit_u32(*len);
+            }
+            FileRow::Imported { cnum, index, start_pos, len } => {
+                enc.emit_u8(1);
+                enc.emit_u32(*cnum);
+                enc.emit_u32(*index);
+                enc.emit_u32(*start_pos);
+                enc.emit_u32(*len);
+            }
+            FileRow::Virtual { name, src, start_pos, len } => {
+                enc.emit_u8(2);
+                name.encode(enc);
+                enc.emit_str(src);
+                enc.emit_u32(*start_pos);
+                enc.emit_u32(*len);
+            }
+        }
+    }
+}
+
+fn decode_file_rows(dec: &mut FeDecoder<'_, '_>) -> Vec<FileRow> {
+    let n = dec.read_usize();
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        let row = match dec.read_u8() {
+            0 => FileRow::Local {
+                path: PathBuf::from(dec.read_str().to_owned()),
+                src_hash: SourceFileHash::decode(dec),
+                start_pos: dec.read_u32(),
+                len: dec.read_u32(),
+            },
+            1 => FileRow::Imported {
+                cnum: dec.read_u32(),
+                index: dec.read_u32(),
+                start_pos: dec.read_u32(),
+                len: dec.read_u32(),
+            },
+            2 => FileRow::Virtual {
+                name: FileName::decode(dec),
+                src: dec.read_str().to_owned(),
+                start_pos: dec.read_u32(),
+                len: dec.read_u32(),
+            },
+            _ => unreachable!("corrupt frontend cache"),
+        };
+        rows.push(row);
+    }
+    rows
+}
+
+// ------------------------------------------------------------------------
+// Snapshot writing
+
+pub(crate) fn write_snapshot(
+    tcx: TyCtxt<'_>,
+    resolver: &mut Resolver<'_, '_>,
+    krate: &ast::Crate,
+    hygiene_mark: hygiene_fecache::HygieneMark,
+) {
+    let sess = tcx.sess;
+    let Some(path) = snapshot_path(tcx) else { return };
+    let Some(def_rows) = resolver.fecache_take_recorded() else {
+        debug!("fecache: not writing snapshot: unreplayable defs");
+        return;
+    };
+    if sess.dcx().has_errors_or_delayed_bugs().is_some() {
+        return;
+    }
+    let Some(file_rows) = classify_files(tcx) else {
+        debug!("fecache: not writing snapshot: unclassifiable source files");
+        return;
+    };
+
+    let mut enc = FeEncoder::new();
+
+    // Validation header.
+    enc.emit_str(option_env!("CFG_VERSION").unwrap_or("unknown"));
+    enc.emit_u64(sess.opts.dep_tracking_hash(true).as_u64());
+    enc.emit_str(tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str());
+
+    // Environment reads made by expansion.
+    {
+        let env_deps = sess.env_depinfo.borrow();
+        enc.emit_usize(env_deps.len());
+        for (key, value) in env_deps.iter() {
+            enc.emit_str(key.as_str());
+            match value {
+                None => enc.emit_u8(0),
+                Some(v) => {
+                    enc.emit_u8(1);
+                    enc.emit_str(v.as_str());
+                }
+            }
+        }
+    }
+
+    // Non-source file reads (include_bytes! etc.): path plus raw content hash,
+    // since the source map may only hold a lossy transcoding of these.
+    {
+        let file_deps: Vec<String> =
+            sess.file_depinfo.borrow().iter().map(|path| path.as_str().to_owned()).collect();
+        enc.emit_usize(file_deps.len());
+        for path in &file_deps {
+            enc.emit_str(path);
+            let hash = std::fs::read(path)
+                .map(|bytes| SourceFileHash::new_in_memory(SourceFileHashAlgorithm::Sha256, bytes));
+            match hash {
+                Ok(hash) => {
+                    enc.emit_u8(1);
+                    hash.encode(&mut enc);
+                }
+                Err(_) => enc.emit_u8(0),
+            }
+        }
+    }
+
+    // Dependency crates in load order.
+    {
+        let crates = CStore::from_tcx(tcx).fecache_crates();
+        enc.emit_usize(crates.len());
+        for (cnum, name, svh, dep_kind) in crates {
+            enc.emit_u32(cnum.as_u32());
+            enc.encode_symbol(name);
+            enc.emit_u128(svh.as_u128());
+            enc.emit_u8(match dep_kind {
+                CrateDepKind::MacrosOnly => 0,
+                CrateDepKind::Conditional => 1,
+                CrateDepKind::Unconditional => 2,
+            });
+        }
+    }
+
+    encode_file_rows(&mut enc, &file_rows);
+
+    hygiene_fecache::encode_delta(&mut enc, hygiene_mark);
+
+    // Def creation log.
+    enc.emit_usize(def_rows.len());
+    for row in &def_rows {
+        enc.emit_u32(row.node_id.as_u32());
+        enc.emit_u32(row.parent.local_def_index.as_u32());
+        match row.name {
+            None => enc.emit_u8(0),
+            Some(name) => {
+                enc.emit_u8(1);
+                enc.encode_symbol(name);
+            }
+        }
+        row.def_kind.encode(&mut enc);
+        enc.encode_expn_id(row.expn_id);
+        enc.encode_span(row.span);
+        enc.emit_bool(row.is_owner);
+    }
+
+    enc.emit_u32(resolver.fecache_next_node_id().as_u32());
+
+    krate.encode(&mut enc);
+
+    // Assemble: magic, version, symbol tables, body.
+    let mut out = Vec::with_capacity(enc.data.len() + 1024);
+    out.extend_from_slice(&MAGIC.to_le_bytes());
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&(enc.syms.len() as u32).to_le_bytes());
+    for sym in &enc.syms {
+        let s = sym.as_str();
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+    out.extend_from_slice(&(enc.byte_syms.len() as u32).to_le_bytes());
+    for bsym in &enc.byte_syms {
+        let b = bsym.as_byte_str();
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    out.extend_from_slice(&enc.data);
+
+    let tmp = path.with_extension("bin.tmp");
+    if std::fs::write(&tmp, &out).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
+        debug!("fecache: failed to write snapshot to {}", path.display());
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+// ------------------------------------------------------------------------
+// Restore
+
+pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> Option<ast::Crate> {
+    let sess = tcx.sess;
+    let path = snapshot_path(tcx)?;
+    let buf = std::fs::read(&path).ok()?;
+
+    // Parse the container: magic, version, symbol tables.
+    if buf.len() < 12 || u32::from_le_bytes(buf[0..4].try_into().unwrap()) != MAGIC {
+        return None;
+    }
+    if u32::from_le_bytes(buf[4..8].try_into().unwrap()) != VERSION {
+        return None;
+    }
+    let mut pos = 8;
+    let read_u32 = |pos: &mut usize| {
+        let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        v
+    };
+    let n_syms = read_u32(&mut pos) as usize;
+    let mut syms = Vec::with_capacity(n_syms);
+    for _ in 0..n_syms {
+        let len = read_u32(&mut pos) as usize;
+        syms.push(Symbol::intern(std::str::from_utf8(&buf[pos..pos + len]).ok()?));
+        pos += len;
+    }
+    let n_byte_syms = read_u32(&mut pos) as usize;
+    let mut byte_syms = Vec::with_capacity(n_byte_syms);
+    for _ in 0..n_byte_syms {
+        let len = read_u32(&mut pos) as usize;
+        byte_syms.push(ByteSymbol::intern(&buf[pos..pos + len]));
+        pos += len;
+    }
+
+    let mut dec =
+        FeDecoder { mem: MemDecoder::new(&buf[pos..], 0).ok()?, syms, byte_syms, psess: &sess.psess };
+
+    // --- Validation (no session mutation until all cheap checks pass) ---
+
+    if dec.read_str() != option_env!("CFG_VERSION").unwrap_or("unknown") {
+        return None;
+    }
+    if dec.read_u64() != sess.opts.dep_tracking_hash(true).as_u64() {
+        return None;
+    }
+    if dec.read_str() != tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str() {
+        return None;
+    }
+
+    let n_env = dec.read_usize();
+    let mut env_deps = Vec::with_capacity(n_env);
+    for _ in 0..n_env {
+        let key = dec.read_str().to_owned();
+        let recorded = match dec.read_u8() {
+            0 => None,
+            _ => Some(dec.read_str().to_owned()),
+        };
+        if std::env::var(&key).ok() != recorded {
+            debug!("fecache: miss: env var {key} changed");
+            return None;
+        }
+        env_deps.push((key, recorded));
+    }
+
+    let n_file_deps = dec.read_usize();
+    let mut file_deps = Vec::with_capacity(n_file_deps);
+    for _ in 0..n_file_deps {
+        let path = dec.read_str().to_owned();
+        let recorded = match dec.read_u8() {
+            0 => None,
+            _ => Some(SourceFileHash::decode(&mut dec)),
+        };
+        if let Some(recorded) = recorded {
+            let Ok(bytes) = std::fs::read(&path) else {
+                debug!("fecache: miss: file dep {path} unreadable");
+                return None;
+            };
+            if SourceFileHash::new_in_memory(SourceFileHashAlgorithm::Sha256, bytes) != recorded {
+                debug!("fecache: miss: file dep {path} changed");
+                return None;
+            }
+        } else {
+            debug!("fecache: miss: file dep {path} had no recorded hash");
+            return None;
+        }
+        file_deps.push(path);
+    }
+
+    let n_crates = dec.read_usize();
+    let mut crates = Vec::with_capacity(n_crates);
+    for _ in 0..n_crates {
+        let cnum = dec.read_u32();
+        let name = dec.decode_symbol();
+        let svh = dec.read_u128();
+        let dep_kind = match dec.read_u8() {
+            0 => CrateDepKind::MacrosOnly,
+            1 => CrateDepKind::Conditional,
+            _ => CrateDepKind::Unconditional,
+        };
+        crates.push((cnum, name, svh, dep_kind));
+    }
+
+    let file_rows = decode_file_rows(&mut dec);
+
+    // Validate local files against the current session before mutating
+    // anything: the parse-loaded prefix must match, and files expansion would
+    // load must be unchanged on disk.
+    {
+        let source_map = sess.source_map();
+        let files = source_map.files();
+        if files.len() > file_rows.len() {
+            return None;
+        }
+        for (file, row) in files.iter().zip(file_rows.iter()) {
+            match row {
+                FileRow::Local { path, src_hash, start_pos, len } => {
+                    if file.cnum != rustc_hir::def_id::LOCAL_CRATE
+                        || file.start_pos.0 != *start_pos
+                        || file.normalized_source_len.0 != *len
+                        || file.src_hash != *src_hash
+                        || !matches!(&file.name, FileName::Real(real)
+                            if real.local_path().is_some_and(|p| p == path))
+                    {
+                        debug!("fecache: miss: prefix file mismatch at {}", path.display());
+                        return None;
+                    }
+                }
+                _ => {
+                    debug!("fecache: miss: non-local file in parse prefix");
+                    return None;
+                }
+            }
+        }
+        for row in &file_rows[files.len()..] {
+            if let FileRow::Local { path, src_hash, .. } = row {
+                let Ok(src) = std::fs::read_to_string(path) else {
+                    debug!("fecache: miss: {} unreadable", path.display());
+                    return None;
+                };
+                if !src_hash.matches(&src) {
+                    debug!("fecache: miss: {} changed", path.display());
+                    return None;
+                }
+            }
+        }
+    }
+
+    // --- Replay (mutations begin; failures below fall back to expansion) ---
+
+    // Load the dependency crates in recorded order and verify identity.
+    {
+        let mut cstore = CStore::from_tcx_mut(tcx);
+        for &(cnum, name, _, dep_kind) in &crates {
+            match cstore.fecache_preload_crate(tcx, name, dep_kind) {
+                Some(loaded) if loaded.as_u32() <= cnum => {}
+                _ => {
+                    debug!("fecache: miss: crate {name} failed to preload");
+                    return None;
+                }
+            }
+        }
+        let loaded = cstore.fecache_crates();
+        if loaded.len() != crates.len() {
+            debug!("fecache: miss: crate count {} != {}", loaded.len(), crates.len());
+            return None;
+        }
+        for ((cnum, name, svh, _), (rec_cnum, rec_name, rec_svh, _)) in
+            loaded.into_iter().zip(crates.iter())
+        {
+            if cnum.as_u32() != *rec_cnum || name != *rec_name || svh.as_u128() != *rec_svh {
+                debug!("fecache: miss: crate {rec_name} identity changed");
+                return None;
+            }
+        }
+    }
+
+    // Materialize the source map exactly as the recorded session had it.
+    {
+        let source_map = sess.source_map();
+        let already = source_map.files().len();
+        for row in &file_rows[already..] {
+            let file: Arc<SourceFile> = match row {
+                FileRow::Local { path, .. } => match source_map.load_file(path) {
+                    Ok(file) => file,
+                    Err(_) => return None,
+                },
+                FileRow::Imported { cnum, index, .. } => CStore::from_tcx(tcx)
+                    .fecache_import_source_file(tcx, CrateNum::from_u32(*cnum), *index),
+                FileRow::Virtual { name, src, .. } => {
+                    source_map.new_source_file(name.clone(), src.clone())
+                }
+            };
+            let (start_pos, len) = match row {
+                FileRow::Local { start_pos, len, .. }
+                | FileRow::Imported { start_pos, len, .. }
+                | FileRow::Virtual { start_pos, len, .. } => (*start_pos, *len),
+            };
+            if file.start_pos.0 != start_pos || file.normalized_source_len.0 != len {
+                debug!("fecache: miss: file landed at {} not {}", file.start_pos.0, start_pos);
+                return None;
+            }
+        }
+    }
+
+    if !hygiene_fecache::decode_delta(&mut dec) {
+        debug!("fecache: miss: hygiene prefix mismatch");
+        return None;
+    }
+
+    // Replay the def creation log.
+    {
+        let n = dec.read_usize();
+        let mut rows = Vec::with_capacity(n);
+        for _ in 0..n {
+            let node_id = ast::NodeId::from_u32(dec.read_u32());
+            let parent = LocalDefId { local_def_index: DefIndex::from_u32(dec.read_u32()) };
+            let name = match dec.read_u8() {
+                0 => None,
+                _ => Some(dec.decode_symbol()),
+            };
+            let def_kind = DefKind::decode(&mut dec);
+            let expn_id = dec.decode_expn_id();
+            let span = dec.decode_span();
+            let is_owner = dec.read_bool();
+            rows.push(FeDefRow { node_id, parent, name, def_kind, expn_id, span, is_owner });
+        }
+        resolver.fecache_replay_defs(rows);
+    }
+
+    resolver.fecache_set_next_node_id(ast::NodeId::from_u32(dec.read_u32()));
+
+    let krate = ast::Crate::decode(&mut dec);
+
+    // Re-register the dependency information that expansion would have.
+    {
+        let mut env_map = sess.env_depinfo.borrow_mut();
+        for (key, value) in env_deps {
+            env_map.insert((Symbol::intern(&key), value.as_deref().map(Symbol::intern)));
+        }
+        drop(env_map);
+        let mut file_map = sess.file_depinfo.borrow_mut();
+        for path in file_deps {
+            file_map.insert(Symbol::intern(&path));
+        }
+    }
+
+    debug!("fecache: hit: restored expanded crate");
+    Some(krate)
+}

@@ -7,6 +7,7 @@
 
 mod callbacks;
 pub mod diagnostics;
+mod frontend_cache;
 pub mod interface;
 mod limits;
 pub mod passes;

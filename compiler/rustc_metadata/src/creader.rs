@@ -1386,3 +1386,43 @@ fn fn_spans(krate: &ast::Crate, name: Symbol) -> Vec<Span> {
     visit::walk_crate(&mut f, krate);
     f.spans
 }
+
+/// Frontend cache (`-Zfrontend-cache`) support.
+impl CStore {
+    /// The currently loaded crates in `CrateNum` order, with the data needed to
+    /// replay and validate this load order in a later session.
+    pub fn fecache_crates(&self) -> Vec<(CrateNum, Symbol, Svh, CrateDepKind)> {
+        self.iter_crate_data()
+            .map(|(cnum, data)| (cnum, data.name(), data.hash(), data.dep_kind()))
+            .collect()
+    }
+
+    /// Loads `name` through normal crate resolution, for replaying the crate load
+    /// order recorded by a previous session. Reuses already-loaded crates.
+    pub fn fecache_preload_crate<'tcx>(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        name: Symbol,
+        dep_kind: CrateDepKind,
+    ) -> Option<CrateNum> {
+        self.maybe_resolve_crate(tcx, name, dep_kind, CrateOrigin::Extern).ok()
+    }
+
+    /// See [`CrateMetadata::fecache_imported_files`].
+    pub fn fecache_imported_files(
+        &self,
+        cnum: CrateNum,
+    ) -> Vec<(u32, std::sync::Arc<rustc_span::SourceFile>)> {
+        self.get_crate_data(cnum).fecache_imported_files()
+    }
+
+    /// See [`CrateMetadata::fecache_import_source_file`].
+    pub fn fecache_import_source_file(
+        &self,
+        tcx: TyCtxt<'_>,
+        cnum: CrateNum,
+        idx: u32,
+    ) -> std::sync::Arc<rustc_span::SourceFile> {
+        self.get_crate_data(cnum).fecache_import_source_file(tcx, idx)
+    }
+}

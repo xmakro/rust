@@ -87,6 +87,7 @@ use crate::ref_mut::{CmCell, CmRef, CmRefCell};
 mod build_reduced_graph;
 mod check_unused;
 mod def_collector;
+pub mod fecache;
 mod diagnostics;
 mod effective_visibilities;
 mod ident;
@@ -1482,6 +1483,14 @@ pub struct Resolver<'ra, 'tcx> {
 
     next_node_id: NodeId = CRATE_NODE_ID,
 
+    /// When recording for the frontend cache: log of the defs created during
+    /// expansion, in creation order. See `fecache`.
+    fecache_def_log: Option<Vec<fecache::FeDefRow>> = None,
+
+    /// Defs replayed from a frontend cache snapshot, by AST node id.
+    /// `create_def` returns the replayed def instead of creating a fresh one.
+    fecache_restored_defs: FxHashMap<NodeId, LocalDefId> = default::fx_hash_map(),
+
     /// Preserves per owner data once the owner is finished resolving.
     owners: NodeMap<PerOwnerResolverData<'tcx>>,
 
@@ -1674,6 +1683,21 @@ impl<'tcx> Resolver<'_, 'tcx> {
                 .definitions_untracked()
                 .def_key(self.current_owner.node_id_to_def_id[&node_id]),
         );
+
+        // This def was already created by a frontend cache replay; redo only the
+        // per-owner bookkeeping, which the replay cannot reproduce.
+        if node_id != ast::DUMMY_NODE_ID
+            && let Some(&def_id) = self.fecache_restored_defs.get(&node_id)
+        {
+            if !is_owner {
+                self.current_owner.node_id_to_def_id.insert(node_id, def_id);
+            }
+            return self.tcx.fecache_def_feed(def_id);
+        }
+
+        if let Some(log) = &mut self.fecache_def_log {
+            log.push(fecache::FeDefRow { node_id, parent, name, def_kind, expn_id, span, is_owner });
+        }
 
         let disambiguator = self.disambiguators.get_or_create(parent);
 

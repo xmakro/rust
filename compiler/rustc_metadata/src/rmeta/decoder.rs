@@ -2135,3 +2135,29 @@ impl CrateMetadata {
         None
     }
 }
+
+/// Frontend cache (`-Zfrontend-cache`) support.
+impl CrateMetadata {
+    /// The source files of this crate that were imported into the local source map,
+    /// with their index in the crate's own source map.
+    pub(crate) fn fecache_imported_files(&self) -> Vec<(u32, Arc<rustc_span::SourceFile>)> {
+        self.source_map_import_info
+            .lock()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, entry)| {
+                entry.as_ref().map(|f| (i as u32, Arc::clone(&f.translated_source_file)))
+            })
+            .collect()
+    }
+
+    /// Force-imports one of this crate's source files into the local source map,
+    /// replaying the import order recorded by a previous session.
+    pub(crate) fn fecache_import_source_file(
+        &self,
+        tcx: TyCtxt<'_>,
+        idx: u32,
+    ) -> Arc<rustc_span::SourceFile> {
+        self.imported_source_file(tcx, idx).translated_source_file
+    }
+}
