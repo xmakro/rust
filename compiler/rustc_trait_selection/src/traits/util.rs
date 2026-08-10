@@ -229,10 +229,17 @@ pub fn sizedness_fast_path<'tcx>(
         predicate.kind().skip_binder()
         && trait_pred.polarity == ty::PredicatePolarity::Positive
     {
-        let sizedness = match tcx.as_lang_item(trait_pred.def_id()) {
-            Some(LangItem::Sized) => SizedTraitKind::Sized,
-            Some(LangItem::MetaSized) => SizedTraitKind::MetaSized,
-            _ => return false,
+        // This fast path runs for ~60% of all predicates, so avoid the
+        // `as_lang_item` reverse-hashmap lookup (which hashes the `DefId`) and
+        // instead do a couple of direct array lookups into the lang-item table.
+        let lang_items = tcx.lang_items();
+        let def_id = trait_pred.def_id();
+        let sizedness = if lang_items.get(LangItem::Sized) == Some(def_id) {
+            SizedTraitKind::Sized
+        } else if lang_items.get(LangItem::MetaSized) == Some(def_id) {
+            SizedTraitKind::MetaSized
+        } else {
+            return false;
         };
 
         if trait_pred.self_ty().has_trivial_sizedness(tcx, sizedness) {
