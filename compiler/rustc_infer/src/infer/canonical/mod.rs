@@ -30,6 +30,7 @@ use rustc_span::Span;
 use crate::infer::{InferCtxt, RegionVariableOrigin};
 
 mod canonicalizer;
+mod env_filter;
 mod instantiate;
 pub mod query_response;
 

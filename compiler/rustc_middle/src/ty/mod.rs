@@ -1200,6 +1200,39 @@ impl<'tcx> ParamEnv<'tcx> {
     }
 }
 
+/// Per-clause relevance information for a `Clauses` list, used to filter a
+/// `ParamEnv` down to the subset of caller bounds that can influence a given
+/// canonical query goal. Cached in `tcx.env_clause_relevance_cache`.
+#[derive(Clone, Debug)]
+pub struct EnvClauseRelevance {
+    pub entries: std::sync::Arc<[EnvClauseEntry]>,
+    /// Some generic param index did not fit the bitmask; relevance filtering
+    /// must be skipped for this clause list.
+    pub overflow: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct EnvClauseEntry {
+    pub class: EnvClauseClass,
+    /// Bitmask over type/const generic param indices appearing in the clause
+    /// head (for `Head`) or the outlived subject type (for `TypeOutlives`).
+    pub head_mask: u128,
+    /// Bitmask over all type/const generic param indices in the whole clause.
+    pub all_mask: u128,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EnvClauseClass {
+    /// Always kept.
+    Always,
+    /// Trait-like clause (trait/projection/host-effect/const): provides
+    /// candidates for goals whose head unifies with the clause head.
+    Head,
+    /// `Ty: 'r`. The subject flags record whether the subject contains
+    /// aliases or free regions (kept when param-free in those cases).
+    TypeOutlives { subject_has_alias: bool, subject_has_free_regions: bool },
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TypeFoldable, TypeVisitable)]
 #[derive(StableHash)]
 pub struct ParamEnvAnd<'tcx, T> {

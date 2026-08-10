@@ -118,7 +118,8 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 't
 
         let mut canonical_var_values = OriginalQueryValues::default();
         let old_param_env = query_key.param_env;
-        let canonical_self = infcx.canonicalize_query(query_key, &mut canonical_var_values);
+        let canonical_self =
+            infcx.canonicalize_query_with_env_filter(query_key, &mut canonical_var_values);
         let canonical_result = Self::perform_query(infcx.tcx, canonical_self)?;
 
         let InferOk { value, obligations } = infcx
