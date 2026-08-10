@@ -15,6 +15,9 @@ use rustc_middle::middle::stability::DeprecationEntry;
 use rustc_middle::queries::ExternProviders;
 use rustc_middle::query::LocalCrate;
 use rustc_middle::ty::fast_reject::SimplifiedType;
+use rustc_middle::ty::trait_def::{
+    ForeignImplsRef, ForeignIncoherentImpls, ForeignTraitImplsIndex,
+};
 use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
 use rustc_middle::util::Providers;
 use rustc_serialize::Decoder;
@@ -386,8 +389,6 @@ provide! { tcx, def_id, other, cdata,
 
     traits => { tcx.arena.alloc_from_iter(cdata.get_traits(tcx)) }
     trait_impls_in_crate => { tcx.arena.alloc_from_iter(cdata.get_trait_impls(tcx)) }
-    implementations_of_trait => { cdata.get_implementations_of_trait(tcx, other) }
-    crate_incoherent_impls => { cdata.get_incoherent_impls(tcx, other) }
 
     crate_dep_kind => { cdata.dep_kind }
     module_children => {
@@ -455,6 +456,59 @@ pub(in crate::rmeta) fn provide(providers: &mut Providers) {
         native_libraries: native_libs::collect,
         foreign_modules: foreign_modules::collect,
         externally_implementable_items: eii::collect,
+
+        foreign_trait_impls_index: |tcx, ()| {
+            // Force `crates` before borrowing the cstore: computing it for the
+            // first time freezes the cstore, which would deadlock against the
+            // borrow below.
+            let crates = tcx.crates(());
+            let cstore = CStore::from_tcx(tcx);
+            let mut index = ForeignTraitImplsIndex::default();
+            for &cnum in crates.iter() {
+                // Register a dependency on the crate metadata,
+                // like external query providers do.
+                if tcx.dep_graph.is_fully_enabled() {
+                    tcx.ensure_ok().crate_hash(cnum);
+                }
+                cstore.get_crate_data(cnum).for_each_trait_impls_ref(
+                    tcx,
+                    |trait_def_id, position, num_impls| {
+                        index.impls.entry(trait_def_id).or_default().push(ForeignImplsRef {
+                            cnum,
+                            position,
+                            num_impls,
+                        });
+                    },
+                );
+            }
+            index
+        },
+        foreign_implementations_of_trait: |tcx, trait_id| {
+            let Some(refs) = tcx.foreign_trait_impls_index(()).impls.get(&trait_id) else {
+                return &[];
+            };
+            let cstore = CStore::from_tcx(tcx);
+            tcx.arena.alloc_from_iter(refs.iter().flat_map(|r| {
+                cstore.get_crate_data(r.cnum).decode_trait_impls_at(tcx, r.position, r.num_impls)
+            }))
+        },
+        foreign_incoherent_impls: |tcx, ()| {
+            // Force `crates` before borrowing the cstore, as above.
+            let crates = tcx.crates(());
+            let cstore = CStore::from_tcx(tcx);
+            let mut impls = ForeignIncoherentImpls::default();
+            for &cnum in crates.iter() {
+                // Register a dependency on the crate metadata,
+                // like external query providers do.
+                if tcx.dep_graph.is_fully_enabled() {
+                    tcx.ensure_ok().crate_hash(cnum);
+                }
+                cstore.get_crate_data(cnum).for_each_incoherent_impls(tcx, |simp, impl_def_id| {
+                    impls.impls.entry(simp).or_default().push(impl_def_id);
+                });
+            }
+            impls
+        },
 
         // Returns a map from a sufficiently visible external item (i.e., an
         // external item that is visible from at least one local module) to a
@@ -664,6 +718,18 @@ impl CStore {
     /// Only public-facing way to traverse all the definitions in a non-local crate.
     /// Critically useful for this third-party project: <https://github.com/hacspec/hacspec>.
     /// See <https://github.com/rust-lang/rust/pull/85889> for context.
+    /// Visits all trait impls of the given crate, without registering any
+    /// dependency on the crate metadata. Used from resolver diagnostics, where
+    /// the crate list must not be frozen yet.
+    pub fn for_each_trait_impl_in_crate_untracked(
+        &self,
+        tcx: TyCtxt<'_>,
+        cnum: CrateNum,
+        f: impl FnMut(DefId, DefId, Option<SimplifiedType>),
+    ) {
+        self.get_crate_data(cnum).for_each_trait_impls(tcx, f)
+    }
+
     pub fn num_def_ids_untracked(&self, cnum: CrateNum) -> usize {
         self.get_crate_data(cnum).num_def_ids()
     }

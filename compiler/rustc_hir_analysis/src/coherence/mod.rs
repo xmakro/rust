@@ -142,8 +142,7 @@ fn enforce_empty_impls_for_marker_traits(
 pub(crate) fn provide(providers: &mut Providers) {
     use self::builtin::coerce_unsized_info;
     use self::inherent_impls::{
-        crate_incoherent_impls, crate_inherent_impls, crate_inherent_impls_validity_check,
-        inherent_impls,
+        crate_inherent_impls, crate_inherent_impls_validity_check, inherent_impls,
     };
     use self::inherent_impls_overlap::crate_inherent_impls_overlap_check;
     use self::orphan::orphan_check_impl;
@@ -151,7 +150,6 @@ pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers {
         coherent_trait,
         crate_inherent_impls,
-        crate_incoherent_impls,
         inherent_impls,
         crate_inherent_impls_validity_check,
         crate_inherent_impls_overlap_check,

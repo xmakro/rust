@@ -12,7 +12,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::find_attr;
 use rustc_middle::bug;
-use rustc_middle::ty::fast_reject::{SimplifiedType, TreatParams, simplify_type};
+use rustc_middle::ty::fast_reject::{TreatParams, simplify_type};
 use rustc_middle::ty::{self, CrateInherentImpls, Ty, TyCtxt};
 use rustc_span::ErrorGuaranteed;
 
@@ -38,13 +38,6 @@ pub(crate) fn crate_inherent_impls_validity_check(
     (): (),
 ) -> Result<(), ErrorGuaranteed> {
     tcx.crate_inherent_impls(()).1
-}
-
-pub(crate) fn crate_incoherent_impls(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &[DefId] {
-    let (crate_map, _) = tcx.crate_inherent_impls(());
-    tcx.arena.alloc_from_iter(
-        crate_map.incoherent_impls.get(&simp).unwrap_or(&Vec::new()).iter().map(|d| d.to_def_id()),
-    )
 }
 
 /// On-demand query: yields a vector of the inherent impls for a specific type.

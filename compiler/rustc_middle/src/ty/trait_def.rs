@@ -1,9 +1,7 @@
-use std::iter;
-
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_hir::{self as hir, find_attr};
 use rustc_macros::{Decodable, Encodable, StableHash};
 use rustc_span::Span;
@@ -105,6 +103,35 @@ pub struct TraitImpls {
     blanket_impls: Vec<DefId>,
     /// Impls indexed by their simplified self type, for fast lookup.
     non_blanket_impls: FxIndexMap<SimplifiedType, Vec<DefId>>,
+}
+
+/// Reference to the impl list a single crate encodes for one trait, as an
+/// offset into that crate's metadata blob. Only `rustc_metadata` knows how to
+/// decode it.
+#[derive(Debug, Copy, Clone, StableHash)]
+pub struct ForeignImplsRef {
+    pub cnum: CrateNum,
+    pub position: usize,
+    pub num_impls: usize,
+}
+
+/// Index of all trait impls from external crates, keyed by trait.
+///
+/// Entries are recorded in crate loading order, and in metadata encoding order
+/// within a crate, so decoding a trait's impl lists produces impls in the same
+/// order as querying each crate separately would. The impl lists themselves
+/// stay lazy: only `foreign_implementations_of_trait` decodes them, per trait.
+#[derive(Default, Debug, StableHash)]
+pub struct ForeignTraitImplsIndex {
+    pub impls: FxIndexMap<DefId, Vec<ForeignImplsRef>>,
+}
+
+/// All incoherent inherent impls from external crates, keyed by self type.
+///
+/// Like `ForeignTraitImplsIndex`, entries are in crate loading order.
+#[derive(Default, Debug, StableHash)]
+pub struct ForeignIncoherentImpls {
+    pub impls: FxIndexMap<SimplifiedType, Vec<DefId>>,
 }
 
 impl TraitImpls {
@@ -308,19 +335,11 @@ pub(super) fn trait_impls_of_provider(tcx: TyCtxt<'_>, trait_id: DefId) -> Trait
     // Traits defined in the current crate can't have impls in upstream
     // crates, so we don't bother querying the cstore.
     if !trait_id.is_local() {
-        for &cnum in tcx.crates(()).iter() {
-            for &(impl_def_id, simplified_self_ty) in
-                tcx.implementations_of_trait((cnum, trait_id)).iter()
-            {
-                if let Some(simplified_self_ty) = simplified_self_ty {
-                    impls
-                        .non_blanket_impls
-                        .entry(simplified_self_ty)
-                        .or_default()
-                        .push(impl_def_id);
-                } else {
-                    impls.blanket_impls.push(impl_def_id);
-                }
+        for &(impl_def_id, simplified_self_ty) in tcx.foreign_implementations_of_trait(trait_id) {
+            if let Some(simplified_self_ty) = simplified_self_ty {
+                impls.non_blanket_impls.entry(simplified_self_ty).or_default().push(impl_def_id);
+            } else {
+                impls.blanket_impls.push(impl_def_id);
             }
         }
     }
@@ -351,10 +370,14 @@ pub(super) fn incoherent_impls_provider(tcx: TyCtxt<'_>, simp: SimplifiedType) -
     }
 
     let mut impls = Vec::new();
-    for cnum in iter::once(LOCAL_CRATE).chain(tcx.crates(()).iter().copied()) {
-        for &impl_def_id in tcx.crate_incoherent_impls((cnum, simp)) {
-            impls.push(impl_def_id)
-        }
+    // Local impls come first, then foreign impls in crate loading order,
+    // matching the previous per-crate iteration order.
+    let (crate_map, _) = tcx.crate_inherent_impls(());
+    if let Some(local) = crate_map.incoherent_impls.get(&simp) {
+        impls.extend(local.iter().map(|def_id| def_id.to_def_id()));
+    }
+    if let Some(foreign) = tcx.foreign_incoherent_impls(()).impls.get(&simp) {
+        impls.extend_from_slice(foreign);
     }
     debug!(?impls);
 

@@ -9,7 +9,6 @@ use std::{io, mem};
 pub(super) use cstore_impl::provide;
 use rustc_ast as ast;
 use rustc_data_structures::fingerprint::Fingerprint;
-use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::owned_slice::OwnedSlice;
 use rustc_data_structures::sync::Lock;
 use rustc_data_structures::unhash::UnhashMap;
@@ -97,15 +96,6 @@ pub(crate) struct CrateMetadata {
     // --- Some data pre-decoded from the metadata blob, usually for performance ---
     /// Data about the top-level items in a crate, as well as various crate-level metadata.
     root: CrateRoot,
-    /// Trait impl data.
-    /// FIXME: Used only from queries and can use query cache,
-    /// so pre-decoding can probably be avoided.
-    trait_impls: FxIndexMap<(u32, DefIndex), LazyArray<(DefIndex, Option<SimplifiedType>)>>,
-    /// Inherent impls which do not follow the normal coherence rules.
-    ///
-    /// These can be introduced using either `#![rustc_coherence_is_core]`
-    /// or `#[rustc_allow_incoherent_impl]`.
-    incoherent_impls: FxIndexMap<SimplifiedType, LazyArray<DefIndex>>,
     /// Proc macro function pointers for this crate, if it's a proc macro crate.
     raw_proc_macros: Option<&'static [ProcMacroClient]>,
     /// Source maps for code from the crate.
@@ -1489,43 +1479,76 @@ impl CrateMetadata {
 
     /// Decodes all trait impls in the crate (for rustdoc).
     fn get_trait_impls(&self, tcx: TyCtxt<'_>) -> impl Iterator<Item = DefId> {
-        self.trait_impls.values().flat_map(move |impls| {
-            impls.decode((self, tcx)).map(move |(impl_index, _)| self.local_def_id(impl_index))
+        self.root.impls.decode((self, tcx)).flat_map(move |trait_impls| {
+            trait_impls
+                .impls
+                .decode((self, tcx))
+                .map(move |(impl_index, _)| self.local_def_id(impl_index))
         })
     }
 
-    fn get_incoherent_impls<'tcx>(&self, tcx: TyCtxt<'tcx>, simp: SimplifiedType) -> &'tcx [DefId] {
-        if let Some(impls) = self.incoherent_impls.get(&simp) {
-            tcx.arena.alloc_from_iter(impls.decode((self, tcx)).map(|idx| self.local_def_id(idx)))
-        } else {
-            &[]
+    /// Decodes this crate's trait impl index, invoking `f` with each trait
+    /// (translated into the current session) and the position and length of
+    /// the trait's impl list, without decoding the impl list itself.
+    pub(crate) fn for_each_trait_impls_ref(
+        &self,
+        tcx: TyCtxt<'_>,
+        mut f: impl FnMut(DefId, usize, usize),
+    ) {
+        for trait_impls in self.root.impls.decode((self, tcx)) {
+            let (raw_cnum, index) = trait_impls.trait_id;
+            let raw_cnum = CrateNum::from_u32(raw_cnum);
+            let krate = if raw_cnum == LOCAL_CRATE { self.cnum } else { self.cnum_map[raw_cnum] };
+            let trait_def_id = DefId { krate, index };
+            f(trait_def_id, trait_impls.impls.position.get(), trait_impls.impls.num_elems);
         }
     }
 
-    fn get_implementations_of_trait<'tcx>(
+    /// Decodes the impl list at the given position, as previously reported by
+    /// `for_each_trait_impls_ref`.
+    pub(crate) fn decode_trait_impls_at(
         &self,
-        tcx: TyCtxt<'tcx>,
-        trait_def_id: DefId,
-    ) -> &'tcx [(DefId, Option<SimplifiedType>)] {
-        if self.trait_impls.is_empty() {
-            return &[];
+        tcx: TyCtxt<'_>,
+        position: usize,
+        num_impls: usize,
+    ) -> impl Iterator<Item = (DefId, Option<SimplifiedType>)> {
+        let impls = LazyArray::<(DefIndex, Option<SimplifiedType>)>::from_position_and_num_elems(
+            NonZero::new(position).unwrap(),
+            num_impls,
+        );
+        impls.decode((self, tcx)).map(move |(index, simp)| (self.local_def_id(index), simp))
+    }
+
+    /// Decodes this crate's trait impl index, invoking `f` with each trait
+    /// (translated into the current session) and its impls, in encoding order.
+    pub(crate) fn for_each_trait_impls(
+        &self,
+        tcx: TyCtxt<'_>,
+        mut f: impl FnMut(DefId, DefId, Option<SimplifiedType>),
+    ) {
+        for trait_impls in self.root.impls.decode((self, tcx)) {
+            let (raw_cnum, index) = trait_impls.trait_id;
+            let raw_cnum = CrateNum::from_u32(raw_cnum);
+            let krate = if raw_cnum == LOCAL_CRATE { self.cnum } else { self.cnum_map[raw_cnum] };
+            let trait_def_id = DefId { krate, index };
+            for (impl_index, simplified_self_ty) in trait_impls.impls.decode((self, tcx)) {
+                f(trait_def_id, self.local_def_id(impl_index), simplified_self_ty);
+            }
         }
+    }
 
-        // Do a reverse lookup beforehand to avoid touching the crate_num
-        // hash map in the loop below.
-        let key = match self.reverse_translate_def_id(trait_def_id) {
-            Some(def_id) => (def_id.krate.as_u32(), def_id.index),
-            None => return &[],
-        };
-
-        if let Some(impls) = self.trait_impls.get(&key) {
-            tcx.arena.alloc_from_iter(
-                impls
-                    .decode((self, tcx))
-                    .map(|(idx, simplified_self_ty)| (self.local_def_id(idx), simplified_self_ty)),
-            )
-        } else {
-            &[]
+    /// Decodes this crate's incoherent impl index, invoking `f` with each self
+    /// type and its impls, in encoding order.
+    pub(crate) fn for_each_incoherent_impls(
+        &self,
+        tcx: TyCtxt<'_>,
+        mut f: impl FnMut(SimplifiedType, DefId),
+    ) {
+        for incoherent_impls in self.root.incoherent_impls.decode((self, tcx)) {
+            let simp = incoherent_impls.self_ty.decode((self, tcx));
+            for impl_index in incoherent_impls.impls.decode((self, tcx)) {
+                f(simp, self.local_def_id(impl_index));
+            }
         }
     }
 
@@ -1941,7 +1964,6 @@ impl CrateMetadata {
 
 impl CrateMetadata {
     pub(crate) fn new(
-        tcx: TyCtxt<'_>,
         blob: MetadataBlob,
         root: CrateRoot,
         raw_proc_macros: Option<&'static [ProcMacroClient]>,
@@ -1952,11 +1974,6 @@ impl CrateMetadata {
         private_dep: bool,
         host_hash: Option<Svh>,
     ) -> CrateMetadata {
-        let trait_impls = root
-            .impls
-            .decode(&blob)
-            .map(|trait_impls| (trait_impls.trait_id, trait_impls.impls))
-            .collect();
         let alloc_decoding_state =
             AllocDecodingState::new(root.interpret_alloc_index.decode(&blob).collect());
 
@@ -1964,11 +1981,9 @@ impl CrateMetadata {
         // that does not copy any data. It just does some data verification.
         let def_path_hash_map = root.def_path_hash_map.decode(&blob);
 
-        let mut cdata = CrateMetadata {
+        CrateMetadata {
             blob,
             root,
-            trait_impls,
-            incoherent_impls: Default::default(),
             raw_proc_macros,
             source_map_import_info: Lock::new(Vec::new()),
             def_path_hash_map,
@@ -1984,18 +1999,7 @@ impl CrateMetadata {
             extern_crate: None,
             hygiene_context: Default::default(),
             def_key_cache: Default::default(),
-        };
-
-        cdata.incoherent_impls = cdata
-            .root
-            .incoherent_impls
-            .decode((&cdata, tcx))
-            .map(|incoherent_impls| {
-                (incoherent_impls.self_ty.decode((&cdata, tcx)), incoherent_impls.impls)
-            })
-            .collect();
-
-        cdata
+        }
     }
 
     pub(crate) fn dependencies(&self) -> impl Iterator<Item = CrateNum> {
@@ -2121,17 +2125,5 @@ impl CrateMetadata {
 
     fn local_def_id(&self, index: DefIndex) -> DefId {
         DefId { krate: self.cnum, index }
-    }
-
-    // Translate a DefId from the current compilation environment to a DefId
-    // for an external crate.
-    fn reverse_translate_def_id(&self, did: DefId) -> Option<DefId> {
-        for (local, &global) in self.cnum_map.iter_enumerated() {
-            if global == did.krate {
-                return Some(DefId { krate: local, index: did.index });
-            }
-        }
-
-        None
     }
 }
