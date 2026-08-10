@@ -157,6 +157,26 @@ macro_rules! define_queries {
                         #[cfg(not($cache_on_disk))]
                         try_load_from_disk_fn: |_tcx, _prev_index| None,
 
+                        #[cfg($cache_on_disk)]
+                        encode_cached_value_fn: |tcx, encoder, prev_index, dep_node_index| {
+                            use rustc_middle::queries::$name::ProvidedValue;
+
+                            // The value can be missing if a per-key condition kept
+                            // it out of the previous cache file; then there is
+                            // nothing to carry forward.
+                            let loaded_value: Option<ProvidedValue<'tcx>> =
+                                $crate::plumbing::try_load_from_disk(tcx, prev_index);
+                            if let Some(value) = loaded_value {
+                                encoder.encode_query_value(
+                                    rustc_middle::dep_graph::DepKind::$name,
+                                    dep_node_index,
+                                    &value,
+                                );
+                            }
+                        },
+                        #[cfg(not($cache_on_disk))]
+                        encode_cached_value_fn: |_tcx, _encoder, _prev_index, _dep_node_index| {},
+
                         #[cfg($handle_cycle_error)]
                         handle_cycle_error_fn: |tcx, key, cycle, err| {
                             use rustc_middle::query::erase::erase_val;

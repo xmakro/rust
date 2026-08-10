@@ -227,6 +227,21 @@ pub struct DepKindVTable<'tcx> {
             dep_node_index: DepNodeIndex,
         ),
     >,
+
+    /// Re-encode the on-disk cached value of a green query directly into the
+    /// next session's cache file. This is the carry-forward path for queries
+    /// whose key cannot be recovered from the dep node: `promote_from_disk_fn`
+    /// cannot put their values into the in-memory query cache, so without this
+    /// their values would be dropped whenever a session marks them green
+    /// without loading them.
+    pub encode_cached_value_fn: Option<
+        fn(
+            tcx: TyCtxt<'tcx>,
+            encoder: &mut crate::query::on_disk_cache::CacheEncoder<'_, 'tcx>,
+            prev_index: SerializedDepNodeIndex,
+            dep_node_index: DepNodeIndex,
+        ),
+    >,
 }
 
 /// A "work product" corresponds to a `.o` (or other) file that we
