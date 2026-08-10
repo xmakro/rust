@@ -160,6 +160,10 @@ pub struct DepGraphData {
     /// Pool of read recorders, amortized across tasks. Global rather than per worker so the
     /// retained memory is bounded by the total number of concurrently recording tasks.
     read_recorder_pool: Lock<Vec<ReadsRecorder>>,
+
+    /// Lazily cached `StableCrateId` of the local crate, used when selecting
+    /// loaded cache values for verification.
+    local_stable_crate_id: std::sync::OnceLock<u64>,
 }
 
 pub fn hash_result<R>(hcx: &mut StableHashState<'_>, result: &R) -> Fingerprint
@@ -218,6 +222,7 @@ impl DepGraph {
                 debug_loaded_from_disk: Default::default(),
                 green_edge_buf: WorkerLocal::default(),
                 read_recorder_pool: Lock::new(Vec::new()),
+                local_stable_crate_id: std::sync::OnceLock::new(),
             })),
             virtual_dep_node_index: Arc::new(AtomicU32::new(0)),
         }
@@ -712,6 +717,15 @@ impl DepGraphData {
     #[inline]
     pub fn session_count(&self) -> u64 {
         self.previous.session_count()
+    }
+
+    /// The `StableCrateId` of the local crate as a `u64`, cached to avoid a
+    /// query lookup per loaded cache value.
+    #[inline]
+    pub fn local_stable_crate_id(&self, tcx: TyCtxt<'_>) -> u64 {
+        *self
+            .local_stable_crate_id
+            .get_or_init(|| tcx.stable_crate_id(rustc_span::def_id::LOCAL_CRATE).as_u64())
     }
 
     #[inline]

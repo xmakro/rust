@@ -1,13 +1,16 @@
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::mem::ManuallyDrop;
 
-use rustc_data_structures::fingerprint::{Fingerprint, PackedFingerprint};
+use rustc_data_structures::fingerprint::Fingerprint;
+use rustc_data_structures::fx::FxHasher;
 use rustc_data_structures::hash_table::{Entry, HashTable};
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_data_structures::sync::{DynSend, DynSync};
 use rustc_data_structures::{defer, outline, sharded, sync};
 use rustc_errors::FatalError;
-use rustc_middle::dep_graph::{DepGraphData, DepNodeKey, SerializedDepNodeIndex};
+use rustc_middle::dep_graph::{
+    DepGraphData, DepNodeKey, SerializedDepNodeIndex, dep_kind_label,
+};
 use rustc_middle::query::{
     ActiveKeyStatus, Cycle, QueryCache, QueryJob, QueryJobId, QueryKey, QueryLatch, QueryMode,
     QueryState, QueryVTable,
@@ -495,17 +498,36 @@ fn execute_job_incr<'tcx, C: QueryCache>(
 /// cache every 32 sessions, and is deterministic so that a verification
 /// failure reproduces on retry.
 ///
+/// Values keyed by a local `DefPathHash` are sampled by their key fingerprint.
 /// `to_smaller_hash` mixes both fingerprint halves because neither half is
-/// evenly distributed on its own (`DefPathHash` keys share the
-/// `StableCrateId`, `HirId` keys contain a sequential id).
+/// evenly distributed on its own.
+///
+/// All other key fingerprints incorporate `StableCrateId`s of other crates
+/// (foreign-def keys directly, opaque keys through the types they contain),
+/// which embed the rustc version those crates were built with. Sampling by
+/// such fingerprints selects different subsets for compilers built from
+/// different sources even on identical input, which makes A/B benchmark
+/// comparisons noisy. Instead, these values rotate in per-kind batches
+/// slotted by the kind's label, which is stable across compiler builds.
+/// Unit-keyed values (a single value per kind) and `HirId`-keyed values also
+/// take this path, which keeps the classification down to a single
+/// comparison.
 pub(crate) fn should_verify_loaded_value(
     tcx: TyCtxt<'_>,
     dep_graph_data: &DepGraphData,
-    key_fingerprint: PackedFingerprint,
+    dep_node: &DepNode,
 ) -> bool {
-    let hash = Fingerprint::from(key_fingerprint).to_smaller_hash().as_u64();
-    hash % 32 == dep_graph_data.session_count() % 32
-        || tcx.sess.opts.unstable_opts.incremental_verify_ich
+    if tcx.sess.opts.unstable_opts.incremental_verify_ich {
+        return true;
+    }
+    let key_fingerprint = Fingerprint::from(dep_node.key_fingerprint);
+    if key_fingerprint.split().0.as_u64() == dep_graph_data.local_stable_crate_id(tcx) {
+        let hash = key_fingerprint.to_smaller_hash().as_u64();
+        return hash % 32 == dep_graph_data.session_count() % 32;
+    }
+    let mut hasher = FxHasher::default();
+    hasher.write(dep_kind_label(dep_node.kind).as_bytes());
+    hasher.finish() % 32 == dep_graph_data.session_count() % 32
 }
 
 /// Given that the dep node for this query+key is green, obtain a value for it
@@ -541,7 +563,7 @@ fn load_from_disk_or_invoke_provider_green<'tcx, C: QueryCache>(
                 dep_graph_data.mark_debug_loaded_from_disk(*dep_node)
             }
 
-            let verify = should_verify_loaded_value(tcx, dep_graph_data, dep_node.key_fingerprint);
+            let verify = should_verify_loaded_value(tcx, dep_graph_data, dep_node);
 
             (value, verify)
         }

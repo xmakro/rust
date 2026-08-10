@@ -296,6 +296,15 @@ macro_rules! define_dep_nodes {
                 _ => Err(()),
             }
         }
+
+        /// The label of a `DepKind`, e.g. `"type_of"`. Unlike the `DepKind`
+        /// discriminant, the label is stable across compiler builds.
+        pub fn dep_kind_label(kind: DepKind) -> &'static str {
+            match kind {
+                $( self::DepKind::$nq_name => stringify!($nq_name), )*
+                $( self::DepKind::$q_name => stringify!($q_name), )*
+            }
+        }
     };
 }
 
