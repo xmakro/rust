@@ -1391,10 +1391,19 @@ fn fn_spans(krate: &ast::Crate, name: Symbol) -> Vec<Span> {
 impl CStore {
     /// The currently loaded crates in `CrateNum` order, with the data needed to
     /// replay and validate this load order in a later session.
-    pub fn fecache_crates(&self) -> Vec<(CrateNum, Symbol, Svh, CrateDepKind)> {
+    pub fn fecache_crates(&self) -> Vec<(CrateNum, Symbol, Svh, CrateDepKind, bool)> {
         self.iter_crate_data()
-            .map(|(cnum, data)| (cnum, data.name(), data.hash(), data.dep_kind()))
+            .map(|(cnum, data)| {
+                (cnum, data.name(), data.hash(), data.dep_kind(), data.is_private_dep())
+            })
             .collect()
+    }
+
+    /// Forces the private-dependency flag a previous session computed for this
+    /// crate: the replayed load order cannot reproduce the dependency-chain
+    /// privacy propagation, so it is restored explicitly.
+    pub fn fecache_set_private_dep(&mut self, cnum: CrateNum, private: bool) {
+        self.get_crate_data_mut(cnum).fecache_set_private_dep(private);
     }
 
     /// Loads `name` through normal crate resolution, for replaying the crate load

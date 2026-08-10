@@ -2151,6 +2151,11 @@ impl CrateMetadata {
             .collect()
     }
 
+    /// See `CStore::fecache_set_private_dep`.
+    pub(crate) fn fecache_set_private_dep(&mut self, private: bool) {
+        self.private_dep = private;
+    }
+
     /// Force-imports one of this crate's source files into the local source map,
     /// replaying the import order recorded by a previous session.
     pub(crate) fn fecache_import_source_file(

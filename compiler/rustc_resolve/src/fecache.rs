@@ -10,6 +10,7 @@
 //! restored AST only redoes the session-local per-owner bookkeeping.
 
 use rustc_ast as ast;
+use rustc_hir::attrs::StrippedCfgItem;
 use rustc_hir::def::DefKind;
 use rustc_hir::definitions::PerParentDisambiguatorsMap;
 use rustc_span::hygiene::ExpnId;
@@ -63,7 +64,33 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         self.next_node_id
     }
 
+    /// Items removed by cfg stripping, recorded during expansion for
+    /// "exists but was cfg-ed out" diagnostics and crate metadata.
+    pub fn fecache_stripped_cfg_items(&self) -> &[StrippedCfgItem<ast::NodeId>] {
+        &self.stripped_cfg_items
+    }
+
+    pub fn fecache_set_stripped_cfg_items(&mut self, items: Vec<StrippedCfgItem<ast::NodeId>>) {
+        self.stripped_cfg_items = items;
+    }
+
     pub fn fecache_set_next_node_id(&mut self, id: ast::NodeId) {
         self.next_node_id = id;
+    }
+
+    /// The names resolved through each glob import so far. Macro path
+    /// resolution during expansion records entries here, which a replayed
+    /// session would otherwise miss.
+    pub fn fecache_glob_map(&self) -> Vec<(LocalDefId, Vec<Symbol>)> {
+        self.glob_map
+            .iter()
+            .map(|(def_id, names)| (*def_id, names.iter().copied().collect()))
+            .collect()
+    }
+
+    pub fn fecache_extend_glob_map(&mut self, entries: Vec<(LocalDefId, Vec<Symbol>)>) {
+        for (def_id, names) in entries {
+            self.glob_map.entry(def_id).or_default().extend(names);
+        }
     }
 }

@@ -228,6 +228,7 @@ fn configure_and_expand(
         let lint_store = LintStoreExpandImpl(lint_store);
         let mut ecx = ExtCtxt::new(sess, cfg, resolver, Some(&lint_store));
         ecx.num_standard_library_imports = num_standard_library_imports;
+        ecx.frontend_cache_replay = fecache_restored;
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
 
@@ -273,6 +274,10 @@ fn configure_and_expand(
         sess.time("fecache_write", || {
             crate::frontend_cache::write_snapshot(tcx, resolver, &mut krate, fecache_mark)
         });
+    }
+
+    if let Some(dump) = std::env::var_os("FECACHE_DUMP_AST") {
+        std::fs::write(dump, format!("{krate:#?}")).unwrap();
     }
 
     sess.time("maybe_building_test_harness", || {
@@ -836,6 +841,29 @@ fn resolver_for_lowering_raw<'tcx>(
         global_ctxt: untracked_resolutions,
         ast_lowering: untracked_resolver_for_lowering,
     } = resolver.into_outputs();
+
+    if std::env::var_os("FECACHE_RES_HASHES").is_some() {
+        use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+        let r = &untracked_resolutions;
+        macro_rules! field_hash {
+            ($($name:ident),* $(,)?) => {
+                $(tcx.with_stable_hashing_context(|mut hcx| {
+                    let mut hasher = StableHasher::new();
+                    r.$name.stable_hash(&mut hcx, &mut hasher);
+                    let h: rustc_hashes::Hash64 = hasher.finish();
+                    eprintln!("res-hash {} {:x}", stringify!($name), h.as_u64());
+                });)*
+            };
+        }
+        field_hash!(
+            visibilities_for_hashing, expn_that_defined, effective_visibilities,
+            macro_reachable_adts, extern_crate_map, maybe_unused_trait_imports,
+            module_children, ambig_module_children, glob_map, main_def, trait_impls,
+            proc_macros, confused_type_with_std_module, doc_link_resolutions,
+            doc_link_traits_in_scope, all_macro_rules, stripped_cfg_items,
+            delegation_infos,
+        );
+    }
 
     (
         tcx.arena.alloc(Steal::new(untracked_resolver_for_lowering)),

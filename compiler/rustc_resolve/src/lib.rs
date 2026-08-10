@@ -1960,15 +1960,29 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         self.visibilities_for_hashing.push((feed.def_id(), vis));
     }
 
-    pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+    pub fn into_outputs(mut self) -> ResolverOutputs<'tcx> {
         let proc_macros = self.proc_macros;
         let expn_that_defined = self.expn_that_defined;
         let extern_crate_map = self.extern_crate_map;
         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
-        let glob_map = self.glob_map;
+        // These are all ordered by when the fixpoint computations reached each
+        // item, which depends on how expansion interleaved with reduced graph
+        // building. Their stable hashes are order-sensitive, so give them a
+        // session-stable order: a frontend cache replay builds the resolver
+        // state in one pass and would otherwise diverge from the recording
+        // session. See `fecache`.
+        let mut glob_map = self.glob_map;
+        glob_map.sort_unstable_by(|a, _, b, _| a.local_def_index.cmp(&b.local_def_index));
+        for set in glob_map.values_mut() {
+            set.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        }
+        let glob_map = glob_map;
+        self.visibilities_for_hashing.sort_unstable_by_key(|&(def_id, _)| def_id.local_def_index);
         let main_def = self.main_def;
         let confused_type_with_std_module = self.confused_type_with_std_module;
-        let effective_visibilities = self.effective_visibilities;
+        let mut effective_visibilities = self.effective_visibilities;
+        effective_visibilities.sort_for_stable_hashing();
+        let effective_visibilities = effective_visibilities;
 
         let stripped_cfg_items = self
             .stripped_cfg_items
@@ -2146,6 +2160,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
             ControlFlow::<()>::Continue(())
         });
+
+        // The collection order follows module binding insertion order, which
+        // differs between a staged expansion and a frontend cache replay. The
+        // candidates form a set as far as method probing is concerned, so give
+        // them a session-stable order.
+        found_traits.sort_by_key(|tr| (tr.def_id.krate.as_u32(), tr.def_id.index.as_u32()));
 
         self.tcx.hir_arena.alloc_slice(&found_traits)
     }

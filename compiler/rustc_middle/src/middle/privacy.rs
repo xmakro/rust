@@ -104,6 +104,14 @@ pub struct EffectiveVisibilities<Id = LocalDefId> {
 }
 
 impl EffectiveVisibilities {
+    /// Gives the map a session-stable order. The insertion order follows the
+    /// visibility fixpoint computation, which depends on how expansion
+    /// interleaved with reduced graph building, so a frontend cache replay
+    /// would otherwise hash differently from the recording session.
+    pub fn sort_for_stable_hashing(&mut self) {
+        self.map.sort_unstable_by(|a, _, b, _| a.local_def_index.cmp(&b.local_def_index));
+    }
+
     pub fn is_public_at_level(&self, id: LocalDefId, level: Level) -> bool {
         self.effective_vis(id).is_some_and(|effective_vis| effective_vis.is_public_at_level(level))
     }

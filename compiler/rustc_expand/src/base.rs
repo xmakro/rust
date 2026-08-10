@@ -1211,6 +1211,9 @@ pub struct ExtCtxt<'a> {
     /// `-Zmacro-stats` data.
     pub macro_stats: FxHashMap<(Symbol, MacroKind), MacroStat>,
     pub nb_macro_errors: usize,
+    /// The crate was restored from the frontend cache: the AST already carries
+    /// its final node ids, so the invocation collector must not assign fresh ones.
+    pub frontend_cache_replay: bool,
 }
 
 impl<'a> ExtCtxt<'a> {
@@ -1242,6 +1245,7 @@ impl<'a> ExtCtxt<'a> {
             buffered_early_lint: vec![],
             macro_stats: Default::default(),
             nb_macro_errors: 0,
+            frontend_cache_replay: false,
         }
     }
 
