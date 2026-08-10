@@ -2,12 +2,14 @@ use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::{fmt, mem};
 
-use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::sync::{HashMapExt, Lock, RwLock};
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId};
+use rustc_hir::def_id::{
+    CrateNum, DefId, DefIdSet, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId,
+};
 use rustc_hir::definitions::DefPathHash;
 use rustc_index::IndexVec;
 use rustc_macros::{Decodable, Encodable};
@@ -22,10 +24,10 @@ use rustc_span::{
     SourceFile, Span, SpanDecoder, SpanEncoder, Spanned, StableSourceFileId, Symbol,
 };
 
-use crate::dep_graph::{DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
+use crate::dep_graph::{DepKind, DepNodeIndex, QuerySideEffect, SerializedDepNodeIndex};
 use crate::mir::interpret::{AllocDecodingSession, AllocDecodingState};
 use crate::mir::{self, interpret};
-use crate::mono::MonoItem;
+use crate::mono::{CodegenUnit, MonoItem, MonoItemPartitions};
 use crate::ty::codec::{RefDecodable, TyDecoder, TyEncoder};
 use crate::ty::{self, Ty, TyCtxt};
 
@@ -61,6 +63,12 @@ pub struct OnDiskCache {
     /// For query dep nodes that have a disk-cached return value, maps the node
     /// index to the position of its serialized value in `serialized_data`.
     query_values_index: FxHashMap<SerializedDepNodeIndex, AbsoluteBytePos>,
+
+    /// The subset of `query_values_index` whose dep kind uses the direct value
+    /// carry-forward path, grouped by kind. Recorded separately at encode time
+    /// so that enumerating carry-forward candidates does not require scanning
+    /// the whole value index.
+    carried_value_candidates: Vec<(DepKind, Vec<SerializedDepNodeIndex>)>,
 
     /// For `DepKind::SideEffect` dep nodes, maps the node index to the position
     /// of its serialized [`QuerySideEffect`] in `serialized_data`.
@@ -98,6 +106,7 @@ pub struct OnDiskCache {
 struct Footer {
     file_index_to_stable_id: FxHashMap<SourceFileIndex, EncodedSourceFileId>,
     query_values_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
+    carried_value_candidates: Vec<(u16, Vec<SerializedDepNodeIndex>)>,
     side_effects_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
     // The location of all allocations.
     // Most uses only need values up to u32::MAX, but benchmarking indicates that we can use a u64
@@ -169,6 +178,11 @@ impl OnDiskCache {
             file_index_to_stable_id: footer.file_index_to_stable_id,
             file_index_to_file: Default::default(),
             query_values_index: footer.query_values_index.into_iter().collect(),
+            carried_value_candidates: footer
+                .carried_value_candidates
+                .into_iter()
+                .map(|(kind, indices)| (DepKind::from_u16(kind), indices))
+                .collect(),
             side_effects_index: footer.side_effects_index.into_iter().collect(),
             alloc_decoding_state: AllocDecodingState::new(footer.interpret_alloc_index),
             syntax_contexts: footer.syntax_contexts,
@@ -184,6 +198,7 @@ impl OnDiskCache {
             file_index_to_stable_id: Default::default(),
             file_index_to_file: Default::default(),
             query_values_index: Default::default(),
+            carried_value_candidates: Default::default(),
             side_effects_index: Default::default(),
             alloc_decoding_state: AllocDecodingState::new(Vec::new()),
             syntax_contexts: FxHashMap::default(),
@@ -233,9 +248,11 @@ impl OnDiskCache {
                 interpret_allocs: Default::default(),
                 caching_source_map_view: CachingSourceMapView::new(tcx.sess.source_map()),
                 file_to_file_index,
+                file_index_to_stable_id,
                 hygiene_context: &hygiene_encode_context,
                 symbol_index_table: Default::default(),
                 query_values_index: Default::default(),
+                carried_value_candidates: Default::default(),
                 side_effects_index: Default::default(),
             };
 
@@ -243,6 +260,44 @@ impl OnDiskCache {
             tcx.sess.time("encode_query_values", || {
                 tcx.encode_query_values(&mut encoder);
             });
+
+            // Carry forward disk-cached values of green nodes that were never
+            // loaded this session and whose key cannot be recovered from the
+            // dep node, so the in-memory promotion pass could not handle them.
+            // Iterating the previous file's value index keeps this proportional
+            // to the number of cached values, and free when there is no
+            // previous cache.
+            if let Some(on_disk_cache) = tcx.query_system.on_disk_cache.as_ref() {
+                tcx.sess.time("encode_unloaded_query_values", || {
+                    let candidates: Vec<SerializedDepNodeIndex> = on_disk_cache
+                        .carried_value_candidates
+                        .iter()
+                        .filter(|&&(kind, _)| {
+                            tcx.dep_kind_vtable(kind).encode_cached_value_fn.is_some()
+                        })
+                        .flat_map(|(_, indices)| indices.iter().copied())
+                        .collect();
+                    if !candidates.is_empty() {
+                        // Only values of the carried kinds can collide with the
+                        // candidates, so only their part of the freshly written
+                        // index is needed for the overlap check. Iteration order
+                        // does not matter for building a lookup set.
+                        #[allow(rustc::potential_query_instability)]
+                        let already_encoded: FxHashSet<SerializedDepNodeIndex> = encoder
+                            .carried_value_candidates
+                            .values()
+                            .flatten()
+                            .copied()
+                            .collect();
+                        tcx.dep_graph.encode_unloaded_green_values(
+                            tcx,
+                            &mut encoder,
+                            &already_encoded,
+                            candidates.into_iter(),
+                        );
+                    }
+                });
+            }
 
             // Encode side effects.
             for (&dep_node_index, side_effect) in tcx.query_system.side_effects.borrow().iter() {
@@ -299,12 +354,18 @@ impl OnDiskCache {
             // Encode the file footer.
             let footer_pos = encoder.position() as u64;
             let query_values_index = mem::take(&mut encoder.query_values_index);
+            #[allow(rustc::potential_query_instability)]
+            let mut carried_value_candidates: Vec<(u16, Vec<SerializedDepNodeIndex>)> =
+                mem::take(&mut encoder.carried_value_candidates).into_iter().collect();
+            carried_value_candidates.sort_unstable_by_key(|&(kind, _)| kind);
             let side_effects_index = mem::take(&mut encoder.side_effects_index);
+            let file_index_to_stable_id = mem::take(&mut encoder.file_index_to_stable_id);
             encoder.encode_tagged(
                 TAG_FILE_FOOTER,
                 &Footer {
                     file_index_to_stable_id,
                     query_values_index,
+                    carried_value_candidates,
                     side_effects_index,
                     interpret_alloc_index,
                     syntax_contexts,
@@ -740,6 +801,29 @@ impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [Spanned<MonoItem<'tc
     }
 }
 
+impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx [CodegenUnit<'tcx>] {
+    #[inline]
+    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
+        RefDecodable::decode(d)
+    }
+}
+
+impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx DefIdSet {
+    #[inline]
+    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
+        RefDecodable::decode(d)
+    }
+}
+
+impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for MonoItemPartitions<'tcx> {
+    #[inline]
+    fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
+        let codegen_units = Decodable::decode(d);
+        let all_mono_items = Decodable::decode(d);
+        MonoItemPartitions { codegen_units, all_mono_items }
+    }
+}
+
 impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
     for &'tcx crate::traits::specialization_graph::Graph
 {
@@ -789,11 +873,13 @@ pub struct CacheEncoder<'a, 'tcx> {
     interpret_allocs: FxIndexSet<interpret::AllocId>,
     caching_source_map_view: CachingSourceMapView<'tcx>,
     file_to_file_index: FxHashMap<*const SourceFile, SourceFileIndex>,
+    file_index_to_stable_id: FxHashMap<SourceFileIndex, EncodedSourceFileId>,
     hygiene_context: &'a HygieneEncodeContext,
     // Used for both `Symbol`s and `ByteSymbol`s.
     symbol_index_table: FxHashMap<u32, usize>,
 
     query_values_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
+    carried_value_candidates: FxHashMap<u16, Vec<SerializedDepNodeIndex>>,
     side_effects_index: Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>,
 }
 
@@ -807,7 +893,20 @@ impl<'a, 'tcx> fmt::Debug for CacheEncoder<'a, 'tcx> {
 impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
     #[inline]
     fn source_file_index(&mut self, source_file: Arc<SourceFile>) -> SourceFileIndex {
-        self.file_to_file_index[&(&raw const *source_file)]
+        let file_ptr: *const SourceFile = &raw const *source_file;
+        if let Some(&index) = self.file_to_file_index.get(&file_ptr) {
+            return index;
+        }
+        // A source file can be imported lazily while values carried forward
+        // from the previous cache file are decoded during serialization, in
+        // which case it is not part of the snapshot taken when this encoder
+        // was created. Assign it the next index and record its stable id so
+        // it ends up in the footer.
+        let index = SourceFileIndex(self.file_to_file_index.len() as u32);
+        self.file_to_file_index.insert(file_ptr, index);
+        let source_file_id = EncodedSourceFileId::new(self.tcx, &source_file);
+        self.file_index_to_stable_id.insert(index, source_file_id);
+        index
     }
 
     /// Encode something with additional information that allows to do some
@@ -825,10 +924,18 @@ impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
         ((end_pos - start_pos) as u64).encode(self);
     }
 
-    pub fn encode_query_value<V: Encodable<Self>>(&mut self, index: DepNodeIndex, value: &V) {
+    pub fn encode_query_value<V: Encodable<Self>>(
+        &mut self,
+        kind: DepKind,
+        index: DepNodeIndex,
+        value: &V,
+    ) {
         let index = SerializedDepNodeIndex::from_curr_for_serialization(index);
 
         self.query_values_index.push((index, AbsoluteBytePos::new(self.position())));
+        if self.tcx.dep_kind_vtable(kind).encode_cached_value_fn.is_some() {
+            self.carried_value_candidates.entry(kind.as_u16()).or_default().push(index);
+        }
         self.encode_tagged(index, value);
     }
 

@@ -1090,6 +1090,39 @@ impl DepGraph {
         }
     }
 
+    /// Companion to `exec_cache_promotions` for queries whose key cannot be
+    /// recovered from the dep node: their values cannot be promoted through the
+    /// in-memory query cache, so green values that were never loaded during
+    /// this session are re-encoded straight from the previous cache file into
+    /// the new one. `candidates` are the node indices that have a value in the
+    /// previous cache file; `already_encoded` contains the indices of all
+    /// values the regular result-cache encoding has already written, which are
+    /// skipped.
+    pub fn encode_unloaded_green_values<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        encoder: &mut crate::query::on_disk_cache::CacheEncoder<'_, 'tcx>,
+        already_encoded: &FxHashSet<SerializedDepNodeIndex>,
+        candidates: impl Iterator<Item = SerializedDepNodeIndex>,
+    ) {
+        let _prof_timer = tcx.prof.generic_activity("incr_comp_encode_unloaded_green_values");
+
+        let Some(data) = self.data.as_ref() else { return };
+        for prev_index in candidates {
+            if let DepNodeColor::Green(dep_node_index) = data.colors.get(prev_index) {
+                let dep_node = data.previous.index_to_node(prev_index);
+                if let Some(encode_fn) = tcx.dep_kind_vtable(dep_node.kind).encode_cached_value_fn
+                    && !already_encoded
+                        .contains(&SerializedDepNodeIndex::from_curr_for_serialization(
+                            dep_node_index,
+                        ))
+                {
+                    encode_fn(tcx, encoder, prev_index, dep_node_index);
+                }
+            }
+        }
+    }
+
     pub(crate) fn finish_encoding(&self) -> FileEncodeResult {
         if let Some(data) = &self.data { data.current.encoder.finish(&data.current) } else { Ok(0) }
     }

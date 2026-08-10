@@ -1,6 +1,6 @@
 use rustc_middle::arena::Arena;
 use rustc_middle::bug;
-use rustc_middle::dep_graph::{DepKindVTable, DepNodeKey, KeyFingerprintStyle};
+use rustc_middle::dep_graph::{DepKind, DepKindVTable, DepNodeKey, KeyFingerprintStyle};
 use rustc_middle::query::QueryCache;
 
 use crate::GetQueryVTable;
@@ -20,6 +20,7 @@ mod non_query {
                 bug!("force_from_dep_node: encountered {dep_node:?}")
             }),
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -32,6 +33,7 @@ mod non_query {
                 bug!("force_from_dep_node: encountered {dep_node:?}")
             }),
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -44,6 +46,7 @@ mod non_query {
                 true
             }),
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -53,6 +56,7 @@ mod non_query {
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: Some(|_, _, _| bug!("cannot force an anon node")),
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -62,6 +66,7 @@ mod non_query {
             key_fingerprint_style: KeyFingerprintStyle::Unit,
             force_from_dep_node_fn: None,
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -71,6 +76,7 @@ mod non_query {
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: None,
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -80,6 +86,7 @@ mod non_query {
             key_fingerprint_style: KeyFingerprintStyle::Opaque,
             force_from_dep_node_fn: None,
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 
@@ -89,6 +96,7 @@ mod non_query {
             key_fingerprint_style: KeyFingerprintStyle::Unit,
             force_from_dep_node_fn: None,
             promote_from_disk_fn: None,
+            encode_cached_value_fn: None,
         }
     }
 }
@@ -99,6 +107,7 @@ pub(crate) fn make_dep_kind_vtable_for_query<'tcx, Q>(
     is_cache_on_disk: bool,
     is_eval_always: bool,
     is_no_force: bool,
+    dep_kind: DepKind,
 ) -> DepKindVTable<'tcx>
 where
     Q: GetQueryVTable<'tcx>,
@@ -121,6 +130,24 @@ where
             |tcx, dep_node, prev_index, dep_node_index| {
                 let query = Q::query_vtable(tcx);
                 promote_from_disk_inner(tcx, query, dep_node, prev_index, dep_node_index)
+            },
+        ),
+        // Queries with recoverable keys are carried forward by `promote_from_disk_fn`
+        // through the in-memory cache; the direct re-encode path is only needed when
+        // the key cannot be recovered. It is restricted to the queries whose green
+        // values the partition replay leaves unloaded: for other queries with
+        // unrecoverable keys (const eval allocations in particular), re-encoding the
+        // values costs more than recomputing them, so they keep the previous
+        // behavior of being dropped from the cache when a session does not use them.
+        encode_cached_value_fn: (matches!(
+            dep_kind,
+            DepKind::items_of_instance | DepKind::size_estimate | DepKind::symbol_name
+        ) && !can_recover
+            && is_cache_on_disk)
+            .then_some(
+            |tcx, encoder, prev_index, dep_node_index| {
+                let query = Q::query_vtable(tcx);
+                (query.encode_cached_value_fn)(tcx, encoder, prev_index, dep_node_index)
             },
         ),
     }
@@ -171,6 +198,7 @@ macro_rules! define_dep_kind_vtables {
                     $cache_on_disk,
                     $eval_always,
                     $no_force,
+                    rustc_middle::dep_graph::DepKind::$name,
                 )
             ),*
         ];

@@ -75,14 +75,18 @@ pub(crate) fn save_dep_graph(tcx: TyCtxt<'_>) {
                     // Can we promote values without decoding them into the memory cache?
                     tcx.dep_graph.exec_cache_promotions(tcx);
 
-                    // Drop the memory map so that we can remove the file and write to it.
-                    on_disk_cache.close_serialized_data_mmap();
-
+                    // Values whose query key cannot be recovered from the dep node
+                    // are carried forward during serialization instead, reading
+                    // straight from the previous cache file, so the mmap has to
+                    // stay open until the new file has been written. Unlinking the
+                    // old file while it is still mapped is fine on unix-like hosts.
                     file_format::save_in(sess, query_cache_path, "query cache", |encoder| {
                         tcx.sess.time("incr_comp_serialize_result_cache", || {
                             on_disk_cache::OnDiskCache::serialize(tcx, encoder)
                         })
                     });
+
+                    on_disk_cache.close_serialized_data_mmap();
                 });
             },
         );

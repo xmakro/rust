@@ -96,6 +96,19 @@ pub struct QueryVTable<'tcx, C: QueryCache> {
     pub try_load_from_disk_fn:
         fn(tcx: TyCtxt<'tcx>, prev_index: SerializedDepNodeIndex) -> Option<C::Value>,
 
+    /// Function pointer that re-encodes this query's previous-session disk-cached
+    /// value into the next session's cache file, without going through the
+    /// in-memory query cache. Used at cache-save time for green nodes whose value
+    /// was never loaded and whose key cannot be recovered from the dep node, so
+    /// the regular promotion pass cannot carry them forward. A no-op for queries
+    /// without `cache_on_disk`.
+    pub encode_cached_value_fn: fn(
+        tcx: TyCtxt<'tcx>,
+        encoder: &mut super::on_disk_cache::CacheEncoder<'_, 'tcx>,
+        prev_index: SerializedDepNodeIndex,
+        dep_node_index: DepNodeIndex,
+    ),
+
     /// Function pointer that hashes this query's result values.
     ///
     /// For `no_hash` queries, this function pointer is None.
