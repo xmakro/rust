@@ -181,6 +181,20 @@ impl<'tcx> TyCtxt<'tcx> {
             return Hashes { bodies_hash: None, attrs_hash: None };
         }
 
+        self.hash_owner_nodes_ungated(node, bodies, attrs, define_opaque)
+    }
+
+    /// Like [`Self::hash_owner_nodes`], but hashes whether or not [`TyCtxt::needs_hir_hash`]
+    /// says per-owner hashes are being kept. Besides implementing `hash_owner_nodes`, this is
+    /// used at metadata-encoding time to hash `global_asm!` owners for the crate hash in
+    /// configurations where lowering did not store any hashes; see `compute_global_asm_hash`.
+    pub fn hash_owner_nodes_ungated(
+        self,
+        node: OwnerNode<'_>,
+        bodies: &SortedMap<ItemLocalId, &Body<'_>>,
+        attrs: &SortedMap<ItemLocalId, &[Attribute]>,
+        define_opaque: Option<&[(Span, LocalDefId)]>,
+    ) -> Hashes {
         self.with_stable_hashing_context(|mut hcx| {
             let mut stable_hasher = StableHasher::new();
             node.stable_hash(&mut hcx, &mut stable_hasher);

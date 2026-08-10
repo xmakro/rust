@@ -21,7 +21,7 @@ use rustc_hir::definitions::DefPathData;
 use rustc_hir::find_attr;
 use rustc_hir_pretty::id_to_string;
 use rustc_middle::dep_graph::WorkProductId;
-use rustc_middle::hir::map::compute_hir_hash;
+use rustc_middle::hir::map::{compute_global_asm_hash, compute_hir_hash};
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::mir::interpret;
 use rustc_middle::query::Providers;
@@ -2581,13 +2581,27 @@ fn with_encode_metadata_header(
     if metadata_crate_hash {
         // Fold in inputs that are not part of the encoded metadata bytes, reduced to a single
         // fingerprint via the stable hasher and then mixed into the byte digest.
-        let hir_body_hash = compute_hir_hash(tcx);
+        //
+        // Proc-macro metadata is a stub that does not describe the macro implementation, so
+        // for proc-macro crates the whole HIR keeps contributing to the crate hash. For every
+        // other crate the encoded bytes stand in for the HIR — everything downstream
+        // compilation can observe is either in the bytes (including the source file hashes in
+        // the encoded source map) or in the tracked command line options — except `global_asm!`
+        // bodies, which reach codegen without leaving a trace in the bytes and are therefore
+        // hashed explicitly; see `compute_global_asm_hash`. This choice must depend only on the
+        // crate type: keying it on, say, `needs_hir_hash()` would make the hash differ between
+        // compilers built with and without debug assertions, or between incremental and
+        // non-incremental builds.
+        let hir_supplement = if tcx.crate_types().contains(&CrateType::ProcMacro) {
+            compute_hir_hash(tcx)
+        } else {
+            compute_global_asm_hash(tcx)
+        };
         let supplement: Fingerprint = tcx.with_stable_hashing_context(|mut hcx| {
             let mut hasher = StableHasher::new();
             // Add dep_tracking_hash to ensure the SVH changes when any tracked flag changes.
             tcx.sess.opts.dep_tracking_hash(true).stable_hash(&mut hcx, &mut hasher);
-            // Add HIR hash for untracked elements, e.g. DefKind::GlobalAsm.
-            hir_body_hash.stable_hash(&mut hcx, &mut hasher);
+            hir_supplement.stable_hash(&mut hcx, &mut hasher);
             hasher.finish()
         });
         metadata_hasher.lock().unwrap().write(&supplement.to_le_bytes());

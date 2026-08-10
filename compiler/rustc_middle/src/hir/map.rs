@@ -1282,6 +1282,44 @@ pub fn compute_hir_hash(tcx: TyCtxt<'_>) -> Fingerprint {
         .expect("HIR hash requested without any content")
 }
 
+/// Hashes the `global_asm!` items of the crate.
+///
+/// When the crate hash is computed from the encoded metadata, `global_asm!` bodies are the one
+/// HIR-only input to codegen that leaves no trace in the encoded bytes: every `should_encode_*`
+/// predicate is off for `DefKind::GlobalAsm`, so all that reaches the metadata is the def-kind
+/// discriminant, no matter what the template says. The template only becomes observable again
+/// when codegen reads it back out of the HIR (`MonoItem::GlobalAsm`). Hashing those owners
+/// explicitly keeps the crate hash changing with them, which matters when the template comes
+/// out of an untracked input such as a proc-macro reading the environment: nothing else — not
+/// the source file hashes in the encoded source map, not the tracked options — sees it.
+///
+/// The owners are re-hashed from their nodes rather than read from the stored per-owner
+/// hashes, because those are not computed in the configurations that take this path. The
+/// combine is in item order, so reordering `global_asm!` blocks (which reorders the emitted
+/// assembly) also changes the hash. Almost every crate has no such items and gets
+/// `Fingerprint::ZERO` for the cost of a walk over the free item ids.
+pub fn compute_global_asm_hash(tcx: TyCtxt<'_>) -> Fingerprint {
+    let mut hash = Fingerprint::ZERO;
+    for item_id in tcx.hir_crate_items(()).free_items() {
+        if tcx.def_kind(item_id.owner_id) != DefKind::GlobalAsm {
+            continue;
+        }
+        let info = tcx
+            .lower_to_hir(item_id.owner_id.def_id)
+            .as_owner()
+            .expect("global_asm item without an owner");
+        let hashes = tcx.hash_owner_nodes_ungated(
+            info.nodes.node(),
+            &info.nodes.bodies,
+            &info.attrs.map,
+            info.attrs.define_opaque,
+        );
+        hash = hash.combine(hashes.bodies_hash.unwrap());
+        hash = hash.combine(hashes.attrs_hash.unwrap());
+    }
+    hash
+}
+
 fn upstream_crates(tcx: TyCtxt<'_>) -> Vec<(StableCrateId, Svh)> {
     let mut upstream_crates: Vec<_> = tcx
         .crates(())
