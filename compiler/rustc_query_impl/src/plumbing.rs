@@ -146,12 +146,12 @@ pub(crate) fn promote_from_disk_inner<'tcx, C: QueryCache>(
 ) {
     debug_assert!(tcx.dep_graph.is_green(&dep_node));
 
-    let key = C::Key::try_recover_key(tcx, &dep_node).unwrap_or_else(|| {
-        panic!(
-            "Failed to recover key for {dep_node:?} with key fingerprint {}",
-            dep_node.key_fingerprint
-        )
-    });
+    // The linear promotion pass can mark nodes green whose keys no longer
+    // exist in the current session (e.g. the stability of a removed item);
+    // no demand can reach them, so there is nothing to promote.
+    let Some(key) = C::Key::try_recover_key(tcx, &dep_node) else {
+        return;
+    };
 
     // If the recovered key isn't eligible for cache-on-disk, then there's no
     // value on disk to promote.

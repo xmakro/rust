@@ -154,6 +154,9 @@ pub struct DepGraphData {
     /// (not just marked green)
     debug_loaded_from_disk: Lock<FxHashSet<DepNode>>,
 
+    /// Whether the linear promotion pass over the previous graph has run.
+    scan_promoted: std::sync::atomic::AtomicBool,
+
     /// Per-worker edge buffer amortized across `try_mark_green` calls.
     green_edge_buf: WorkerLocal<Cell<Vec<DepNodeIndex>>>,
 
@@ -216,6 +219,7 @@ impl DepGraph {
                 previous: prev_graph,
                 colors,
                 debug_loaded_from_disk: Default::default(),
+                scan_promoted: std::sync::atomic::AtomicBool::new(false),
                 green_edge_buf: WorkerLocal::default(),
                 read_recorder_pool: Lock::new(Vec::new()),
             })),
@@ -897,6 +901,111 @@ impl DepGraph {
         dep_node: &DepNode,
     ) -> Option<(SerializedDepNodeIndex, DepNodeIndex)> {
         self.data()?.try_mark_green(tcx, dep_node)
+    }
+
+    /// Returns true if a previous graph is loaded and the linear promotion
+    /// pass has not run yet. Callers use this to skip the pre-coloring of
+    /// input-like queries in sessions with nothing to promote.
+    pub fn should_scan_promote(&self) -> bool {
+        self.data.as_deref().is_some_and(|data| {
+            data.previous.index_space_len() > 0
+                && !data.scan_promoted.load(Ordering::Relaxed)
+        })
+    }
+
+    /// Promotes every previous-session node whose dependencies are already
+    /// green, in one linear pass over the previous graph in index order.
+    ///
+    /// This performs the same promotion as recursive on-demand green marking,
+    /// but iteratively and with sequential access patterns: a node is promoted
+    /// only when every one of its dependencies is already green, so the
+    /// promoted set is a subset of what on-demand marking would produce.
+    /// Skipped nodes (a dependency red, not yet colored, or ahead in index
+    /// order) fall back to on-demand marking as before.
+    ///
+    /// Meant to run once, after AST lowering has executed the per-owner
+    /// input-like queries: their green/red colors then let the pass flow
+    /// through the bulk of an unchanged graph without any recursion.
+    pub fn scan_promote<'tcx>(&self, tcx: TyCtxt<'tcx>) {
+        let Some(data) = self.data.as_deref() else { return };
+        if data.scan_promoted.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let _prof_timer = tcx.prof.generic_activity("incr_comp_scan_promote_dep_graph");
+        let stats = std::env::var_os("RUSTC_SCAN_PROMOTE_STATS").is_some();
+        let start = stats.then(std::time::Instant::now);
+        let (mut promoted, mut blocked, mut precolored) = (0u64, 0u64, 0u64);
+        // [kind]: blocked node counts; blockers split by the offending dep color.
+        let mut blocked_kinds = vec![0u64; DepKind::NUM_VARIANTS];
+        let mut blocker_unknown = vec![0u64; DepKind::NUM_VARIANTS];
+        let mut blocker_red = vec![0u64; DepKind::NUM_VARIANTS];
+
+        let prev = &data.previous;
+        let mut edges: Vec<DepNodeIndex> = Vec::new();
+        for i in 0..prev.index_space_len() {
+            let prev_index = SerializedDepNodeIndex::from_usize(i);
+            if !matches!(data.colors.get(prev_index), DepNodeColor::Unknown) {
+                precolored += 1;
+                continue;
+            }
+            let kind = prev.index_to_node(prev_index).kind;
+            if kind == DepKind::Null || tcx.is_eval_always(kind) {
+                continue;
+            }
+            edges.clear();
+            let mut all_green = true;
+            for e in prev.edge_targets_from(prev_index) {
+                match data.colors.get(e) {
+                    DepNodeColor::Green(parent_index) => edges.push(parent_index),
+                    color @ (DepNodeColor::Red | DepNodeColor::Unknown) => {
+                        all_green = false;
+                        if stats {
+                            blocked_kinds[kind.as_usize()] += 1;
+                            let bk = prev.index_to_node(e).kind.as_usize();
+                            match color {
+                                DepNodeColor::Red => blocker_red[bk] += 1,
+                                _ => blocker_unknown[bk] += 1,
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+            if all_green {
+                data.promote_node_and_deps_to_current(prev_index, &edges);
+                promoted += 1;
+            } else {
+                blocked += 1;
+            }
+        }
+
+        if stats {
+            let top = |v: &[u64]| {
+                let mut t: Vec<_> =
+                    v.iter().copied().enumerate().filter(|&(_, c)| c > 0).collect();
+                t.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+                t.into_iter()
+                    .take(8)
+                    .map(|(k, c)| format!("{:?}:{}", DepKind::from_u16(k as u16), c))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            eprintln!(
+                "[scan-promote] crate={} index_space={} promoted={} blocked={} precolored={} time={:?}\n\
+                 [scan-promote]   blocked kinds: {}\n\
+                 [scan-promote]   blockers unknown: {}\n\
+                 [scan-promote]   blockers red: {}",
+                tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE),
+                prev.index_space_len(),
+                promoted,
+                blocked,
+                precolored,
+                start.unwrap().elapsed(),
+                top(&blocked_kinds),
+                top(&blocker_unknown),
+                top(&blocker_red),
+            );
+        }
     }
 }
 

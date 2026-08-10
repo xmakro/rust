@@ -1098,6 +1098,41 @@ fn run_required_analyses(tcx: TyCtxt<'_>) {
     // to use `hir_crate_items`.
     tcx.ensure_done().hir_crate_items(());
 
+    if tcx.dep_graph.should_scan_promote() {
+        tcx.sess.time("dep_graph_scan_promote", || {
+            // Run the session-config queries that execute in every session
+            // anyway. Running them now colors their previous-session nodes, so
+            // the linear promotion pass below can flow past them. The
+            // per-owner lowering inputs are already colored: `hir_crate_items`
+            // above lowered the whole crate.
+            let force = tcx.ensure_ok();
+            force.get_lang_items(());
+            force.effective_visibilities(());
+            force.crates(());
+            force.used_crates(());
+            force.postorder_cnums(());
+            force.all_diagnostic_items(());
+            force.all_canonical_symbols(());
+            force.skippable_lints(());
+            force.allocator_kind(());
+            force.alloc_error_handler_kind(());
+            force.global_backend_features(());
+            for &cnum in tcx.crates(()) {
+                force.crate_hash(cnum);
+                force.crate_host_hash(cnum);
+                force.crate_dep_kind(cnum);
+                force.extern_crate(cnum);
+                force.used_crate_source(cnum);
+                force.extra_filename(cnum);
+                force.has_global_allocator(cnum);
+                force.has_alloc_error_handler(cnum);
+                force.is_private_dep(cnum);
+                force.missing_extern_crate_item(cnum);
+            }
+            tcx.dep_graph.scan_promote(tcx);
+        });
+    }
+
     rustc_passes::delegation::check_glob_and_list_delegations_target_expr(tcx);
 
     let sess = tcx.sess;
