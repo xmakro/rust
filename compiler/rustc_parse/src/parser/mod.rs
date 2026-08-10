@@ -29,6 +29,8 @@ pub use path::PathStyle;
 use rustc_ast::token::{
     self, IdentIsRaw, InvisibleOrigin, MetaVarKind, NtExprKind, NtPatKind, Token, TokenKind,
 };
+#[cfg(debug_assertions)]
+use rustc_ast::tokenstream::TokenCursor;
 use rustc_ast::tokenstream::{
     DelimSpan, FlatTokenCursor, FlatTt, ParserRange, ParserReplacement, Spacing, TokenStream,
     TokenTree, WithTokens,
@@ -196,6 +198,13 @@ pub struct Parser<'a> {
     restrictions: Restrictions = Restrictions::empty(),
     expected_token_types: TokenTypeSet = TokenTypeSet::new(),
     token_cursor: FlatTokenCursor,
+    // Debug builds step the old tree-walking cursor in lockstep with
+    // `token_cursor` and assert in `bump` that both yield identical tokens.
+    // The shadow walks the token tree rebuilt from the cursor's own buffer,
+    // so a failure means either a cursor-stepping divergence or a buffer
+    // whose tree rebuild does not round-trip.
+    #[cfg(debug_assertions)]
+    shadow_cursor: Option<TokenCursor> = None,
     // The number of calls to `bump`, i.e. the position in the token stream.
     num_bump_calls: u32 = 0,
     // During parsing we may sometimes need to "unglue" a glued token into two
@@ -246,7 +255,12 @@ pub struct Parser<'a> {
 // This type is used a lot, e.g. it's cloned when matching many declarative macro rules with
 // nonterminals. Make sure it doesn't unintentionally get bigger. We only check a few arches
 // though, because `TokenTypeSet(u128)` alignment varies on others, changing the total size.
-#[cfg(all(target_pointer_width = "64", any(target_arch = "aarch64", target_arch = "x86_64")))]
+// Debug builds carry the extra shadow-cursor field, so only release sizes are asserted.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    not(debug_assertions)
+))]
 rustc_data_structures::static_assert_size!(Parser<'_>, 272);
 
 /// Stores span information about a closure.
@@ -375,6 +389,16 @@ impl<'a> Parser<'a> {
             },
             ..
         };
+
+        // Differential validation: rebuild the token tree from the buffer
+        // and walk it with the old tree-walking cursor alongside the flat
+        // one. Every parse in a debug build cross-checks the two, token for
+        // token, at each `bump`.
+        #[cfg(debug_assertions)]
+        {
+            parser.shadow_cursor =
+                Some(TokenCursor::new(parser.token_cursor.to_token_stream()));
+        }
 
         // Make parser point to the first token.
         parser.bump();
@@ -1147,6 +1171,15 @@ impl<'a> Parser<'a> {
         // Note: destructuring here would give nicer code, but it was found in #96210 to be slower
         // than `.0`/`.1` access.
         let mut next = self.token_cursor.inlined_next();
+        #[cfg(debug_assertions)]
+        if let Some(shadow) = &mut self.shadow_cursor {
+            let tree_next = shadow.next();
+            assert_eq!(
+                (next.0, next.1),
+                tree_next,
+                "flat token cursor diverged from the tree-walking cursor"
+            );
+        }
         self.num_bump_calls += 1;
         // We got a token from the underlying cursor and no longer need to
         // worry about an unglued token. See `break_and_eat` for more details.
@@ -1423,6 +1456,13 @@ impl<'a> Parser<'a> {
                 // declarative macros that pass large `tt` fragments through
                 // multiple rules, as seen in the uom-0.37.0 crate.
                 self.token_cursor.reposition_forward(close_idx);
+                // Keep the shadow in lockstep: it has descended into this
+                // group (its open delimiter is the current token), so
+                // skipping to the group's end mirrors the reposition above.
+                #[cfg(debug_assertions)]
+                if let Some(shadow) = &mut self.shadow_cursor {
+                    shadow.bump_to_end();
+                }
                 self.bump();
             } else {
                 loop {
