@@ -1211,10 +1211,15 @@ macro_rules! assign_id {
     ($self:ident, $id:expr, $closure:expr) => {{
         let old_id = $self.cx.current_expansion.lint_node_id;
         if $self.monotonic {
-            debug_assert_eq!(*$id, ast::DUMMY_NODE_ID);
-            let new_id = $self.cx.resolver.next_node_id();
-            *$id = new_id;
-            $self.cx.current_expansion.lint_node_id = new_id;
+            if $self.cx.frontend_cache_replay {
+                // The node already carries the id the recorded session assigned.
+                $self.cx.current_expansion.lint_node_id = *$id;
+            } else {
+                debug_assert_eq!(*$id, ast::DUMMY_NODE_ID);
+                let new_id = $self.cx.resolver.next_node_id();
+                *$id = new_id;
+                $self.cx.current_expansion.lint_node_id = new_id;
+            }
         }
         let ret = ($closure)();
         $self.cx.current_expansion.lint_node_id = old_id;
@@ -2164,6 +2169,16 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
         &self,
         item: &mut impl HasAttrs,
     ) -> Option<(ast::Attribute, usize, Vec<ast::Path>)> {
+        // A crate restored from the frontend cache is fully expanded: every
+        // attribute that survived is inert by construction (cfg stripping ran,
+        // attr macros and derives were consumed, helpers were left in place).
+        // Skipping the scan also avoids re-running speculative macro
+        // resolution for derive helper attributes, whose registrations died
+        // with the recording session.
+        if self.cx.frontend_cache_replay {
+            return None;
+        }
+
         let mut attr = None;
 
         let mut cfg_pos = None;

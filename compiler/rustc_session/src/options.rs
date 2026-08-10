@@ -2508,6 +2508,9 @@ options! {
     force_intrinsic_fallback: bool = (false, parse_bool, [TRACKED],
         "always use the fallback body of an intrinsic, if it has one, instead of lowering \
         the intrinsic in the codegen backend (default: no)."),
+    frontend_cache: Option<bool> = (None, parse_opt_bool, [UNTRACKED],
+        "cache the expanded AST and replay it when all frontend inputs are unchanged \
+        (default: yes under -Cincremental)"),
     force_unstable_if_unmarked: bool = (false, parse_bool, [TRACKED],
         "force all crates to be `rustc_private` unstable (default: no)"),
     function_return: FunctionReturn = (FunctionReturn::default(), parse_function_return, [TRACKED],

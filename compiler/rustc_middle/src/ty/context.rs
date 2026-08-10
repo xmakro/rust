@@ -588,6 +588,13 @@ impl<'tcx> TyCtxt<'tcx> {
         TyCtxtFeed { tcx: self, key: () }
     }
 
+    /// Only used by the frontend cache when replaying definitions recorded by a
+    /// previous session: returns the feed handle for a def that was already
+    /// created (and fed) by `create_def` during the replay.
+    pub fn fecache_def_feed(self, key: LocalDefId) -> TyCtxtFeed<'tcx, LocalDefId> {
+        TyCtxtFeed { tcx: self, key }
+    }
+
     /// Only used in the resolver to register the `CRATE_DEF_ID` `DefId` and feed
     /// some queries for it. It will panic if used twice.
     pub fn create_local_crate_def_id(self, span: Span) -> TyCtxtFeed<'tcx, LocalDefId> {

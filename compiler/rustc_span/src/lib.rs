@@ -226,6 +226,26 @@ impl MetavarSpansMap {
     pub fn freeze_and_get_read_spans(&self) -> UnordMap<Span, Span> {
         self.0.freeze().items().filter(|(_, (_, b))| *b).map(|(s1, (s2, _))| (*s1, *s2)).collect()
     }
+
+    /// All entries, for the frontend cache snapshot. The order is irrelevant:
+    /// the restored table is an unordered lookup map.
+    pub fn fecache_pairs(&self) -> Vec<(Span, Span)> {
+        let keyed: Vec<((u32, u32, u32), (Span, Span))> = self
+            .0
+            .read()
+            .items()
+            .map(|(s1, (s2, _))| {
+                let data = s1.data();
+                ((data.lo.0, data.hi.0, data.ctxt.as_u32()), (*s1, *s2))
+            })
+            .into_sorted_stable_ord_by_key(|entry| &entry.0);
+        keyed.into_iter().map(|(_, pair)| pair).collect()
+    }
+
+    /// Replays an entry recorded by a previous session.
+    pub fn fecache_insert(&self, span: Span, var_span: Span) {
+        self.0.write().insert(span, (var_span, false));
+    }
 }
 
 #[inline]

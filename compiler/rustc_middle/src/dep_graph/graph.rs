@@ -804,6 +804,9 @@ impl DepGraphData {
                 } else {
                     // This is a red node: it existed in the previous compilation, its query
                     // was re-executed, but it has a different result from before.
+                    if std::env::var_os("FECACHE_RED_NODES").is_some() {
+                        eprintln!("red-node {:?} {:?}", key.kind, key.key_fingerprint);
+                    }
                     false
                 }
             } else {

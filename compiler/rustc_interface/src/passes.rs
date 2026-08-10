@@ -160,6 +160,28 @@ fn configure_and_expand(
         )
     });
 
+    // If a previous session recorded the expanded crate and every frontend
+    // input is unchanged, replay it: expansion below then only rebuilds the
+    // resolver state over the restored AST without finding any macro to expand.
+    let fecache_mark = rustc_span::hygiene::fecache::mark();
+    let mut fecache_restored = false;
+    let mut fecache_record = false;
+    let mut fecache_binding_orders = Vec::new();
+    if crate::frontend_cache::enabled(tcx) {
+        match sess.time("fecache_restore", || crate::frontend_cache::try_restore(tcx, resolver)) {
+            crate::frontend_cache::RestoreOutcome::Restored(restored, binding_orders) => {
+                krate = restored;
+                fecache_restored = true;
+                fecache_binding_orders = binding_orders;
+            }
+            crate::frontend_cache::RestoreOutcome::InputsValid => {}
+            crate::frontend_cache::RestoreOutcome::Miss => {
+                resolver.fecache_start_recording();
+                fecache_record = true;
+            }
+        }
+    }
+
     // Expand all macros
     krate = sess.time("macro_expand_crate", || {
         // Windows dlls do not have rpaths, so they don't know how to find their
@@ -212,6 +234,7 @@ fn configure_and_expand(
         let lint_store = LintStoreExpandImpl(lint_store);
         let mut ecx = ExtCtxt::new(sess, cfg, resolver, Some(&lint_store));
         ecx.num_standard_library_imports = num_standard_library_imports;
+        ecx.frontend_cache_replay = fecache_restored;
         // Expand macros now!
         let krate = sess.time("expand_crate", || ecx.monotonic_expander().expand_crate(krate));
 
@@ -225,9 +248,13 @@ fn configure_and_expand(
             buffered_lints.append(&mut ecx.buffered_early_lint);
         });
 
-        sess.time("check_unused_macros", || {
-            ecx.check_unused_macros();
-        });
+        // On a frontend cache hit the usage recording that feeds this check was
+        // skipped along with expansion, so it would report false positives.
+        if !fecache_restored {
+            sess.time("check_unused_macros", || {
+                ecx.check_unused_macros();
+            });
+        }
 
         // If we hit a recursion limit, exit early to avoid later passes getting overwhelmed
         // with a large AST
@@ -248,6 +275,22 @@ fn configure_and_expand(
 
         krate
     });
+
+    if fecache_restored {
+        sess.time("fecache_reorder_bindings", || {
+            resolver.fecache_reorder_bindings(fecache_binding_orders)
+        });
+    }
+
+    if fecache_record {
+        sess.time("fecache_write", || {
+            crate::frontend_cache::write_snapshot(tcx, resolver, &mut krate, fecache_mark)
+        });
+    }
+
+    if let Some(dump) = std::env::var_os("FECACHE_DUMP_AST") {
+        std::fs::write(dump, format!("{krate:#?}")).unwrap();
+    }
 
     sess.time("maybe_building_test_harness", || {
         rustc_builtin_macros::test_harness::inject(&mut krate, sess, features, resolver)
@@ -811,6 +854,29 @@ fn resolver_for_lowering_raw<'tcx>(
         ast_lowering: untracked_resolver_for_lowering,
     } = resolver.into_outputs();
 
+    if std::env::var_os("FECACHE_RES_HASHES").is_some() {
+        use rustc_data_structures::stable_hash::{StableHash, StableHasher};
+        let r = &untracked_resolutions;
+        macro_rules! field_hash {
+            ($($name:ident),* $(,)?) => {
+                $(tcx.with_stable_hashing_context(|mut hcx| {
+                    let mut hasher = StableHasher::new();
+                    r.$name.stable_hash(&mut hcx, &mut hasher);
+                    let h: rustc_hashes::Hash64 = hasher.finish();
+                    eprintln!("res-hash {} {:x}", stringify!($name), h.as_u64());
+                });)*
+            };
+        }
+        field_hash!(
+            visibilities_for_hashing, expn_that_defined, effective_visibilities,
+            macro_reachable_adts, extern_crate_map, maybe_unused_trait_imports,
+            module_children, ambig_module_children, glob_map, main_def, trait_impls,
+            proc_macros, confused_type_with_std_module, doc_link_resolutions,
+            doc_link_traits_in_scope, all_macro_rules, stripped_cfg_items,
+            delegation_infos,
+        );
+    }
+
     (
         tcx.arena.alloc(Steal::new(untracked_resolver_for_lowering)),
         tcx.arena.alloc(Steal::new(krate)),
@@ -1085,6 +1151,19 @@ pub fn emit_delayed_lints(tcx: TyCtxt<'_>) {
 /// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
 /// This function never fails.
 fn run_required_analyses(tcx: TyCtxt<'_>) {
+    if std::env::var_os("FECACHE_HIR_HASHES").is_some() {
+        let items = tcx.hir_crate_items(());
+        for owner in items.owners() {
+            let nodes = tcx.hir_owner_nodes(owner);
+            eprintln!(
+                "hir-hash {} {:?} attrs {:?} dph {:?}",
+                tcx.def_path_str(owner.def_id),
+                nodes.opt_hash,
+                tcx.hir_attr_map(owner).opt_hash,
+                tcx.def_path_hash(owner.to_def_id()),
+            );
+        }
+    }
     if tcx.sess.opts.unstable_opts.input_stats {
         rustc_passes::input_stats::print_hir_stats(tcx);
     }

@@ -706,13 +706,16 @@ impl SyntaxContext {
         self.0 == SyntaxContext::root().as_u32()
     }
 
+    /// The raw interner index. Only meaningful within the session that interned it,
+    /// or when replaying a hygiene table snapshot from an identical session.
     #[inline]
-    pub(crate) const fn as_u32(self) -> u32 {
+    pub const fn as_u32(self) -> u32 {
         self.0
     }
 
+    /// See [`SyntaxContext::as_u32`].
     #[inline]
-    pub(crate) const fn from_u32(raw: u32) -> SyntaxContext {
+    pub const fn from_u32(raw: u32) -> SyntaxContext {
         SyntaxContext(raw)
     }
 
@@ -1568,5 +1571,155 @@ impl StableHash for ExpnId {
 impl StableHash for LocalExpnId {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
         self.to_expn_id().stable_hash(hcx, hasher);
+    }
+}
+
+/// Frontend cache (`-Zfrontend-cache`) support: snapshot and replay of the hygiene
+/// tables across sessions with identical frontend inputs.
+///
+/// The snapshot records the table rows created during macro expansion (everything
+/// past the deterministic pre-expansion prefix) with raw indices. Replaying them
+/// into a session whose prefix has the same length reproduces the interner
+/// bit-for-bit, which is what makes raw `SyntaxContext`/`ExpnId` values embedded
+/// in a cached expanded AST valid again.
+pub mod fecache {
+    use super::*;
+
+    /// Table lengths at a sequence point. Rows past these lengths form the delta.
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    pub struct HygieneMark {
+        pub ctxts: u32,
+        pub local_expns: u32,
+    }
+
+    pub fn mark() -> HygieneMark {
+        HygieneData::with(|data| HygieneMark {
+            ctxts: data.syntax_context_data.len() as u32,
+            local_expns: data.local_expn_data.len() as u32,
+        })
+    }
+
+    pub fn encode_delta<E: SpanEncoder>(enc: &mut E, mark: HygieneMark) {
+        HygieneData::with(|data| {
+            enc.emit_u32(mark.ctxts);
+            enc.emit_u32(mark.local_expns);
+
+            let ctxts = &data.syntax_context_data[mark.ctxts as usize..];
+            enc.emit_usize(ctxts.len());
+            for row in ctxts {
+                enc.encode_expn_id(row.outer_expn);
+                row.outer_transparency.encode(enc);
+                enc.encode_syntax_context(row.parent);
+                enc.encode_syntax_context(row.opaque);
+                enc.encode_syntax_context(row.opaque_and_semiopaque);
+                enc.encode_symbol(row.dollar_crate_name);
+            }
+
+            let expns: Vec<LocalExpnId> = (mark.local_expns..data.local_expn_data.len() as u32)
+                .map(LocalExpnId::from_u32)
+                .collect();
+            enc.emit_usize(expns.len());
+            for id in expns {
+                data.local_expn_data[id].encode(enc);
+                data.local_expn_hashes[id].0.encode(enc);
+            }
+
+            // The snapshot encoding order of these maps does not matter: both
+            // are restored into lookup maps whose iteration order is never
+            // observed by the replayed session.
+            #[allow(rustc::potential_query_instability)]
+            {
+                enc.emit_usize(data.foreign_expn_data.len());
+                for (expn_id, expn_data) in &data.foreign_expn_data {
+                    enc.encode_expn_id(*expn_id);
+                    expn_data.encode(enc);
+                    data.foreign_expn_hashes[expn_id].0.encode(enc);
+                }
+
+                enc.emit_usize(data.expn_data_disambiguators.len());
+                for (hash, disambig) in &data.expn_data_disambiguators {
+                    hash.as_u64().encode(enc);
+                    enc.emit_u32(*disambig);
+                }
+            }
+        })
+    }
+
+    /// Replays a delta recorded by [`encode_delta`]. Returns `false` (leaving the
+    /// tables untouched) if the current tables do not match the recorded
+    /// pre-expansion prefix.
+    pub fn decode_delta<D: SpanDecoder>(dec: &mut D) -> bool {
+        let rec_mark =
+            HygieneMark { ctxts: dec.read_u32(), local_expns: dec.read_u32() };
+        if mark() != rec_mark {
+            return false;
+        }
+
+        let n_ctxts = dec.read_usize();
+        let mut ctxt_rows = Vec::with_capacity(n_ctxts);
+        for _ in 0..n_ctxts {
+            let outer_expn = dec.decode_expn_id();
+            let outer_transparency = Transparency::decode(dec);
+            let parent = dec.decode_syntax_context();
+            let opaque = dec.decode_syntax_context();
+            let opaque_and_semiopaque = dec.decode_syntax_context();
+            let dollar_crate_name = dec.decode_symbol();
+            ctxt_rows.push(SyntaxContextData {
+                outer_expn,
+                outer_transparency,
+                parent,
+                opaque,
+                opaque_and_semiopaque,
+                dollar_crate_name,
+            });
+        }
+
+        let n_expns = dec.read_usize();
+        let mut expn_rows = Vec::with_capacity(n_expns);
+        for _ in 0..n_expns {
+            let data = Option::<ExpnData>::decode(dec);
+            let hash = ExpnHash(Fingerprint::decode(dec));
+            expn_rows.push((data, hash));
+        }
+
+        let n_foreign = dec.read_usize();
+        let mut foreign_rows = Vec::with_capacity(n_foreign);
+        for _ in 0..n_foreign {
+            let expn_id = dec.decode_expn_id();
+            let data = ExpnData::decode(dec);
+            let hash = ExpnHash(Fingerprint::decode(dec));
+            foreign_rows.push((expn_id, data, hash));
+        }
+
+        let n_disambig = dec.read_usize();
+        let mut disambig_rows = Vec::with_capacity(n_disambig);
+        for _ in 0..n_disambig {
+            let hash = Hash64::new(u64::decode(dec));
+            disambig_rows.push((hash, dec.read_u32()));
+        }
+
+        HygieneData::with(|data| {
+            for row in ctxt_rows {
+                let ctxt = SyntaxContext::from_u32(data.syntax_context_data.len() as u32);
+                data.syntax_context_map.insert(row.key(), ctxt);
+                data.syntax_context_data.push(row);
+            }
+            for (expn_data, hash) in expn_rows {
+                let expn_id = data.local_expn_data.push(expn_data);
+                let _hid = data.local_expn_hashes.push(hash);
+                debug_assert_eq!(expn_id, _hid);
+                let _old = data.expn_hash_to_expn_id.insert(hash, expn_id.to_expn_id());
+                debug_assert!(_old.is_none());
+            }
+            for (expn_id, expn_data, hash) in foreign_rows {
+                data.foreign_expn_data.insert(expn_id, expn_data);
+                data.foreign_expn_hashes.insert(expn_id, hash);
+                data.expn_hash_to_expn_id.insert(hash, expn_id);
+            }
+            for (hash, disambig) in disambig_rows {
+                data.expn_data_disambiguators.insert(hash, disambig);
+            }
+        });
+        true
     }
 }

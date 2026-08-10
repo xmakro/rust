@@ -1386,3 +1386,88 @@ fn fn_spans(krate: &ast::Crate, name: Symbol) -> Vec<Span> {
     visit::walk_crate(&mut f, krate);
     f.spans
 }
+
+/// Frontend cache (`-Zfrontend-cache`) support.
+impl CStore {
+    /// The currently loaded crates in `CrateNum` order, with the data needed to
+    /// replay and validate this load order in a later session.
+    pub fn fecache_crates(&self) -> Vec<(CrateNum, Symbol, Svh, CrateDepKind, bool)> {
+        self.iter_crate_data()
+            .map(|(cnum, data)| {
+                (cnum, data.name(), data.hash(), data.dep_kind(), data.is_private_dep())
+            })
+            .collect()
+    }
+
+    /// Forces the private-dependency flag a previous session computed for this
+    /// crate: the replayed load order cannot reproduce the dependency-chain
+    /// privacy propagation, so it is restored explicitly.
+    pub fn fecache_set_private_dep(&mut self, cnum: CrateNum, private: bool) {
+        self.get_crate_data_mut(cnum).fecache_set_private_dep(private);
+    }
+
+    /// Loads `name` through normal crate resolution, for replaying the crate load
+    /// order recorded by a previous session. Reuses already-loaded crates.
+    pub fn fecache_preload_crate<'tcx>(
+        &mut self,
+        tcx: TyCtxt<'tcx>,
+        name: Symbol,
+        svh: u128,
+        dep_kind: CrateDepKind,
+    ) -> Option<CrateNum> {
+        // Direct dependencies resolve through `--extern` like any root crate.
+        if let Ok(cnum) = self.maybe_resolve_crate(tcx, name, dep_kind, CrateOrigin::Extern) {
+            return Some(cnum);
+        }
+        // Indirect dependencies are only findable in dependency search paths,
+        // by hash: locate them the way their parent's dependency chain would.
+        let hash = Svh::new(rustc_data_structures::fingerprint::Fingerprint::new(
+            svh as u64,
+            (svh >> 64) as u64,
+        ));
+        let dep_root = crate::locator::CratePaths::new(
+            name,
+            CrateSource { dylib: None, rlib: None, rmeta: None, sdylib_interface: None },
+        );
+        let dep = crate::rmeta::CrateDep {
+            name,
+            hash,
+            host_hash: None,
+            kind: dep_kind,
+            extra_filename: String::new(),
+            is_private: false,
+        };
+        let origin = CrateOrigin::IndirectDependency {
+            dep_root_for_errors: &dep_root,
+            parent_private: false,
+            dep: &dep,
+        };
+        match self.maybe_resolve_crate(tcx, name, dep_kind, origin) {
+            Ok(cnum) => Some(cnum),
+            Err(err) => {
+                if std::env::var_os("FECACHE_DEBUG").is_some() {
+                    eprintln!("fecache: preload of {name} failed: {err:?}");
+                }
+                None
+            }
+        }
+    }
+
+    /// See [`CrateMetadata::fecache_imported_files`].
+    pub fn fecache_imported_files(
+        &self,
+        cnum: CrateNum,
+    ) -> Vec<(u32, std::sync::Arc<rustc_span::SourceFile>)> {
+        self.get_crate_data(cnum).fecache_imported_files()
+    }
+
+    /// See [`CrateMetadata::fecache_import_source_file`].
+    pub fn fecache_import_source_file(
+        &self,
+        tcx: TyCtxt<'_>,
+        cnum: CrateNum,
+        idx: u32,
+    ) -> std::sync::Arc<rustc_span::SourceFile> {
+        self.get_crate_data(cnum).fecache_import_source_file(tcx, idx)
+    }
+}

@@ -87,6 +87,7 @@ use crate::ref_mut::{CmCell, CmRef, CmRefCell};
 mod build_reduced_graph;
 mod check_unused;
 mod def_collector;
+pub mod fecache;
 mod diagnostics;
 mod effective_visibilities;
 mod ident;
@@ -1482,6 +1483,14 @@ pub struct Resolver<'ra, 'tcx> {
 
     next_node_id: NodeId = CRATE_NODE_ID,
 
+    /// When recording for the frontend cache: log of the defs created during
+    /// expansion, in creation order. See `fecache`.
+    fecache_def_log: Option<Vec<fecache::FeDefRow>> = None,
+
+    /// Defs replayed from a frontend cache snapshot, by AST node id.
+    /// `create_def` returns the replayed def instead of creating a fresh one.
+    fecache_restored_defs: FxHashMap<NodeId, LocalDefId> = default::fx_hash_map(),
+
     /// Preserves per owner data once the owner is finished resolving.
     owners: NodeMap<PerOwnerResolverData<'tcx>>,
 
@@ -1674,6 +1683,21 @@ impl<'tcx> Resolver<'_, 'tcx> {
                 .definitions_untracked()
                 .def_key(self.current_owner.node_id_to_def_id[&node_id]),
         );
+
+        // This def was already created by a frontend cache replay; redo only the
+        // per-owner bookkeeping, which the replay cannot reproduce.
+        if node_id != ast::DUMMY_NODE_ID
+            && let Some(&def_id) = self.fecache_restored_defs.get(&node_id)
+        {
+            if !is_owner {
+                self.current_owner.node_id_to_def_id.insert(node_id, def_id);
+            }
+            return self.tcx.fecache_def_feed(def_id);
+        }
+
+        if let Some(log) = &mut self.fecache_def_log {
+            log.push(fecache::FeDefRow { node_id, parent, name, def_kind, expn_id, span, is_owner });
+        }
 
         let disambiguator = self.disambiguators.get_or_create(parent);
 
@@ -1936,15 +1960,35 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         self.visibilities_for_hashing.push((feed.def_id(), vis));
     }
 
-    pub fn into_outputs(self) -> ResolverOutputs<'tcx> {
+    pub fn into_outputs(mut self) -> ResolverOutputs<'tcx> {
         let proc_macros = self.proc_macros;
         let expn_that_defined = self.expn_that_defined;
         let extern_crate_map = self.extern_crate_map;
         let maybe_unused_trait_imports = self.maybe_unused_trait_imports;
-        let glob_map = self.glob_map;
+        // These are all ordered by when the fixpoint computations reached each
+        // item, which depends on how expansion interleaved with reduced graph
+        // building. Their stable hashes are order-sensitive, so give them a
+        // session-stable order: a frontend cache replay builds the resolver
+        // state in one pass and would otherwise diverge from the recording
+        // session. See `fecache`.
+        let mut glob_map = self.glob_map;
+        glob_map.sort_unstable_by(|a, _, b, _| a.local_def_index.cmp(&b.local_def_index));
+        for set in glob_map.values_mut() {
+            set.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        }
+        let glob_map = glob_map;
+        self.visibilities_for_hashing.sort_unstable_by_key(|&(def_id, _)| def_id.local_def_index);
         let main_def = self.main_def;
         let confused_type_with_std_module = self.confused_type_with_std_module;
-        let effective_visibilities = self.effective_visibilities;
+        let mut effective_visibilities = self.effective_visibilities;
+        effective_visibilities.sort_for_stable_hashing();
+        let effective_visibilities = effective_visibilities;
+        self.doc_link_traits_in_scope.sort_unstable_by(|a, _, b, _| {
+            a.to_local_def_id().local_def_index.cmp(&b.to_local_def_id().local_def_index)
+        });
+        for traits in self.doc_link_traits_in_scope.values_mut() {
+            traits.sort_unstable_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
+        }
 
         let stripped_cfg_items = self
             .stripped_cfg_items
@@ -3062,6 +3106,12 @@ mod hygiene {
         pub(crate) fn new_unchecked(ctxt: SyntaxContext) -> Macros20NormalizedSyntaxContext {
             debug_assert_eq!(ctxt, ctxt.normalize_to_macros_2_0());
             Macros20NormalizedSyntaxContext(ctxt)
+        }
+
+        /// The raw context, for the frontend cache binding-order snapshot.
+        #[inline]
+        pub(crate) fn raw(self) -> SyntaxContext {
+            self.0
         }
 
         /// The passed closure must preserve the context's normalized-ness.
