@@ -110,12 +110,6 @@ pub trait QueryTypeOp<'tcx>: fmt::Debug + Copy + TypeFoldable<TyCtxt<'tcx>> + 't
         ),
         NoSolution,
     > {
-        if !infcx.disable_trait_solver_fast_paths()
-            && let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &query_key)
-        {
-            return Ok((result, None, PredicateObligations::new(), Certainty::Proven));
-        }
-
         let mut canonical_var_values = OriginalQueryValues::default();
         let old_param_env = query_key.param_env;
         let canonical_self = infcx.canonicalize_query(query_key, &mut canonical_var_values);
@@ -147,6 +141,23 @@ where
         root_def_id: LocalDefId,
         span: Span,
     ) -> Result<TypeOpOutput<'tcx, Self>, ErrorGuaranteed> {
+        // Fast path results are final: they register no obligations and no
+        // region constraints, so the machinery below has nothing to do.
+        // Skipping it also skips the drain in `scrape_region_constraints`,
+        // which is only sound while no region state is pending on the
+        // inference context; assert that instead.
+        if !infcx.disable_trait_solver_fast_paths()
+            && let Some(output) = QueryTypeOp::try_fast_path(infcx.tcx, &self)
+        {
+            assert!(
+                !infcx.has_pending_region_state(),
+                "region state pending at a query type op fast path"
+            );
+            assert!(!infcx.in_snapshot(), "query type op performed inside a snapshot");
+            let output = infcx.resolve_vars_if_possible(output);
+            return Ok(TypeOpOutput { output, constraints: None, error_info: None });
+        }
+
         // In the new trait solver, query type ops are performed locally. This
         // is because query type ops currently use the old canonicalizer, and
         // that doesn't preserve things like opaques which have been registered
@@ -160,14 +171,7 @@ where
                 root_def_id,
                 "query type op",
                 span,
-                |ocx| {
-                    if !infcx.disable_trait_solver_fast_paths()
-                        && let Some(result) = QueryTypeOp::try_fast_path(infcx.tcx, &self)
-                    {
-                        return Ok(result);
-                    }
-                    QueryTypeOp::perform_locally_with_next_solver(ocx, self, span)
-                },
+                |ocx| QueryTypeOp::perform_locally_with_next_solver(ocx, self, span),
             )?
             .0);
         }
