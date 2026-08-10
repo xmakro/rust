@@ -6,6 +6,7 @@ mod impl_interner;
 pub mod tls;
 
 use std::borrow::{Borrow, Cow};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::env::VarError;
 use std::ffi::OsStr;
@@ -20,7 +21,7 @@ use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::intern::Interned;
 use rustc_data_structures::profiling::SelfProfilerRef;
-use rustc_data_structures::sharded::{IntoPointer, ShardedHashMap};
+use rustc_data_structures::sharded::{IntoPointer, ShardedHashMap, make_hash};
 use rustc_data_structures::stable_hash::StableHash;
 use rustc_data_structures::steal::Steal;
 use rustc_data_structures::sync::{
@@ -130,6 +131,31 @@ impl<'tcx> rustc_type_ir::inherent::Span<TyCtxt<'tcx>> for Span {
 
 type InternedSet<'tcx, T> = ShardedHashMap<InternedInSet<'tcx, T>, ()>;
 
+const FRONT_CACHE_BITS: usize = 12;
+const FRONT_CACHE_SIZE: usize = 1 << FRONT_CACHE_BITS;
+
+/// A per-worker, direct-mapped cache in front of a sharded interner, for the
+/// hottest interned kinds. Interning is dominated by hits on recently-interned
+/// values, but each hit pays a probe of a large, mostly cache-cold hash table.
+/// A hit here instead touches a single line of a small array (and skips the
+/// shard lock), falling back to the shared interner on miss.
+struct FrontCache<T> {
+    entries: Box<[Option<(u64, T)>; FRONT_CACHE_SIZE]>,
+}
+
+impl<T: Copy> FrontCache<T> {
+    fn new() -> Self {
+        FrontCache { entries: Box::new([None; FRONT_CACHE_SIZE]) }
+    }
+
+    /// The slot for `hash`. `make_hash` is multiplicative, so the top bits are
+    /// the well-mixed ones.
+    #[inline]
+    fn entry(&mut self, hash: u64) -> &mut Option<(u64, T)> {
+        &mut self.entries[(hash >> (64 - FRONT_CACHE_BITS)) as usize]
+    }
+}
+
 pub struct CtxtInterners<'tcx> {
     /// The arena that types, regions, etc. are allocated from.
     arena: &'tcx WorkerLocal<Arena<'tcx>>,
@@ -161,6 +187,14 @@ pub struct CtxtInterners<'tcx> {
     valtree: InternedSet<'tcx, ty::ValTreeKind<TyCtxt<'tcx>>>,
     patterns: InternedSet<'tcx, List<ty::Pattern<'tcx>>>,
     outlives: InternedSet<'tcx, List<ty::ArgOutlivesClause<'tcx>>>,
+
+    // Per-worker front caches for the hottest interners. The `RefCell` borrow
+    // is held across the fallback probe of the shared interner, so any
+    // unexpected reentrance panics instead of corrupting the cache.
+    ty_cache: WorkerLocal<RefCell<FrontCache<Ty<'tcx>>>>,
+    predicate_cache: WorkerLocal<RefCell<FrontCache<Predicate<'tcx>>>>,
+    args_cache: WorkerLocal<RefCell<FrontCache<GenericArgsRef<'tcx>>>>,
+    type_list_cache: WorkerLocal<RefCell<FrontCache<&'tcx List<Ty<'tcx>>>>>,
 }
 
 impl<'tcx> CtxtInterners<'tcx> {
@@ -199,6 +233,10 @@ impl<'tcx> CtxtInterners<'tcx> {
             valtree: InternedSet::with_capacity(N),
             patterns: InternedSet::with_capacity(N),
             outlives: InternedSet::with_capacity(N),
+            ty_cache: WorkerLocal::new(|_| RefCell::new(FrontCache::new())),
+            predicate_cache: WorkerLocal::new(|_| RefCell::new(FrontCache::new())),
+            args_cache: WorkerLocal::new(|_| RefCell::new(FrontCache::new())),
+            type_list_cache: WorkerLocal::new(|_| RefCell::new(FrontCache::new())),
         }
     }
 
@@ -206,9 +244,18 @@ impl<'tcx> CtxtInterners<'tcx> {
     #[allow(rustc::usage_of_ty_tykind)]
     #[inline(never)]
     fn intern_ty(&self, kind: TyKind<'tcx>) -> Ty<'tcx> {
-        Ty(Interned::new_unchecked(
+        let hash = make_hash(&kind);
+        let mut cache = self.ty_cache.borrow_mut();
+        let entry = cache.entry(hash);
+        if let Some((entry_hash, ty)) = *entry
+            && entry_hash == hash
+            && *ty.kind() == kind
+        {
+            return ty;
+        }
+        let ty = Ty(Interned::new_unchecked(
             self.type_
-                .intern(kind, |kind| {
+                .intern_with_hash(hash, kind, |kind| {
                     let flags = ty::FlagComputation::<TyCtxt<'tcx>>::for_kind(&kind);
                     InternedInSet(self.arena.alloc(WithCachedTypeInfo {
                         internee: kind,
@@ -217,7 +264,9 @@ impl<'tcx> CtxtInterners<'tcx> {
                     }))
                 })
                 .0,
-        ))
+        ));
+        *entry = Some((hash, ty));
+        ty
     }
 
     /// Interns a const. (Use `mk_*` functions instead, where possible.)
@@ -241,9 +290,18 @@ impl<'tcx> CtxtInterners<'tcx> {
     /// Interns a predicate. (Use `mk_predicate` instead, where possible.)
     #[inline(never)]
     fn intern_predicate(&self, kind: Binder<'tcx, PredicateKind<'tcx>>) -> Predicate<'tcx> {
-        Predicate(Interned::new_unchecked(
+        let hash = make_hash(&kind);
+        let mut cache = self.predicate_cache.borrow_mut();
+        let entry = cache.entry(hash);
+        if let Some((entry_hash, predicate)) = *entry
+            && entry_hash == hash
+            && predicate.kind() == kind
+        {
+            return predicate;
+        }
+        let predicate = Predicate(Interned::new_unchecked(
             self.predicate
-                .intern(kind, |kind| {
+                .intern_with_hash(hash, kind, |kind| {
                     let flags = ty::FlagComputation::<TyCtxt<'tcx>>::for_predicate(kind);
                     InternedInSet(self.arena.alloc(WithCachedTypeInfo {
                         internee: kind,
@@ -252,7 +310,9 @@ impl<'tcx> CtxtInterners<'tcx> {
                     }))
                 })
                 .0,
-        ))
+        ));
+        *entry = Some((hash, predicate));
+        predicate
     }
 
     fn intern_clauses(&self, clauses: &[Clause<'tcx>]) -> Clauses<'tcx> {
@@ -2010,8 +2070,6 @@ macro_rules! slice_interners {
 // should be used when possible, because it's faster.
 slice_interners!(
     const_lists: pub mk_const_list(Const<'tcx>),
-    args: pub mk_args(GenericArg<'tcx>),
-    type_lists: pub mk_type_list(Ty<'tcx>),
     canonical_var_kinds: pub mk_canonical_var_kinds(CanonicalVarKind<'tcx>),
     poly_existential_predicates: intern_poly_existential_predicates(PolyExistentialPredicate<'tcx>),
     projs: pub mk_projs(ProjectionKind),
@@ -2024,6 +2082,55 @@ slice_interners!(
     outlives: pub mk_outlives(ty::ArgOutlivesClause<'tcx>),
     predefined_opaques_in_body: pub mk_predefined_opaques_in_body((ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)),
 );
+
+impl<'tcx> TyCtxt<'tcx> {
+    // `mk_args` and `mk_type_list` are the hottest slice interners; unlike the
+    // `slice_interners!`-generated methods they go through a per-worker front
+    // cache first (see `FrontCache`).
+    pub fn mk_args(self, v: &[GenericArg<'tcx>]) -> GenericArgsRef<'tcx> {
+        if v.is_empty() {
+            return List::empty();
+        }
+        let hash = make_hash(&v);
+        let mut cache = self.interners.args_cache.borrow_mut();
+        let entry = cache.entry(hash);
+        if let Some((entry_hash, list)) = *entry
+            && entry_hash == hash
+            && list.as_slice() == v
+        {
+            return list;
+        }
+        let list = self
+            .interners
+            .args
+            .intern_ref_with_hash(hash, v, || InternedInSet(List::from_arena(&*self.arena, (), v)))
+            .0;
+        *entry = Some((hash, list));
+        list
+    }
+
+    pub fn mk_type_list(self, v: &[Ty<'tcx>]) -> &'tcx List<Ty<'tcx>> {
+        if v.is_empty() {
+            return List::empty();
+        }
+        let hash = make_hash(&v);
+        let mut cache = self.interners.type_list_cache.borrow_mut();
+        let entry = cache.entry(hash);
+        if let Some((entry_hash, list)) = *entry
+            && entry_hash == hash
+            && list.as_slice() == v
+        {
+            return list;
+        }
+        let list = self
+            .interners
+            .type_lists
+            .intern_ref_with_hash(hash, v, || InternedInSet(List::from_arena(&*self.arena, (), v)))
+            .0;
+        *entry = Some((hash, list));
+        list
+    }
+}
 
 impl<'tcx> TyCtxt<'tcx> {
     /// Given a `fn` sig, returns an equivalent `unsafe fn` type;
