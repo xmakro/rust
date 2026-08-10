@@ -218,7 +218,22 @@ impl<K: Eq + Hash + Copy> ShardedHashMap<K, ()> {
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let hash = make_hash(value);
+        self.intern_ref_with_hash(make_hash(value), value, make)
+    }
+
+    /// Like `intern_ref`, but takes the value's `make_hash` hash, for callers that
+    /// have already computed it. The hash must equal `make_hash(value)`.
+    #[inline]
+    pub fn intern_ref_with_hash<Q: ?Sized>(
+        &self,
+        hash: u64,
+        value: &Q,
+        make: impl FnOnce() -> K,
+    ) -> K
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         let mut shard = self.lock_shard_by_hash(hash);
 
         match table_entry(&mut shard, hash, value) {
@@ -237,7 +252,17 @@ impl<K: Eq + Hash + Copy> ShardedHashMap<K, ()> {
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let hash = make_hash(&value);
+        self.intern_with_hash(make_hash(&value), value, make)
+    }
+
+    /// Like `intern`, but takes the value's `make_hash` hash, for callers that
+    /// have already computed it. The hash must equal `make_hash(&value)`.
+    #[inline]
+    pub fn intern_with_hash<Q>(&self, hash: u64, value: Q, make: impl FnOnce(Q) -> K) -> K
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         let mut shard = self.lock_shard_by_hash(hash);
 
         match table_entry(&mut shard, hash, &value) {
