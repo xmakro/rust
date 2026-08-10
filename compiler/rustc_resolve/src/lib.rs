@@ -1983,6 +1983,12 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         let mut effective_visibilities = self.effective_visibilities;
         effective_visibilities.sort_for_stable_hashing();
         let effective_visibilities = effective_visibilities;
+        self.doc_link_traits_in_scope.sort_unstable_by(|a, _, b, _| {
+            a.to_local_def_id().local_def_index.cmp(&b.to_local_def_id().local_def_index)
+        });
+        for traits in self.doc_link_traits_in_scope.values_mut() {
+            traits.sort_unstable_by_key(|def_id| (def_id.krate.as_u32(), def_id.index.as_u32()));
+        }
 
         let stripped_cfg_items = self
             .stripped_cfg_items
@@ -2160,12 +2166,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
             ControlFlow::<()>::Continue(())
         });
-
-        // The collection order follows module binding insertion order, which
-        // differs between a staged expansion and a frontend cache replay. The
-        // candidates form a set as far as method probing is concerned, so give
-        // them a session-stable order.
-        found_traits.sort_by_key(|tr| (tr.def_id.krate.as_u32(), tr.def_id.index.as_u32()));
 
         self.tcx.hir_arena.alloc_slice(&found_traits)
     }
