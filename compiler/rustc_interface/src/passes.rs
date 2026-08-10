@@ -166,11 +166,13 @@ fn configure_and_expand(
     let fecache_mark = rustc_span::hygiene::fecache::mark();
     let mut fecache_restored = false;
     let mut fecache_record = false;
+    let mut fecache_binding_orders = Vec::new();
     if crate::frontend_cache::enabled(tcx) {
         match sess.time("fecache_restore", || crate::frontend_cache::try_restore(tcx, resolver)) {
-            crate::frontend_cache::RestoreOutcome::Restored(restored) => {
+            crate::frontend_cache::RestoreOutcome::Restored(restored, binding_orders) => {
                 krate = restored;
                 fecache_restored = true;
+                fecache_binding_orders = binding_orders;
             }
             crate::frontend_cache::RestoreOutcome::InputsValid => {}
             crate::frontend_cache::RestoreOutcome::Miss => {
@@ -273,6 +275,12 @@ fn configure_and_expand(
 
         krate
     });
+
+    if fecache_restored {
+        sess.time("fecache_reorder_bindings", || {
+            resolver.fecache_reorder_bindings(fecache_binding_orders)
+        });
+    }
 
     if fecache_record {
         sess.time("fecache_write", || {
@@ -1143,6 +1151,19 @@ pub fn emit_delayed_lints(tcx: TyCtxt<'_>) {
 /// Runs all analyses that we guarantee to run, even if errors were reported in earlier analyses.
 /// This function never fails.
 fn run_required_analyses(tcx: TyCtxt<'_>) {
+    if std::env::var_os("FECACHE_HIR_HASHES").is_some() {
+        let items = tcx.hir_crate_items(());
+        for owner in items.owners() {
+            let nodes = tcx.hir_owner_nodes(owner);
+            eprintln!(
+                "hir-hash {} {:?} attrs {:?} dph {:?}",
+                tcx.def_path_str(owner.def_id),
+                nodes.opt_hash,
+                tcx.hir_attr_map(owner).opt_hash,
+                tcx.def_path_hash(owner.to_def_id()),
+            );
+        }
+    }
     if tcx.sess.opts.unstable_opts.input_stats {
         rustc_passes::input_stats::print_hir_stats(tcx);
     }

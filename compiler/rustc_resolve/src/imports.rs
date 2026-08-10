@@ -1906,27 +1906,6 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
         });
 
-        // The natural order of `children` is binding insertion order, which
-        // depends on how expansion interleaved with reduced graph building. A
-        // frontend cache replay builds the graph in one pass over the already
-        // expanded crate, so insertion order can differ from the recording
-        // session even though the set of bindings is identical. Sort by a
-        // session-stable key so query fingerprints and metadata match.
-        let sort_key = |child: &ModChild| {
-            let span = child.ident.span.data();
-            let (krate, index) = match child.res.opt_def_id() {
-                Some(child_def_id) => (child_def_id.krate.as_u32(), child_def_id.index.as_u32()),
-                None => (u32::MAX, u32::MAX),
-            };
-            (child.ident.name, (span.lo.0, span.hi.0, span.ctxt.as_u32(), krate, index))
-        };
-        let cmp_keys = |a: (Symbol, (u32, u32, u32, u32, u32)),
-                        b: (Symbol, (u32, u32, u32, u32, u32))| {
-            a.0.as_str().cmp(b.0.as_str()).then_with(|| a.1.cmp(&b.1))
-        };
-        children.sort_by(|a, b| cmp_keys(sort_key(a), sort_key(b)));
-        ambig_children.sort_by(|a, b| cmp_keys(sort_key(&a.main), sort_key(&b.main)));
-
         if !children.is_empty() {
             module_children.insert(def_id.expect_local(), children);
         }

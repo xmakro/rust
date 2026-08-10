@@ -576,6 +576,24 @@ pub(crate) fn write_snapshot(
         }
     }
 
+    {
+        let orders = resolver.fecache_binding_orders();
+        enc.emit_usize(orders.len());
+        for (module_id, keys) in orders {
+            enc.emit_u32(module_id.0);
+            enc.emit_u32(module_id.1);
+            enc.emit_u32(module_id.2);
+            enc.emit_u32(module_id.3);
+            enc.emit_usize(keys.len());
+            for key in keys {
+                enc.encode_symbol(key.name);
+                enc.encode_syntax_context(key.ctxt);
+                enc.emit_u8(key.ns);
+                enc.emit_u32(key.disambiguator);
+            }
+        }
+    }
+
     krate.encode(&mut enc);
 
     // Assemble: magic, version, symbol tables, body.
@@ -608,8 +626,10 @@ pub(crate) fn write_snapshot(
 // Restore
 
 pub(crate) enum RestoreOutcome {
-    /// The snapshot was replayed; expansion will find nothing to do.
-    Restored(ast::Crate),
+    /// The snapshot was replayed; expansion will find nothing to do. The
+    /// binding orders must be applied to the resolver once the reduced graph
+    /// has been rebuilt over the restored crate.
+    Restored(ast::Crate, Vec<(rustc_resolve::fecache::FeModuleId, Vec<rustc_resolve::fecache::FeBindingKey>)>),
     /// The inputs are unchanged but the session could not be replayed (e.g.
     /// the crate numbering diverged). Re-expand, but do not rewrite the
     /// snapshot: it would encode to the same bytes.
@@ -927,6 +947,25 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> R
         resolver.fecache_extend_glob_map(entries);
     }
 
+    let mut binding_orders = Vec::new();
+    {
+        let n = dec.read_usize();
+        binding_orders.reserve(n);
+        for _ in 0..n {
+            let module_id = (dec.read_u32(), dec.read_u32(), dec.read_u32(), dec.read_u32());
+            let n_keys = dec.read_usize();
+            let keys = (0..n_keys)
+                .map(|_| rustc_resolve::fecache::FeBindingKey {
+                    name: dec.decode_symbol(),
+                    ctxt: dec.decode_syntax_context(),
+                    ns: dec.read_u8(),
+                    disambiguator: dec.read_u32(),
+                })
+                .collect();
+            binding_orders.push((module_id, keys));
+        }
+    }
+
     let krate = ast::Crate::decode(&mut dec);
 
     // Re-register the dependency information that expansion would have.
@@ -943,5 +982,5 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> R
     }
 
     fedbg!("hit: restored expanded crate");
-    RestoreOutcome::Restored(krate)
+    RestoreOutcome::Restored(krate, binding_orders)
 }

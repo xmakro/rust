@@ -3108,6 +3108,12 @@ mod hygiene {
             Macros20NormalizedSyntaxContext(ctxt)
         }
 
+        /// The raw context, for the frontend cache binding-order snapshot.
+        #[inline]
+        pub(crate) fn raw(self) -> SyntaxContext {
+            self.0
+        }
+
         /// The passed closure must preserve the context's normalized-ness.
         #[inline]
         pub(crate) fn update_unchecked<R>(&mut self, f: impl FnOnce(&mut SyntaxContext) -> R) -> R {
