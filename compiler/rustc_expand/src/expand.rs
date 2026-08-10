@@ -2169,6 +2169,16 @@ impl<'a, 'b> InvocationCollector<'a, 'b> {
         &self,
         item: &mut impl HasAttrs,
     ) -> Option<(ast::Attribute, usize, Vec<ast::Path>)> {
+        // A crate restored from the frontend cache is fully expanded: every
+        // attribute that survived is inert by construction (cfg stripping ran,
+        // attr macros and derives were consumed, helpers were left in place).
+        // Skipping the scan also avoids re-running speculative macro
+        // resolution for derive helper attributes, whose registrations died
+        // with the recording session.
+        if self.cx.frontend_cache_replay {
+            return None;
+        }
+
         let mut attr = None;
 
         let mut cfg_pos = None;

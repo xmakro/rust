@@ -179,6 +179,18 @@ struct FeDecoder<'a, 'psess> {
     syms: Vec<Symbol>,
     byte_syms: Vec<ByteSymbol>,
     psess: &'psess rustc_session::parse::ParseSess,
+    /// Maps the recorded session's `CrateNum`s to this session's. The replayed
+    /// crate loads resolve by name and hash, so the raw numbering may differ.
+    cnum_map: FxHashMap<u32, u32>,
+}
+
+impl FeDecoder<'_, '_> {
+    fn map_cnum(&self, raw: u32) -> CrateNum {
+        match self.cnum_map.get(&raw) {
+            Some(&mapped) => CrateNum::from_u32(mapped),
+            None => CrateNum::from_u32(raw),
+        }
+    }
 }
 
 macro_rules! delegate_read {
@@ -251,7 +263,8 @@ impl<'a, 'psess> SpanDecoder for FeDecoder<'a, 'psess> {
     }
 
     fn decode_expn_id(&mut self) -> ExpnId {
-        let krate = CrateNum::from_u32(self.read_u32());
+        let raw = self.read_u32();
+        let krate = self.map_cnum(raw);
         let local_id = ExpnIndex::from_u32(self.read_u32());
         ExpnId { krate, local_id }
     }
@@ -261,11 +274,13 @@ impl<'a, 'psess> SpanDecoder for FeDecoder<'a, 'psess> {
     }
 
     fn decode_crate_num(&mut self) -> CrateNum {
-        CrateNum::from_u32(self.read_u32())
+        let raw = self.read_u32();
+        self.map_cnum(raw)
     }
 
     fn decode_def_id(&mut self) -> rustc_hir::def_id::DefId {
-        let krate = CrateNum::from_u32(self.read_u32());
+        let raw = self.read_u32();
+        let krate = self.map_cnum(raw);
         let index = DefIndex::from_u32(self.read_u32());
         rustc_hir::def_id::DefId { krate, index }
     }
@@ -592,23 +607,34 @@ pub(crate) fn write_snapshot(
 // ------------------------------------------------------------------------
 // Restore
 
-pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> Option<ast::Crate> {
+pub(crate) enum RestoreOutcome {
+    /// The snapshot was replayed; expansion will find nothing to do.
+    Restored(ast::Crate),
+    /// The inputs are unchanged but the session could not be replayed (e.g.
+    /// the crate numbering diverged). Re-expand, but do not rewrite the
+    /// snapshot: it would encode to the same bytes.
+    InputsValid,
+    /// The inputs changed or no snapshot exists: re-expand and re-record.
+    Miss,
+}
+
+pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> RestoreOutcome {
     let sess = tcx.sess;
     fedbg!("restore: attempting");
-    let path = snapshot_path(tcx)?;
+    let Some(path) = snapshot_path(tcx) else { return RestoreOutcome::Miss };
     let Ok(buf) = std::fs::read(&path) else {
         fedbg!("miss: no snapshot at {}", path.display());
-        return None;
+        return RestoreOutcome::Miss;
     };
 
     // Parse the container: magic, version, symbol tables.
     if buf.len() < 12 || u32::from_le_bytes(buf[0..4].try_into().unwrap()) != MAGIC {
         fedbg!("miss: bad magic");
-        return None;
+        return RestoreOutcome::Miss;
     }
     if u32::from_le_bytes(buf[4..8].try_into().unwrap()) != VERSION {
         fedbg!("miss: format version");
-        return None;
+        return RestoreOutcome::Miss;
     }
     let mut pos = 8;
     let read_u32 = |pos: &mut usize| {
@@ -620,7 +646,10 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
     let mut syms = Vec::with_capacity(n_syms);
     for _ in 0..n_syms {
         let len = read_u32(&mut pos) as usize;
-        syms.push(Symbol::intern(std::str::from_utf8(&buf[pos..pos + len]).ok()?));
+        let Ok(sym_str) = std::str::from_utf8(&buf[pos..pos + len]) else {
+            return RestoreOutcome::Miss;
+        };
+        syms.push(Symbol::intern(sym_str));
         pos += len;
     }
     let n_byte_syms = read_u32(&mut pos) as usize;
@@ -633,25 +662,26 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
 
     let Ok(mem) = MemDecoder::new(&buf[pos..], 0) else {
         fedbg!("miss: truncated snapshot");
-        return None;
+        return RestoreOutcome::Miss;
     };
-    let mut dec = FeDecoder { mem, syms, byte_syms, psess: &sess.psess };
+    let mut dec =
+        FeDecoder { mem, syms, byte_syms, psess: &sess.psess, cnum_map: FxHashMap::default() };
 
     // --- Validation (no session mutation until all cheap checks pass) ---
 
     if dec.read_str() != option_env!("CFG_VERSION").unwrap_or("unknown") {
         fedbg!("miss: compiler version");
-        return None;
+        return RestoreOutcome::Miss;
     }
     let rec_opts_hash = dec.read_u64();
     let cur_opts_hash = sess.opts.dep_tracking_hash(true).as_u64();
     if rec_opts_hash != cur_opts_hash {
         fedbg!("miss: opts hash {rec_opts_hash:x} != {cur_opts_hash:x}");
-        return None;
+        return RestoreOutcome::Miss;
     }
     if dec.read_str() != tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str() {
         fedbg!("miss: crate name");
-        return None;
+        return RestoreOutcome::Miss;
     }
 
     let n_env = dec.read_usize();
@@ -664,7 +694,7 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
         };
         if std::env::var(&key).ok() != recorded {
             fedbg!("miss: env var {key} changed");
-            return None;
+            return RestoreOutcome::Miss;
         }
         env_deps.push((key, recorded));
     }
@@ -680,15 +710,15 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
         if let Some(recorded) = recorded {
             let Ok(bytes) = std::fs::read(&path) else {
                 fedbg!("miss: file dep {path} unreadable");
-                return None;
+                return RestoreOutcome::Miss;
             };
             if SourceFileHash::new_in_memory(SourceFileHashAlgorithm::Sha256, bytes) != recorded {
                 fedbg!("miss: file dep {path} changed");
-                return None;
+                return RestoreOutcome::Miss;
             }
         } else {
             fedbg!("miss: file dep {path} had no recorded hash");
-            return None;
+            return RestoreOutcome::Miss;
         }
         file_deps.push(path);
     }
@@ -718,7 +748,7 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
         let files = source_map.files();
         if files.len() > file_rows.len() {
             fedbg!("miss: parse loaded {} files, snapshot has {}", files.len(), file_rows.len());
-            return None;
+            return RestoreOutcome::Miss;
         }
         for (file, row) in files.iter().zip(file_rows.iter()) {
             match row {
@@ -731,12 +761,12 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
                             if real.local_path().is_some_and(|p| p == path))
                     {
                         fedbg!("miss: prefix file mismatch at {}", path.display());
-                        return None;
+                        return RestoreOutcome::Miss;
                     }
                 }
                 _ => {
                     fedbg!("miss: non-local file in parse prefix");
-                    return None;
+                    return RestoreOutcome::Miss;
                 }
             }
         }
@@ -744,11 +774,11 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
             if let FileRow::Local { path, src_hash, .. } = row {
                 let Ok(src) = std::fs::read_to_string(path) else {
                     fedbg!("miss: {} unreadable", path.display());
-                    return None;
+                    return RestoreOutcome::Miss;
                 };
                 if !src_hash.matches(&src) {
                     fedbg!("miss: {} changed", path.display());
-                    return None;
+                    return RestoreOutcome::Miss;
                 }
             }
         }
@@ -757,32 +787,59 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
     // --- Replay (mutations begin; failures below fall back to expansion) ---
 
     // Load the dependency crates in recorded order and verify identity.
+    // Several loaded crates sharing a name (e.g. the sysroot's and the user's
+    // version of the same library) cannot be re-located unambiguously, so the
+    // recorded numbering will not reproduce. Detect this before touching any
+    // session state: the session then expands normally, reproducing the
+    // recorded session bit for bit at only the cost of this validation.
+    {
+        let mut names: Vec<Symbol> = crates.iter().map(|&(_, name, ..)| name).collect();
+        names.sort_unstable_by_key(|name| name.as_u32());
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            fedbg!("inputs valid, but duplicate crate names prevent replay");
+            return RestoreOutcome::InputsValid;
+        }
+    }
+
     {
         let mut cstore = CStore::from_tcx_mut(tcx);
-        for &(cnum, name, _, dep_kind, _) in &crates {
-            match cstore.fecache_preload_crate(tcx, name, dep_kind) {
-                Some(loaded) if loaded.as_u32() <= cnum => {}
-                _ => {
+        for &(rec, name, svh, dep_kind, _) in &crates {
+            match cstore.fecache_preload_crate(tcx, name, svh, dep_kind) {
+                Some(got) => {
+                    fedbg!("preload {name} rec={rec} got={}", got.as_u32());
+                }
+                None => {
                     fedbg!("miss: crate {name} failed to preload");
-                    return None;
+                    return RestoreOutcome::Miss;
                 }
             }
         }
+        // Match each recorded crate to a loaded one by name and hash, and
+        // remap the snapshot's crate numbering onto this session's.
         let loaded = cstore.fecache_crates();
+        for (rec_cnum, rec_name, rec_svh, _, private) in &crates {
+            let Some((actual, ..)) = loaded
+                .iter()
+                .find(|(_, name, svh, _, _)| name == rec_name && svh.as_u128() == *rec_svh)
+            else {
+                fedbg!("miss: crate {rec_name} identity changed");
+                return RestoreOutcome::Miss;
+            };
+            if actual.as_u32() != *rec_cnum {
+                // The load order could not reproduce the recorded numbering
+                // (e.g. several crates share a name). Raw crate references in
+                // the snapshot could be remapped, but this session's crate
+                // list would still hash differently from the recording
+                // session's, going red; re-expanding is cheaper than that.
+                fedbg!("inputs valid, but {rec_name} loaded as {} not {}", actual.as_u32(), rec_cnum);
+                return RestoreOutcome::InputsValid;
+            }
+            dec.cnum_map.insert(*rec_cnum, actual.as_u32());
+            cstore.fecache_set_private_dep(*actual, *private);
+        }
         if loaded.len() != crates.len() {
             fedbg!("miss: crate count {} != {}", loaded.len(), crates.len());
-            return None;
-        }
-        for ((cnum, name, svh, _, _), (rec_cnum, rec_name, rec_svh, _, _)) in
-            loaded.into_iter().zip(crates.iter())
-        {
-            if cnum.as_u32() != *rec_cnum || name != *rec_name || svh.as_u128() != *rec_svh {
-                fedbg!("miss: crate {rec_name} identity changed");
-                return None;
-            }
-        }
-        for &(cnum, _, _, _, private) in &crates {
-            cstore.fecache_set_private_dep(CrateNum::from_u32(cnum), private);
+            return RestoreOutcome::Miss;
         }
     }
 
@@ -796,11 +853,11 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
                     Ok(file) => file,
                     Err(_) => {
                         fedbg!("miss: cannot load {}", path.display());
-                        return None;
+                        return RestoreOutcome::Miss;
                     }
                 },
                 FileRow::Imported { cnum, index, .. } => CStore::from_tcx(tcx)
-                    .fecache_import_source_file(tcx, CrateNum::from_u32(*cnum), *index),
+                    .fecache_import_source_file(tcx, dec.map_cnum(*cnum), *index),
                 FileRow::Virtual { name, src, .. } => {
                     source_map.new_source_file(name.clone(), src.clone())
                 }
@@ -812,14 +869,14 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
             };
             if file.start_pos.0 != start_pos || file.normalized_source_len.0 != len {
                 fedbg!("miss: file landed at {} not {}", file.start_pos.0, start_pos);
-                return None;
+                return RestoreOutcome::Miss;
             }
         }
     }
 
     if !hygiene_fecache::decode_delta(&mut dec) {
         fedbg!("miss: hygiene prefix mismatch");
-        return None;
+        return RestoreOutcome::Miss;
     }
 
     {
@@ -886,5 +943,5 @@ pub(crate) fn try_restore(tcx: TyCtxt<'_>, resolver: &mut Resolver<'_, '_>) -> O
     }
 
     fedbg!("hit: restored expanded crate");
-    Some(krate)
+    RestoreOutcome::Restored(krate)
 }

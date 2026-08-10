@@ -1412,9 +1412,45 @@ impl CStore {
         &mut self,
         tcx: TyCtxt<'tcx>,
         name: Symbol,
+        svh: u128,
         dep_kind: CrateDepKind,
     ) -> Option<CrateNum> {
-        self.maybe_resolve_crate(tcx, name, dep_kind, CrateOrigin::Extern).ok()
+        // Direct dependencies resolve through `--extern` like any root crate.
+        if let Ok(cnum) = self.maybe_resolve_crate(tcx, name, dep_kind, CrateOrigin::Extern) {
+            return Some(cnum);
+        }
+        // Indirect dependencies are only findable in dependency search paths,
+        // by hash: locate them the way their parent's dependency chain would.
+        let hash = Svh::new(rustc_data_structures::fingerprint::Fingerprint::new(
+            svh as u64,
+            (svh >> 64) as u64,
+        ));
+        let dep_root = crate::locator::CratePaths::new(
+            name,
+            CrateSource { dylib: None, rlib: None, rmeta: None, sdylib_interface: None },
+        );
+        let dep = crate::rmeta::CrateDep {
+            name,
+            hash,
+            host_hash: None,
+            kind: dep_kind,
+            extra_filename: String::new(),
+            is_private: false,
+        };
+        let origin = CrateOrigin::IndirectDependency {
+            dep_root_for_errors: &dep_root,
+            parent_private: false,
+            dep: &dep,
+        };
+        match self.maybe_resolve_crate(tcx, name, dep_kind, origin) {
+            Ok(cnum) => Some(cnum),
+            Err(err) => {
+                if std::env::var_os("FECACHE_DEBUG").is_some() {
+                    eprintln!("fecache: preload of {name} failed: {err:?}");
+                }
+                None
+            }
+        }
     }
 
     /// See [`CrateMetadata::fecache_imported_files`].

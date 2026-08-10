@@ -165,14 +165,18 @@ fn configure_and_expand(
     // resolver state over the restored AST without finding any macro to expand.
     let fecache_mark = rustc_span::hygiene::fecache::mark();
     let mut fecache_restored = false;
+    let mut fecache_record = false;
     if crate::frontend_cache::enabled(tcx) {
-        if let Some(restored) =
-            sess.time("fecache_restore", || crate::frontend_cache::try_restore(tcx, resolver))
-        {
-            krate = restored;
-            fecache_restored = true;
-        } else {
-            resolver.fecache_start_recording();
+        match sess.time("fecache_restore", || crate::frontend_cache::try_restore(tcx, resolver)) {
+            crate::frontend_cache::RestoreOutcome::Restored(restored) => {
+                krate = restored;
+                fecache_restored = true;
+            }
+            crate::frontend_cache::RestoreOutcome::InputsValid => {}
+            crate::frontend_cache::RestoreOutcome::Miss => {
+                resolver.fecache_start_recording();
+                fecache_record = true;
+            }
         }
     }
 
@@ -270,7 +274,7 @@ fn configure_and_expand(
         krate
     });
 
-    if crate::frontend_cache::enabled(tcx) && !fecache_restored {
+    if fecache_record {
         sess.time("fecache_write", || {
             crate::frontend_cache::write_snapshot(tcx, resolver, &mut krate, fecache_mark)
         });
