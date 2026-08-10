@@ -1062,8 +1062,8 @@ impl<'a> Parser<'a> {
     ///
     /// See also [`TokenKind::break_two_token_op`] which does similar splitting of `>>` into `>`.
     //
-    // FIXME: With current `TokenCursor` it's hard to break tokens into more than 2
-    //  parts unless those parts are processed immediately. `TokenCursor` should either
+    // FIXME: With current `FlatTokenCursor` it's hard to break tokens into more than 2
+    //  parts unless those parts are processed immediately. `FlatTokenCursor` should either
     //  support pushing "future tokens" (would be also helpful to `break_and_eat`), or
     //  we should break everything including floats into more basic proc-macro style
     //  tokens in the lexer (probably preferable).
@@ -1138,7 +1138,7 @@ impl<'a> Parser<'a> {
             [IdentLike(_), Punct('.'), IdentLike(_), Punct('+' | '-')] |
             // 1.2e+3 | 1.2e-3
             [IdentLike(_), Punct('.'), IdentLike(_), Punct('+' | '-'), IdentLike(_)] => {
-                // See the FIXME about `TokenCursor` above.
+                // See the FIXME about `FlatTokenCursor` above.
                 self.error_unexpected_after_dot();
                 DestructuredFloat::Error
             }
@@ -1275,6 +1275,11 @@ impl<'a> Parser<'a> {
             None
         };
         let open_paren = self.token.span;
+        // Comparing depths across a bounded view's range end is normally a
+        // hazard (past the end `depth()` is 0, not the origin buffer's
+        // depth), but here it is benign: both samples come from the same
+        // cursor, and `call_depth` is >= 1 (taken inside the parens), so at
+        // the range end the equality fails just as the old cursor's did.
         let call_depth = self.token_cursor.depth();
 
         let seq = match self.parse_expr_paren_seq() {
@@ -2523,8 +2528,8 @@ impl<'a> Parser<'a> {
         }
 
         if self.token == TokenKind::Semi
-            && let Some((Delimiter::Parenthesis, _)) = self.token_cursor.parent_delim_and_span()
             && self.may_recover()
+            && self.token_cursor.enclosing_delimiter() == Some(Delimiter::Parenthesis)
         {
             // It is likely that the closure body is a block but where the
             // braces have been removed. We will recover and eat the next

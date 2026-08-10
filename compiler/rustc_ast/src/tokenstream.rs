@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::hash::Hash;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{cmp, fmt, iter, mem};
 
 use rustc_data_structures::stable_hash::{StableHash, StableHashCtxt, StableHasher};
@@ -120,7 +120,7 @@ impl LazyAttrTokenStream {
 
     pub fn new_pending(
         start_token: (Token, Spacing),
-        cursor_snapshot: TokenCursor,
+        cursor_snapshot: FlatTokenCursor,
         num_calls: u32,
         break_last_token: u32,
         node_replacements: ThinVec<NodeReplacement>,
@@ -231,7 +231,7 @@ enum LazyAttrTokenStreamInner {
     // intermediate collection buffer to clone.
     Pending {
         start_token: (Token, Spacing),
-        cursor_snapshot: TokenCursor,
+        cursor_snapshot: FlatTokenCursor,
         num_calls: u32,
         break_last_token: u32,
         node_replacements: ThinVec<NodeReplacement>,
@@ -514,7 +514,7 @@ fn attrs_and_tokens_to_token_trees(
                 for inner_attr in inner_attrs {
                     tts.extend(inner_attr.token_trees());
                 }
-                tts.extend(stream.0.iter().cloned());
+                tts.extend(stream.iter().cloned());
                 let stream = TokenStream::new(tts);
                 *tree = TokenTree::Delimited(*span, *spacing, Delimiter::Brace, stream);
                 return true;
@@ -620,25 +620,157 @@ pub enum Spacing {
     JointHidden,
 }
 
+/// The state of a view-backed [`TokenStream`]: a view of one nesting level
+/// of a flat token buffer, plus its lazily materialized token trees. Boxed
+/// in [`TokenStreamInner::Flat`] so the enum stays at `Vec` size (24 bytes,
+/// niched on the box pointer): eager streams — the vast majority — carry no
+/// dead `OnceLock`, and view streams pay one extra allocation each.
+#[derive(Clone)]
+pub(crate) struct FlatLazy {
+    view: FlatTokenSlice,
+    trees: OnceLock<Vec<TokenTree>>,
+}
+
+/// The backing of a [`TokenStream`]: either materialized token trees, or a
+/// lazily materialized view of one nesting level of a flat token buffer.
+/// The latter lets macro-invocation arguments flow from the parser to the
+/// mbe matcher without the token tree ever being built; any tree-level
+/// access materializes it on first use.
+#[derive(Clone)]
+pub(crate) enum TokenStreamInner {
+    Eager(Vec<TokenTree>),
+    Flat(Box<FlatLazy>),
+}
+
 /// A `TokenStream` is an abstract sequence of tokens, organized into [`TokenTree`]s.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Encodable, Decodable)]
-pub struct TokenStream(Arc<Vec<TokenTree>>);
+#[derive(Clone)]
+pub struct TokenStream(pub(crate) Arc<TokenStreamInner>);
+
+// Manual impl printing the token trees in the same format as the old derived
+// impl on `TokenStream(Arc<Vec<TokenTree>>)`. For a flat view this
+// materializes (and prints) only the viewed range — the derived impl would
+// dump the whole underlying buffer for every view, which makes debug dumps
+// of unexpanded macro calls quadratic in crate size. The materialized trees
+// are cached in the stream's `OnceLock`, so formatting a view-backed stream
+// populates its lazy state as a side effect.
+impl fmt::Debug for TokenStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TokenStream").field(self.trees_vec()).finish()
+    }
+}
+
+impl Default for TokenStream {
+    fn default() -> TokenStream {
+        TokenStream::new(Vec::new())
+    }
+}
+
+impl PartialEq for TokenStream {
+    fn eq(&self, other: &TokenStream) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        // Identical views of the same buffer are equal without materializing.
+        if let (Some(a), Some(b)) = (self.flat_view(), other.flat_view())
+            && Arc::ptr_eq(&a.buf, &b.buf)
+            && a.start == b.start
+            && a.end == b.end
+        {
+            return true;
+        }
+        self.trees_vec() == other.trees_vec()
+    }
+}
+
+impl Eq for TokenStream {}
+
+impl std::hash::Hash for TokenStream {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.trees_vec().hash(state);
+    }
+}
+
+impl<E: rustc_serialize::Encoder> rustc_serialize::Encodable<E> for TokenStream
+where
+    Vec<TokenTree>: rustc_serialize::Encodable<E>,
+{
+    fn encode(&self, e: &mut E) {
+        self.trees_vec().encode(e);
+    }
+}
+
+impl<D: rustc_serialize::Decoder> rustc_serialize::Decodable<D> for TokenStream
+where
+    Vec<TokenTree>: rustc_serialize::Decodable<D>,
+{
+    fn decode(d: &mut D) -> TokenStream {
+        TokenStream::new(rustc_serialize::Decodable::decode(d))
+    }
+}
 
 impl TokenStream {
     pub fn new(tts: Vec<TokenTree>) -> TokenStream {
-        TokenStream(Arc::new(tts))
+        TokenStream(Arc::new(TokenStreamInner::Eager(tts)))
+    }
+
+    /// Creates a stream that is a lazily materialized view of a flat buffer
+    /// range covering one nesting level.
+    pub fn from_flat_view(view: FlatTokenSlice) -> TokenStream {
+        TokenStream(Arc::new(TokenStreamInner::Flat(Box::new(FlatLazy {
+            view,
+            trees: OnceLock::new(),
+        }))))
+    }
+
+    /// The flat view backing this stream, if it has one (and tree access
+    /// would thus require materialization).
+    pub fn flat_view(&self) -> Option<&FlatTokenSlice> {
+        match &*self.0 {
+            TokenStreamInner::Flat(lazy) => Some(&lazy.view),
+            TokenStreamInner::Eager(_) => None,
+        }
+    }
+
+    /// The materialized token trees, materializing a flat view on first use.
+    ///
+    /// For a view shared across threads (`-Zthreads`), concurrent first
+    /// calls may each compute the trees, with all but the `OnceLock` winner
+    /// discarded; the result is the same either way.
+    fn trees_vec(&self) -> &Vec<TokenTree> {
+        match &*self.0 {
+            TokenStreamInner::Eager(trees) => trees,
+            TokenStreamInner::Flat(lazy) => lazy.trees.get_or_init(|| lazy.view.to_tree_vec()),
+        }
+    }
+
+    /// Mutable access to the trees, converting a flat view into an eager
+    /// stream first. The view case copies twice (materialize, then clone
+    /// into the new `Eager` allocation); mutation of view-backed streams is
+    /// rare enough that this has not been worth a dedicated path.
+    fn vec_mut(&mut self) -> &mut Vec<TokenTree> {
+        if let TokenStreamInner::Flat(..) = &*self.0 {
+            let trees = self.trees_vec().clone();
+            self.0 = Arc::new(TokenStreamInner::Eager(trees));
+        }
+        match Arc::make_mut(&mut self.0) {
+            TokenStreamInner::Eager(trees) => trees,
+            TokenStreamInner::Flat(..) => unreachable!(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        match &*self.0 {
+            TokenStreamInner::Eager(trees) => trees.is_empty(),
+            TokenStreamInner::Flat(lazy) => lazy.view.len() == 0,
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.trees_vec().len()
     }
 
     pub fn get(&self, index: usize) -> Option<&TokenTree> {
-        self.0.get(index)
+        self.trees_vec().get(index)
     }
 
     pub fn iter(&self) -> TokenStreamIter<'_> {
@@ -682,7 +814,7 @@ impl TokenStream {
     /// construction within the compiler just build a `Vec<TokenTree>` with
     /// normal `Vec` operations and then do `TokenStream::new`.
     pub fn push_tree_with_gluing(&mut self, tt: TokenTree) {
-        let vec_mut = Arc::make_mut(&mut self.0);
+        let vec_mut = self.vec_mut();
 
         if Self::try_glue_to_last(vec_mut, &tt) {
             // nothing else to do
@@ -699,11 +831,12 @@ impl TokenStream {
     /// construction within the compiler just build a `Vec<TokenTree>` with
     /// normal `Vec` operations and then do `TokenStream::new`.
     pub fn push_stream_with_gluing(&mut self, stream: TokenStream) {
-        let vec_mut = Arc::make_mut(&mut self.0);
+        let vec_mut = self.vec_mut();
 
-        let stream_iter = stream.0.iter().cloned();
+        let stream_trees = stream.trees_vec();
+        let stream_iter = stream_trees.iter().cloned();
 
-        if let Some(first) = stream.0.first()
+        if let Some(first) = stream_trees.first()
             && Self::try_glue_to_last(vec_mut, first)
         {
             // Now skip the first token tree from `stream`.
@@ -726,7 +859,7 @@ impl TokenStream {
         fn desugar_inner(mut stream: TokenStream) -> Option<TokenStream> {
             let mut i = 0;
             let mut modified = false;
-            while let Some(tt) = stream.0.get(i) {
+            while let Some(tt) = stream.get(i) {
                 match tt {
                     &TokenTree::Token(
                         Token { kind: token::DocComment(_, attr_style, data), span },
@@ -734,7 +867,7 @@ impl TokenStream {
                     ) => {
                         let desugared = desugared_tts(attr_style, data, span);
                         let desugared_len = desugared.len();
-                        Arc::make_mut(&mut stream.0).splice(i..i + 1, desugared);
+                        stream.vec_mut().splice(i..i + 1, desugared);
                         modified = true;
                         i += desugared_len;
                     }
@@ -745,7 +878,7 @@ impl TokenStream {
                         if let Some(desugared_delim_stream) = desugar_inner(delim_stream.clone()) {
                             let new_tt =
                                 TokenTree::Delimited(sp, spacing, delim, desugared_delim_stream);
-                            Arc::make_mut(&mut stream.0)[i] = new_tt;
+                            stream.vec_mut()[i] = new_tt;
                             modified = true;
                         }
                         i += 1;
@@ -807,7 +940,7 @@ impl TokenStream {
     pub fn add_comma(&self) -> Option<(TokenStream, Span)> {
         // Used to suggest if a user writes `foo!(a b);`
         let mut suggestion = None;
-        let mut iter = self.0.iter().enumerate().peekable();
+        let mut iter = self.trees_vec().iter().enumerate().peekable();
         while let Some((pos, ts)) = iter.next() {
             if let Some((_, next)) = iter.peek() {
                 let sp = match (&ts, &next) {
@@ -829,8 +962,9 @@ impl TokenStream {
             }
         }
         if let Some((pos, comma, sp)) = suggestion {
-            let mut new_stream = Vec::with_capacity(self.0.len() + 1);
-            let parts = self.0.split_at(pos + 1);
+            let trees = self.trees_vec();
+            let mut new_stream = Vec::with_capacity(trees.len() + 1);
+            let parts = trees.split_at(pos + 1);
             new_stream.extend_from_slice(parts.0);
             new_stream.push(comma);
             new_stream.extend_from_slice(parts.1);
@@ -848,23 +982,33 @@ impl FromIterator<TokenTree> for TokenStream {
 
 impl StableHash for TokenStream {
     fn stable_hash<Hcx: StableHashCtxt>(&self, hcx: &mut Hcx, hasher: &mut StableHasher) {
-        self.0.as_slice().stable_hash(hcx, hasher);
+        // Hash as a slice so the tree count prefixes the elements: without
+        // it, nested-stream boundaries are ambiguous and different streams
+        // could produce identical incremental fingerprints.
+        self.trees_vec().as_slice().stable_hash(hcx, hasher);
     }
 }
 
+/// Iterates over the trees of a stream. Holds the materialized tree slice
+/// directly (materializing a flat view once at construction), so `next` is a
+/// plain slice index rather than a per-element re-resolution of the stream's
+/// backing.
 #[derive(Clone)]
-pub struct TokenStreamIter<'t>(std::slice::Iter<'t, TokenTree>);
+pub struct TokenStreamIter<'t> {
+    trees: &'t [TokenTree],
+    index: usize,
+}
 
 impl<'t> TokenStreamIter<'t> {
     fn new(stream: &'t TokenStream) -> Self {
-        TokenStreamIter(stream.0.as_slice().iter())
+        TokenStreamIter { trees: stream.trees_vec(), index: 0 }
     }
 
     // Peeking could be done via `Peekable`, but most iterators need peeking,
     // and this is simple and avoids the need to use `peekable` and `Peekable`
     // at all the use sites.
     pub fn peek(&self) -> Option<&'t TokenTree> {
-        self.0.as_slice().first()
+        self.trees.get(self.index)
     }
 }
 
@@ -872,12 +1016,723 @@ impl<'t> Iterator for TokenStreamIter<'t> {
     type Item = &'t TokenTree;
 
     fn next(&mut self) -> Option<&'t TokenTree> {
-        self.0.next()
+        self.trees.get(self.index).map(|tree| {
+            self.index += 1;
+            tree
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.size_hint()
+        // `index` only advances on a successful `next`, so it never exceeds
+        // the slice length.
+        let remaining = self.trees.len() - self.index;
+        (remaining, Some(remaining))
     }
+}
+
+impl ExactSizeIterator for TokenStreamIter<'_> {}
+
+impl std::iter::FusedIterator for TokenStreamIter<'_> {}
+
+/// One entry of a [`FlatTokenCursor`]'s pre-flattened token buffer.
+///
+/// The buffer contains every token the tree-walking cursor would synthesize,
+/// in order, plus open/close entries for *skipped* invisible delimiters:
+/// those entries are filtered out by [`FlatTokenCursor::inlined_next`], but
+/// retaining them preserves the tree structure for tree-level lookahead and
+/// depth queries.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlatEntry {
+    token: Token,
+    spacing: Spacing,
+    /// The nesting depth this entry lives at. Open-delimiter entries carry
+    /// the *parent* depth, while the contents and the close-delimiter entry
+    /// carry the inner depth. This makes [`FlatTokenCursor::depth`] agree
+    /// with the `stack.len()` of the old tree-walking cursor at every point
+    /// in the token sequence.
+    depth: u32,
+}
+
+impl FlatEntry {
+    pub fn token(&self) -> &Token {
+        &self.token
+    }
+
+    pub fn spacing(&self) -> Spacing {
+        self.spacing
+    }
+}
+
+/// The backing store of a flat token buffer: the entry sequence plus the
+/// open-to-close match table, behind a single `Arc` so that cursors and
+/// slices clone with one reference-count bump. The match table is kept out
+/// of [`FlatEntry`] deliberately: it is consulted only at open-delimiter
+/// entries, and inlining it would widen every entry of the sequentially
+/// scanned buffer (though it does cost 4 bytes per entry itself; see the
+/// comment on `matches`).
+///
+/// Kept private to this module: the invariants (depths, match table) are
+/// maintained solely by [`FlatSink`], and all consumers go through cursor
+/// and slice methods.
+struct FlatBuffer {
+    entries: Vec<FlatEntry>,
+    /// For every open-delimiter entry, the index of its matching
+    /// close-delimiter entry (zero for other entries). Lets the parser skip
+    /// a whole delimited sequence in one step, at the cost of one `u32` per
+    /// entry (+12.5% on the 32-byte entries).
+    matches: Vec<u32>,
+}
+
+/// A linear cursor over a pre-flattened token stream, replacing the
+/// tree-walking `TokenCursor`: advancing is an index increment, lookahead is
+/// direct indexing, and cloning (for parser snapshots and lazy token stream
+/// replay) is one reference-count bump.
+#[derive(Clone)]
+pub struct FlatTokenCursor {
+    buf: Arc<FlatBuffer>,
+    /// Index of the next entry to consume. Invariant: `index <= end`.
+    index: u32,
+    /// Exclusive end of the entry range this cursor may consume. Equal to
+    /// `entries.len()` except for cursors over a sub-range of a buffer
+    /// (macro-invocation arguments), which yield `Eof` at the range end.
+    end: u32,
+}
+
+// Manual impl: the derived one would print the whole underlying buffer
+// (which can be an entire crate's tokens).
+impl fmt::Debug for FlatTokenCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatTokenCursor")
+            .field("index", &self.index)
+            .field("end", &self.end)
+            .field(
+                "entries",
+                &&self.buf.entries[self.index.min(self.end) as usize..self.end as usize],
+            )
+            .finish()
+    }
+}
+
+/// A view of one contiguous entry range of a flat token buffer — either a
+/// whole delimited group (open and close entries included) or a run of
+/// entries at one nesting level. Cloning is one reference-count bump; this
+/// is the flat analog of an `Arc`-shared subtree.
+#[derive(Clone)]
+pub struct FlatTokenSlice {
+    buf: Arc<FlatBuffer>,
+    /// Invariant: `start <= end <= buf.entries.len()`.
+    start: u32,
+    end: u32,
+}
+
+// Manual impl: the derived one would print the whole underlying buffer
+// (which can be an entire crate's tokens) for every view.
+impl fmt::Debug for FlatTokenSlice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatTokenSlice")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("entries", &self.entries())
+            .finish()
+    }
+}
+
+impl FlatTokenSlice {
+    fn new(buf: Arc<FlatBuffer>, start: u32, end: u32) -> FlatTokenSlice {
+        debug_assert!(start <= end && end as usize <= buf.entries.len());
+        FlatTokenSlice { buf, start, end }
+    }
+
+    pub fn len(&self) -> usize {
+        (self.end - self.start) as usize
+    }
+
+    pub fn entries(&self) -> &[FlatEntry] {
+        &self.buf.entries[self.start as usize..self.end as usize]
+    }
+
+    /// The view of this slice's contents, without the open and close
+    /// delimiter entries. Requires the slice to be a whole delimited group.
+    pub fn inner_view(&self) -> FlatTokenSlice {
+        debug_assert!(self.buf.entries[self.start as usize].token.kind.open_delim().is_some());
+        debug_assert!(self.len() >= 2);
+        FlatTokenSlice::new(Arc::clone(&self.buf), self.start + 1, self.end - 1)
+    }
+
+    /// Rebuilds this slice as a token tree. Requires the slice to be a whole
+    /// delimited group (as produced by tt-fragment capture).
+    pub fn to_token_tree(&self) -> TokenTree {
+        debug_assert!(self.buf.entries[self.start as usize].token.kind.open_delim().is_some());
+        flat_delimited_at(&self.buf.entries, &self.buf.matches, self.start as usize)
+    }
+
+    pub fn to_token_stream(&self) -> TokenStream {
+        flat_range_to_stream(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.start as usize,
+            self.end as usize,
+        )
+    }
+
+    /// Materializes the token trees of this slice, which must cover one
+    /// whole nesting level.
+    pub fn to_tree_vec(&self) -> Vec<TokenTree> {
+        flat_range_to_trees(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.start as usize,
+            self.end as usize,
+        )
+    }
+}
+
+/// A captured `tt` metavariable fragment in flat form: the flat analog of
+/// the `TokenTree` the old cursor captured by `Arc`-cloning.
+#[derive(Clone, Debug)]
+pub enum FlatTt {
+    /// A whole delimited group, shared as a slice of its source buffer.
+    Slice(FlatTokenSlice),
+    /// A single non-delimited token, kept by value: it may be an unglued
+    /// half of a glued buffer entry, which no slice can represent.
+    Token(Token, Spacing),
+}
+
+impl FlatTt {
+    pub fn to_token_tree(&self) -> TokenTree {
+        match self {
+            FlatTt::Slice(slice) => slice.to_token_tree(),
+            FlatTt::Token(token, spacing) => TokenTree::Token(*token, *spacing),
+        }
+    }
+}
+
+/// An append-only builder for flat token buffers: the flat analog of
+/// building a `TokenStream`. Delimited groups are emitted as an open entry,
+/// contents, and a close entry (patching the match table); whole slices and
+/// token trees can be spliced in with their depths and match indices rebased.
+#[derive(Default)]
+pub struct FlatSink {
+    entries: Vec<FlatEntry>,
+    matches: Vec<u32>,
+    /// Entry indices of currently open delimiters.
+    open_stack: Vec<u32>,
+}
+
+// Manual impl: a sink mid-transcription holds an entire expansion's tokens;
+// print a summary instead of dumping them.
+impl fmt::Debug for FlatSink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FlatSink")
+            .field("entries", &self.entries.len())
+            .field("depth", &self.open_stack.len())
+            .finish()
+    }
+}
+
+impl FlatSink {
+    pub fn new() -> FlatSink {
+        FlatSink::default()
+    }
+
+    pub fn with_capacity(cap: usize) -> FlatSink {
+        FlatSink {
+            entries: Vec::with_capacity(cap),
+            matches: Vec::with_capacity(cap),
+            open_stack: Vec::new(),
+        }
+    }
+
+    /// The nesting depth entries pushed right now will carry.
+    pub fn depth(&self) -> u32 {
+        self.open_stack.len() as u32
+    }
+
+    #[inline]
+    pub fn push_token(&mut self, token: Token, spacing: Spacing) {
+        debug_assert!(!token.kind.is_delim());
+        self.entries.push(FlatEntry { token, spacing, depth: self.depth() });
+        self.matches.push(0);
+    }
+
+    /// The number of entries emitted so far.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Emits an open-delimiter entry and enters the group. `token` must be an
+    /// open-delimiter token. Returns the entry index of the open delimiter,
+    /// usable with [`FlatSink::patch_open_spacing`].
+    pub fn open_delim(&mut self, token: Token, spacing: Spacing) -> usize {
+        debug_assert!(token.kind.open_delim().is_some());
+        let open_idx = self.entries.len() as u32;
+        self.entries.push(FlatEntry { token, spacing, depth: self.depth() });
+        self.matches.push(0);
+        self.open_stack.push(open_idx);
+        open_idx as usize
+    }
+
+    /// Rewrites the spacing of the open-delimiter entry at `open_idx`. The
+    /// lexer only knows an open delimiter's spacing after bumping past it,
+    /// so it emits the entry with a placeholder and patches it here.
+    pub fn patch_open_spacing(&mut self, open_idx: usize, spacing: Spacing) {
+        debug_assert!(self.entries[open_idx].token.kind.open_delim().is_some());
+        self.entries[open_idx].spacing = spacing;
+    }
+
+    /// Emits the close-delimiter entry for the innermost open group and
+    /// leaves it. `token` must be the matching close-delimiter token.
+    pub fn close_delim(&mut self, token: Token, spacing: Spacing) {
+        debug_assert!(token.kind.close_delim().is_some());
+        let open_idx =
+            self.open_stack.last().copied().expect("close_delim without a matching open_delim")
+                as usize;
+        self.matches[open_idx] = self.entries.len() as u32;
+        // The close entry carries the inner depth, like the contents.
+        self.entries.push(FlatEntry { token, spacing, depth: self.depth() });
+        self.matches.push(0);
+        self.open_stack.pop();
+    }
+
+    /// Appends a copy of `slice`, rebasing entry depths and match indices to
+    /// this sink. Returns the entry index range the slice landed at.
+    pub fn splice_slice(&mut self, slice: &FlatTokenSlice) -> (usize, usize) {
+        // The depth rebase below keys off the first entry, so the slice must
+        // start at its own base depth: a whole group (open entry) or a run
+        // starting at the level the slice covers.
+        debug_assert!(slice.entries().first().is_none_or(|e| e.token.kind.close_delim().is_none()));
+        let dst_start = self.entries.len();
+        let src = &slice.buf.entries[slice.start as usize..slice.end as usize];
+        let src_matches = &slice.buf.matches[slice.start as usize..slice.end as usize];
+        // The first entry's depth is the slice's base depth: for a whole
+        // delimited group that is the open entry, which carries the parent
+        // depth in the source buffer.
+        let depth_delta = self.depth() as i64 - src.first().map_or(0, |e| e.depth) as i64;
+        let idx_delta = dst_start as i64 - slice.start as i64;
+        self.entries.extend(src.iter().map(|e| FlatEntry {
+            token: e.token,
+            spacing: e.spacing,
+            depth: (e.depth as i64 + depth_delta) as u32,
+        }));
+        self.matches.extend(src_matches.iter().map(|&m| {
+            // Only open-delimiter entries carry a (nonzero) match index.
+            if m == 0 { 0 } else { (m as i64 + idx_delta) as u32 }
+        }));
+        (dst_start, self.entries.len())
+    }
+
+    /// Rewrites the spans of the boundary (first and last) entries of the
+    /// range returned by [`FlatSink::splice_slice`]. Used by transcription to
+    /// re-attribute a spliced group's delimiters to the metavariable span.
+    pub fn set_boundary_spans(&mut self, (start, end): (usize, usize), open: Span, close: Span) {
+        debug_assert!(start < end && end == self.entries.len());
+        self.entries[start].token.span = open;
+        self.entries[end - 1].token.span = close;
+    }
+
+    /// Appends the flattened form of a token stream, exactly as
+    /// [`FlatTokenCursor::new`] would produce it, at the current depth.
+    pub fn splice_stream(&mut self, stream: &TokenStream) {
+        let base = self.depth();
+        // Iterative traversal; each stack element is the parent stream, the
+        // index of the tree *after* the `Delimited` we descended into, and
+        // the entry index of the open delimiter.
+        let mut stack: Vec<(TokenStream, usize, usize)> = Vec::new();
+        let mut stream = stream.clone();
+        let mut i = 0;
+        loop {
+            if let Some(tree) = stream.get(i) {
+                i += 1;
+                match tree {
+                    &TokenTree::Token(token, spacing) => {
+                        debug_assert!(!token.kind.is_delim());
+                        self.entries.push(FlatEntry {
+                            token,
+                            spacing,
+                            depth: base + stack.len() as u32,
+                        });
+                        self.matches.push(0);
+                    }
+                    &TokenTree::Delimited(sp, spacing, delim, ref tts) => {
+                        let open_idx = self.entries.len();
+                        self.entries.push(FlatEntry {
+                            token: Token::new(delim.as_open_token_kind(), sp.open),
+                            spacing: spacing.open,
+                            depth: base + stack.len() as u32,
+                        });
+                        self.matches.push(0);
+                        let tts = tts.clone();
+                        stack.push((mem::replace(&mut stream, tts), i, open_idx));
+                        i = 0;
+                    }
+                }
+            } else if let Some((parent, parent_i, open_idx)) = stack.pop() {
+                let Some(&TokenTree::Delimited(sp, spacing, delim, _)) = parent.get(parent_i - 1)
+                else {
+                    unreachable!("parent tree should be Delimited")
+                };
+                self.matches[open_idx] = self.entries.len() as u32;
+                self.entries.push(FlatEntry {
+                    token: Token::new(delim.as_close_token_kind(), sp.close),
+                    spacing: spacing.close,
+                    depth: base + stack.len() as u32 + 1,
+                });
+                self.matches.push(0);
+                stream = parent;
+                i = parent_i;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Finishes the buffer. All opened delimiters must have been closed.
+    pub fn finish(self) -> FlatTokenCursor {
+        debug_assert!(self.open_stack.is_empty());
+        FlatTokenCursor::from_parts(self.entries, self.matches)
+    }
+}
+
+impl FlatTokenCursor {
+    pub fn new(stream: TokenStream) -> FlatTokenCursor {
+        let mut sink = FlatSink::new();
+        sink.splice_stream(&stream);
+        sink.finish()
+    }
+
+    /// Assembles a cursor from a pre-built buffer. Private: buffers are only
+    /// produced by [`FlatSink`], which maintains the depth and match-table
+    /// invariants; external producers go through the sink.
+    fn from_parts(mut entries: Vec<FlatEntry>, mut matches: Vec<u32>) -> FlatTokenCursor {
+        // Expansion output is not bounded by the source-file size limit, so
+        // the 32-bit entry indices need a real guard: a silent wrap would
+        // corrupt the match table.
+        let end = u32::try_from(entries.len()).expect("flat token buffer exceeds u32::MAX entries");
+        assert_eq!(entries.len(), matches.len());
+        debug_assert!(flat_buffer_is_well_formed(&entries, &matches));
+        // Presize estimates can overshoot (comment- and string-heavy files),
+        // and captured views can pin the buffer for a long time; return
+        // large slack allocations rather than retaining them. The len/4
+        // threshold keeps overshoot up to the ~p75 of measured source
+        // density (see the presize comment in `rustc_parse::lexer`) without
+        // a shrink copy; the 4096 floor exempts small buffers, where slack
+        // is cheaper than any copy.
+        if entries.capacity() - entries.len() > 4096 + entries.len() / 4 {
+            entries.shrink_to_fit();
+            matches.shrink_to_fit();
+        }
+        FlatTokenCursor { buf: Arc::new(FlatBuffer { entries, matches }), index: 0, end }
+    }
+
+    /// A cursor over the sub-range of a buffer covered by `view`, sharing
+    /// the backing buffer. The cursor yields `Eof` at the range end.
+    pub fn from_view(view: &FlatTokenSlice) -> FlatTokenCursor {
+        FlatTokenCursor { buf: Arc::clone(&view.buf), index: view.start, end: view.end }
+    }
+
+    /// Rebuilds the token *tree* for the remaining (unconsumed) range, for
+    /// the few consumers that need a `TokenStream` rather than a parser
+    /// (e.g. the proc-macro server's `from_str`).
+    pub fn to_token_stream(&self) -> TokenStream {
+        flat_range_to_stream(
+            &self.buf.entries,
+            &self.buf.matches,
+            self.index as usize,
+            self.end as usize,
+        )
+    }
+
+    pub fn next(&mut self) -> (Token, Spacing) {
+        self.inlined_next()
+    }
+
+    /// This always-inlined version should only be used on hot code paths.
+    #[inline(always)]
+    pub fn inlined_next(&mut self) -> (Token, Spacing) {
+        while let Some(entry) =
+            self.buf.entries.get(self.index as usize).filter(|_| self.index < self.end)
+        {
+            self.index += 1;
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                continue;
+            }
+            return (entry.token, entry.spacing);
+        }
+        // We have exhausted the token stream. The use of `Spacing::Alone` is
+        // arbitrary and immaterial, because the `Eof` token's spacing is
+        // never used.
+        (Token::new(token::Eof, DUMMY_SP), Spacing::Alone)
+    }
+
+    /// The nesting depth at the current position. For a full-buffer cursor
+    /// this agrees with the `stack.len()` of the old tree-walking cursor.
+    ///
+    /// CAVEAT for bounded sub-range cursors: depths are the *origin*
+    /// buffer's (macro-argument views start at the invocation's depth, not
+    /// 0), and past the range end this returns 0. Only compare depths taken
+    /// from the same cursor, and never across a possible range end — use
+    /// entry positions there instead.
+    pub fn depth(&self) -> usize {
+        if self.index < self.end {
+            self.buf.entries.get(self.index as usize).map_or(0, |e| e.depth as usize)
+        } else {
+            0
+        }
+    }
+
+    /// The `dist`-th (one-based) upcoming token, not counting skipped
+    /// invisible delimiters, without consuming anything. Returns `Eof` past
+    /// the end of the stream.
+    pub fn peek(&self, dist: usize) -> Token {
+        debug_assert!(dist >= 1);
+        let mut remaining = dist;
+        for entry in self.buf.entries[self.index.min(self.end) as usize..self.end as usize].iter() {
+            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = entry.token.kind
+                && origin.skip()
+            {
+                continue;
+            }
+            if remaining <= 1 {
+                return entry.token;
+            }
+            remaining -= 1;
+        }
+        Token::new(token::Eof, DUMMY_SP)
+    }
+
+    /// The delimiter of the innermost delimited sequence containing the
+    /// current position, or `None` in the outermost stream.
+    pub fn enclosing_delimiter(&self) -> Option<Delimiter> {
+        // Every entry carries its nesting depth, so depth 0 (or the range
+        // end) means "no enclosing delimiter" without any scan. Note this
+        // fast path only fires for full-buffer cursors: a bounded view
+        // cursor carries the origin buffer's depths, which are nonzero even
+        // at the view's own top level, so it takes the scan below (bounded
+        // by the view's range end).
+        if self.depth() == 0 {
+            return None;
+        }
+        let entries = &self.buf.entries;
+        let end = self.end as usize;
+        let mut i = self.index as usize;
+        while i < end {
+            let entry = &entries[i];
+            if entry.token.kind.open_delim().is_some() {
+                // Step over whole sibling groups via the match table.
+                let close_idx = self.buf.matches[i] as usize;
+                debug_assert!(close_idx > i);
+                i = close_idx + 1;
+            } else if let Some(delim) = entry.token.kind.close_delim() {
+                return Some(delim);
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+
+    /// The first token after the close delimiter of the innermost delimited
+    /// sequence containing the current position, provided it is a normal
+    /// (non-delimiter) token. Nested groups are stepped over via the match
+    /// table.
+    ///
+    /// This must walk from the raw cursor position: a skipped invisible
+    /// *open* right at the cursor still has its close ahead of us, so
+    /// filtering it out (as consumption does) would pair the walk one
+    /// nesting level too deep.
+    pub fn token_after_enclosing_close(&self) -> Option<Token> {
+        let entries = &self.buf.entries;
+        let end = self.end as usize;
+        let mut i = self.index as usize;
+        while i < end {
+            let entry = &entries[i];
+            if entry.token.kind.open_delim().is_some() {
+                let close_idx = self.buf.matches[i] as usize;
+                debug_assert!(close_idx > i);
+                i = close_idx + 1;
+            } else if entry.token.kind.close_delim().is_some() {
+                let after = entries.get(i + 1).filter(|_| i + 1 < end)?;
+                // Match only normal tokens, like the tree-level lookahead of
+                // the old cursor (the following tree had to be a `Token`).
+                return (after.token.kind.open_delim().is_none()
+                    && after.token.kind.close_delim().is_none())
+                .then_some(after.token);
+            } else {
+                i += 1;
+            }
+        }
+        None
+    }
+
+    /// The `dist`-th (one-based) upcoming whole element — token or delimited
+    /// group, including non-consumed invisible ones — at the current nesting
+    /// level, without consuming anything. A delimited group is returned with
+    /// a lazy view of its contents. Returns `None` if the current level ends
+    /// before `dist` elements, matching tree-level lookahead on the old
+    /// cursor. Like [`FlatTokenCursor::token_after_enclosing_close`], this
+    /// deliberately walks from the raw cursor position so that a skipped
+    /// invisible group right at the cursor counts as one element rather than
+    /// being entered transparently.
+    ///
+    /// A delimited result allocates (the returned tree owns its view
+    /// stream); all current callers are cold recovery/lookahead paths, so
+    /// this has not been worth a by-parts return type.
+    pub fn look_ahead_tree(&self, dist: usize) -> Option<TokenTree> {
+        debug_assert!(dist >= 1);
+        let entries = &self.buf.entries;
+        let end = self.end as usize;
+        let mut i = self.index as usize;
+        let mut remaining = dist;
+        loop {
+            let entry = entries.get(i).filter(|_| i < end)?;
+            let is_open = entry.token.kind.open_delim().is_some();
+            if !is_open && entry.token.kind.close_delim().is_some() {
+                // End of the current nesting level.
+                return None;
+            }
+            let close_idx = if is_open {
+                let close_idx = self.buf.matches[i] as usize;
+                debug_assert!(close_idx > i && close_idx < end);
+                close_idx
+            } else {
+                i
+            };
+            if remaining <= 1 {
+                return Some(if is_open {
+                    let close = &entries[close_idx];
+                    TokenTree::Delimited(
+                        DelimSpan::from_pair(entry.token.span, close.token.span),
+                        DelimSpacing::new(entry.spacing, close.spacing),
+                        entry.token.kind.open_delim().unwrap(),
+                        TokenStream::from_flat_view(FlatTokenSlice::new(
+                            Arc::clone(&self.buf),
+                            i as u32 + 1,
+                            close_idx as u32,
+                        )),
+                    )
+                } else {
+                    TokenTree::Token(entry.token, entry.spacing)
+                });
+            }
+            remaining -= 1;
+            i = close_idx + 1;
+        }
+    }
+
+    /// The entry index of the whole delimited group whose open-delimiter
+    /// entry produced `open_token` (the parser's current token), returned as
+    /// a slice of the buffer plus the entry index of its close delimiter.
+    /// Panics if the current token is not backed by an open-delimiter entry,
+    /// e.g. if it was injected via `bump_with`: capturing would silently
+    /// cover the wrong range.
+    pub fn current_group_slice(&self, open_token: &Token) -> (FlatTokenSlice, u32) {
+        let open_idx = self.index.checked_sub(1).expect("no consumed entry to capture");
+        let entry = &self.buf.entries[open_idx as usize];
+        assert!(
+            entry.token.kind.open_delim().is_some(),
+            "current token is not a buffer-backed open delimiter"
+        );
+        // Compare kinds only: `Parser::bump` rewrites a dummy entry span to
+        // a fallback span for diagnostics, so the parser's current token can
+        // differ from the buffer entry in span while being the same token.
+        debug_assert_eq!(entry.token.kind, open_token.kind);
+        let close_idx = self.buf.matches[open_idx as usize];
+        debug_assert!(close_idx > open_idx);
+        (FlatTokenSlice::new(Arc::clone(&self.buf), open_idx, close_idx + 1), close_idx)
+    }
+
+    /// The current entry index: the entry the next `inlined_next` call
+    /// consumes (or starts skipping from).
+    pub fn position(&self) -> u32 {
+        self.index
+    }
+
+    /// The full backing buffer of this cursor, for validation in tests. Not
+    /// part of the parsing API.
+    #[doc(hidden)]
+    pub fn raw_parts(&self) -> (&[FlatEntry], &[u32]) {
+        (&self.buf.entries, &self.buf.matches)
+    }
+
+    /// Moves the cursor forward to `index`, skipping everything in between.
+    pub fn reposition_forward(&mut self, index: u32) {
+        debug_assert!(index >= self.index && index <= self.end);
+        self.index = index;
+    }
+}
+
+/// Whether every open-delimiter entry has a patched match index pointing at
+/// a close-delimiter entry after it, and every other entry a zero one.
+/// Debug-assertion helper for the buffer producers.
+fn flat_buffer_is_well_formed(entries: &[FlatEntry], matches: &[u32]) -> bool {
+    entries.len() == matches.len()
+        && entries.iter().enumerate().all(|(i, e)| {
+            if e.token.kind.open_delim().is_some() {
+                let m = matches[i] as usize;
+                m > i && m < entries.len() && entries[m].token.kind.close_delim().is_some()
+            } else {
+                matches[i] == 0
+            }
+        })
+}
+
+/// Rebuilds the token tree for the buffer range `start..end`, which must lie
+/// entirely at one nesting level (delimited sequences fully contained).
+fn flat_range_to_stream(
+    entries: &[FlatEntry],
+    matches: &[u32],
+    start: usize,
+    end: usize,
+) -> TokenStream {
+    TokenStream::new(flat_range_to_trees(entries, matches, start, end))
+}
+
+fn flat_range_to_trees(
+    entries: &[FlatEntry],
+    matches: &[u32],
+    start: usize,
+    end: usize,
+) -> Vec<TokenTree> {
+    let mut trees = Vec::new();
+    let mut i = start;
+    while i < end {
+        let entry = &entries[i];
+        if entry.token.kind.open_delim().is_some() {
+            trees.push(flat_delimited_at(entries, matches, i));
+            let next = matches[i] as usize + 1;
+            // A close outside `start..end` means the range does not cover
+            // whole nesting levels; without this check tokens beyond the
+            // requested range would be silently included.
+            debug_assert!(next > i && next <= end);
+            i = next;
+        } else {
+            debug_assert!(
+                entry.token.kind.close_delim().is_none(),
+                "range starts inside a delimited group"
+            );
+            trees.push(TokenTree::Token(entry.token, entry.spacing));
+            i += 1;
+        }
+    }
+    trees
+}
+
+/// Rebuilds the `TokenTree::Delimited` whose open delimiter lives at
+/// `open_idx` in the flat token buffer.
+fn flat_delimited_at(entries: &[FlatEntry], matches: &[u32], open_idx: usize) -> TokenTree {
+    let open = &entries[open_idx];
+    let close_idx = matches[open_idx] as usize;
+    debug_assert!(close_idx > open_idx, "unpatched match index for open-delimiter entry");
+    let close = &entries[close_idx];
+    let delim = open.token.kind.open_delim().unwrap();
+    TokenTree::Delimited(
+        DelimSpan::from_pair(open.token.span, close.token.span),
+        DelimSpacing::new(open.spacing, close.spacing),
+        delim,
+        flat_range_to_stream(entries, matches, open_idx + 1, close_idx),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1080,10 +1935,14 @@ mod size_asserts {
     // tidy-alphabetical-start
     static_assert_size!(AttrTokenStream, 8);
     static_assert_size!(AttrTokenTree, 32);
+    static_assert_size!(FlatEntry, 32);
+    static_assert_size!(FlatTokenCursor, 16);
+    static_assert_size!(FlatTokenSlice, 16);
     static_assert_size!(LazyAttrTokenStream, 8);
-    static_assert_size!(LazyAttrTokenStreamInner, 88);
+    static_assert_size!(LazyAttrTokenStreamInner, 64);
     static_assert_size!(Option<LazyAttrTokenStream>, 8); // must be small, used in many AST nodes
     static_assert_size!(TokenStream, 8);
+    static_assert_size!(TokenStreamInner, 24); // niches on the `Flat` box: eager streams pay no view overhead
     static_assert_size!(TokenTree, 32);
     // tidy-alphabetical-end
 }

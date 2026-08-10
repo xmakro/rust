@@ -17,7 +17,7 @@ mod ty;
 pub mod asm;
 pub mod cfg_select;
 
-use std::{debug_assert_matches, fmt, mem, slice};
+use std::{fmt, mem, slice};
 
 use attr_wrapper::{AttrWrapper, UsePreAttrPos};
 pub use diagnostics::AttemptLocalParseRecovery;
@@ -30,7 +30,8 @@ use rustc_ast::token::{
     self, IdentIsRaw, InvisibleOrigin, MetaVarKind, NtExprKind, NtPatKind, Token, TokenKind,
 };
 use rustc_ast::tokenstream::{
-    ParserRange, ParserReplacement, Spacing, TokenCursor, TokenStream, TokenTree, WithTokens,
+    DelimSpan, FlatTokenCursor, FlatTt, ParserRange, ParserReplacement, Spacing, TokenStream,
+    TokenTree, WithTokens,
 };
 use rustc_ast::util::case::Case;
 use rustc_ast::util::classify;
@@ -194,7 +195,7 @@ pub struct Parser<'a> {
     pub capture_cfg: bool = false,
     restrictions: Restrictions = Restrictions::empty(),
     expected_token_types: TokenTypeSet = TokenTypeSet::new(),
-    token_cursor: TokenCursor,
+    token_cursor: FlatTokenCursor,
     // The number of calls to `bump`, i.e. the position in the token stream.
     num_bump_calls: u32 = 0,
     // During parsing we may sometimes need to "unglue" a glued token into two
@@ -246,7 +247,7 @@ pub struct Parser<'a> {
 // nonterminals. Make sure it doesn't unintentionally get bigger. We only check a few arches
 // though, because `TokenTypeSet(u128)` alignment varies on others, changing the total size.
 #[cfg(all(target_pointer_width = "64", any(target_arch = "aarch64", target_arch = "x86_64")))]
-rustc_data_structures::static_assert_size!(Parser<'_>, 288);
+rustc_data_structures::static_assert_size!(Parser<'_>, 272);
 
 /// Stores span information about a closure.
 #[derive(Clone, Debug)]
@@ -344,9 +345,27 @@ impl<'a> Parser<'a> {
         stream: TokenStream,
         subparser_name: Option<&'static str>,
     ) -> Self {
+        // A stream that is a lazy view of a flat buffer can be parsed in
+        // place; only eager streams need the flatten pass. Callers that
+        // already hold a cursor (the lexer, mbe expansion) use
+        // `new_from_flat` directly and skip this dispatch.
+        let cursor = match stream.flat_view() {
+            Some(view) => FlatTokenCursor::from_view(view),
+            None => FlatTokenCursor::new(stream),
+        };
+        Self::new_from_flat(psess, cursor, subparser_name)
+    }
+
+    /// Like `new`, but takes an already-flattened token buffer, as produced
+    /// directly by the lexer for primary parses.
+    pub fn new_from_flat(
+        psess: &'a ParseSess,
+        token_cursor: FlatTokenCursor,
+        subparser_name: Option<&'static str>,
+    ) -> Self {
         let mut parser = Parser {
             psess,
-            token_cursor: TokenCursor::new(stream),
+            token_cursor,
             subparser_name,
             capture_state: CaptureState {
                 capturing: Capturing::No,
@@ -494,18 +513,14 @@ impl<'a> Parser<'a> {
     }
 
     // Check the first token after the delimiter that closes the current
-    // delimited sequence. (Panics if used in the outermost token stream, which
-    // has no delimiters.) It uses a clone of the relevant tree cursor to skip
-    // past the entire `TokenTree::Delimited` in a single step, avoiding the
-    // need for unbounded token lookahead.
+    // delimited sequence (false in the outermost token stream, which has no
+    // delimiters). Nested groups are stepped over via the match table, so
+    // this needs no unbounded token lookahead.
     //
     // Primarily used when `self.token` matches `OpenInvisible(_))`, to look
     // ahead through the current metavar expansion.
     fn check_noexpect_past_close_delim(&self, tok: &TokenKind) -> bool {
-        matches!(
-            self.token_cursor.look_ahead_past_close_delim(),
-            Some(TokenTree::Token(token::Token { kind, .. }, _)) if kind == tok
-        )
+        self.token_cursor.token_after_enclosing_close().is_some_and(|after| after.kind == *tok)
     }
 
     /// Consumes a token 'tok' if it exists. Returns whether the given token was present.
@@ -1105,6 +1120,13 @@ impl<'a> Parser<'a> {
     }
 
     /// Advance the parser by one token using provided token as the next one.
+    /// Advance to an injected token that does not come from the token
+    /// cursor (e.g. the second half of a broken compound token).
+    ///
+    /// Note: injected tokens must not be open delimiters. The token capture
+    /// machinery (`Parser::parse_token_tree_flat` via `current_group_slice`)
+    /// requires the current open delimiter to be backed by the buffer entry
+    /// just before the cursor position, and fails loudly otherwise.
     fn bump_with(&mut self, next: (Token, Spacing)) {
         self.inlined_bump_with(next)
     }
@@ -1149,51 +1171,9 @@ impl<'a> Parser<'a> {
             return looker(&self.token);
         }
 
-        // Typically around 98% of the `dist > 0` cases have `dist == 1`, so we
-        // have a fast special case for that.
-        if dist == 1 {
-            // `look_ahead(0)` returns the *next* token.
-            match self.token_cursor.look_ahead(0) {
-                Some(tree) => {
-                    // Indexing stayed within the current token tree.
-                    match tree {
-                        TokenTree::Token(token, _) => return looker(token),
-                        &TokenTree::Delimited(dspan, _, delim, _) => {
-                            if !delim.skip() {
-                                return looker(&Token::new(delim.as_open_token_kind(), dspan.open));
-                            }
-                        }
-                    }
-                }
-                None => {
-                    // The tree cursor lookahead went (one) past the end of the
-                    // current token tree. Try to return a close delimiter.
-                    if let Some((delim, span)) = self.token_cursor.parent_delim_and_span()
-                        && !delim.skip()
-                    {
-                        // We are not in the outermost token stream, so we have
-                        // delimiters. Also, those delimiters are not skipped.
-                        return looker(&Token::new(delim.as_close_token_kind(), span.close));
-                    }
-                }
-            }
-        }
-
-        // Just clone the token cursor and use `next`, skipping delimiters as
-        // necessary. Slow but simple.
-        let mut cursor = self.token_cursor.clone();
-        let mut i = 0;
-        let mut token = Token::dummy();
-        while i < dist {
-            token = cursor.next().0;
-            if let token::OpenInvisible(origin) | token::CloseInvisible(origin) = token.kind
-                && origin.skip()
-            {
-                continue;
-            }
-            i += 1;
-        }
-        looker(&token)
+        // The flat token buffer makes lookahead a direct scan from the
+        // current position; delimiters are already materialized as tokens.
+        looker(&self.token_cursor.peek(dist))
     }
 
     /// Like `look_ahead`, but skips over token trees rather than tokens. Useful
@@ -1204,7 +1184,11 @@ impl<'a> Parser<'a> {
         looker: impl FnOnce(&TokenTree) -> R,
     ) -> Option<R> {
         assert_ne!(dist, 0);
-        self.token_cursor.look_ahead(dist - 1).map(looker)
+        // Walk whole elements (tokens or delimited groups, including
+        // invisible ones) at the current nesting level; a delimited group
+        // carries a lazy view of its contents. Returns `None` when the
+        // current level ends first.
+        self.token_cursor.look_ahead_tree(dist).map(|tree| looker(&tree))
     }
 
     /// Returns whether any of the given keywords are `dist` tokens ahead of the current one.
@@ -1363,8 +1347,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses delimited arguments whose token stream is a lazy view of the
+    /// flat token buffer. Used for macro invocation arguments, which usually
+    /// flow to the mbe matcher without the tree ever being needed. The view
+    /// retains the underlying buffer, so this should not be used for
+    /// long-lived nodes (attributes, macro definition bodies).
     fn parse_delim_args(&mut self) -> PResult<'a, Box<DelimArgs>> {
-        if let Some(args) = self.parse_delim_args_inner() {
+        if let Some(args) = self.parse_delim_args_inner(false) {
+            Ok(Box::new(args))
+        } else {
+            self.unexpected_any()
+        }
+    }
+
+    /// Parses delimited arguments with an eagerly materialized token tree,
+    /// for long-lived nodes that would otherwise pin the token buffer.
+    fn parse_delim_args_eager(&mut self) -> PResult<'a, Box<DelimArgs>> {
+        if let Some(args) = self.parse_delim_args_inner(true) {
             Ok(Box::new(args))
         } else {
             self.unexpected_any()
@@ -1372,7 +1371,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_attr_args(&mut self) -> PResult<'a, AttrArgs> {
-        Ok(if let Some(args) = self.parse_delim_args_inner() {
+        Ok(if let Some(args) = self.parse_delim_args_inner(true) {
             AttrArgs::Delimited(args)
         } else if self.eat(exp!(Eq)) {
             let eq_span = self.prev_token.span;
@@ -1383,48 +1382,59 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_delim_args_inner(&mut self) -> Option<DelimArgs> {
+    fn parse_delim_args_inner(&mut self, eager: bool) -> Option<DelimArgs> {
         let delimited = self.check(exp!(OpenParen))
             || self.check(exp!(OpenBracket))
             || self.check(exp!(OpenBrace));
 
         delimited.then(|| {
-            let TokenTree::Delimited(dspan, _, delim, tokens) = self.parse_token_tree() else {
-                unreachable!()
+            let FlatTt::Slice(slice) = self.parse_token_tree_flat() else {
+                unreachable!("delimited args must be a delimited group")
             };
+            let entries = slice.entries();
+            let (open, close) = (entries.first().unwrap(), entries.last().unwrap());
+            let dspan = DelimSpan::from_pair(open.token().span, close.token().span);
+            let delim = open.token().kind.open_delim().unwrap();
+            let inner = slice.inner_view();
+            let tokens =
+                if eager { inner.to_token_stream() } else { TokenStream::from_flat_view(inner) };
             DelimArgs { dspan, delim, tokens }
         })
     }
 
     /// Parses a single token tree from the input.
     pub fn parse_token_tree(&mut self) -> TokenTree {
-        if self.token.kind.open_delim().is_some() {
-            // Clone the `TokenTree::Delimited` that we are currently
-            // within. That's what we are going to return.
-            let tree = self.token_cursor.clone_enclosing_delim();
-            debug_assert_matches!(tree, TokenTree::Delimited(..));
+        self.parse_token_tree_flat().to_token_tree()
+    }
 
-            // Advance the token cursor through the entire delimited
-            // sequence. After getting the `OpenDelim` we are *within* the
-            // delimited sequence, i.e. at depth `d`. After getting the
-            // matching `CloseDelim` we are *after* the delimited sequence,
-            // i.e. at depth `d - 1`.
-            let target_depth = self.token_cursor.depth() - 1;
+    /// Parses a single token tree from the input, in flat form: a delimited
+    /// group is captured as a slice of the token buffer (a refcount bump)
+    /// rather than rebuilt as a tree. Used for `tt` metavariable capture.
+    pub fn parse_token_tree_flat(&mut self) -> FlatTt {
+        if self.token.kind.open_delim().is_some() {
+            // The current token is the open delimiter, so the entry that
+            // produced it is the one just before the cursor position; the
+            // delimited group it opens is what we are going to return.
+            let (slice, close_idx) = self.token_cursor.current_group_slice(&self.token);
 
             if let Capturing::No = self.capture_state.capturing {
                 // We are not capturing tokens, so skip to the end of the
                 // delimited sequence. This is a perf win when dealing with
                 // declarative macros that pass large `tt` fragments through
                 // multiple rules, as seen in the uom-0.37.0 crate.
-                self.token_cursor.bump_to_end();
+                self.token_cursor.reposition_forward(close_idx);
                 self.bump();
-                debug_assert_eq!(self.token_cursor.depth(), target_depth);
             } else {
                 loop {
-                    // Advance one token at a time, so `TokenCursor::next()`
-                    // can capture these tokens if necessary.
+                    // Advance one token at a time, so the token capture
+                    // machinery can see these tokens if necessary. We have
+                    // passed the whole sequence once the cursor moves beyond
+                    // the close-delimiter entry; a depth comparison would be
+                    // wrong for a bounded view cursor whose range ends at
+                    // this group, since past the range end the origin
+                    // buffer's depths are no longer visible.
                     self.bump();
-                    if self.token_cursor.depth() == target_depth {
+                    if self.token_cursor.position() > close_idx {
                         break;
                     }
                 }
@@ -1433,12 +1443,12 @@ impl<'a> Parser<'a> {
 
             // Consume close delimiter
             self.bump();
-            tree
+            FlatTt::Slice(slice)
         } else {
             assert!(!self.token.kind.is_close_delim_or_eof());
             let prev_spacing = self.token_spacing;
             self.bump();
-            TokenTree::Token(self.prev_token, prev_spacing)
+            FlatTt::Token(self.prev_token, prev_spacing)
         }
     }
 
@@ -1819,7 +1829,7 @@ impl<'a> Parser<'a> {
 // smaller.
 #[derive(Clone, Debug)]
 pub enum ParseNtResult {
-    Tt(TokenTree),
+    Tt(FlatTt),
     Ident(Ident, IdentIsRaw),
     Lifetime(Ident, IdentIsRaw),
     Item(Box<ast::Item>),

@@ -2517,7 +2517,7 @@ impl<'a> Parser<'a> {
     fn parse_item_decl_macro(&mut self, lo: Span) -> PResult<'a, ItemKind> {
         let ident = self.parse_ident()?;
         let body = if self.check(exp!(OpenBrace)) {
-            self.parse_delim_args()? // `MacBody`
+            self.parse_delim_args_eager()? // `MacBody`
         } else if self.check(exp!(OpenParen)) {
             let params = self.parse_token_tree(); // `MacParams`
             let pspan = params.span();
@@ -2582,7 +2582,7 @@ impl<'a> Parser<'a> {
             self.dcx().emit_err(diagnostics::MacroNameRemoveBang { span });
         }
 
-        let body = self.parse_delim_args()?;
+        let body = self.parse_delim_args_eager()?;
         self.eat_semi_for_macro_if_needed(&body, None);
         self.complain_if_pub_macro(vis, true);
 
