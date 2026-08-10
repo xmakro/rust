@@ -1140,7 +1140,12 @@ impl<'tcx> TyCtxt<'tcx> {
         // - debug_assertions: for the "fingerprint the result" check in
         //   `rustc_query_impl::execution::execute_job`.
         // - incremental: for query lookups.
-        // - needs_metadata: it is included in the crate metadata through the crate_hash query
+        // - proc-macro crates emitting metadata: their metadata is a stub that does not
+        //   describe the macro implementation, so their crate hash keeps covering the HIR
+        //   (see the supplement in `with_encode_metadata_header`). For other crates emitting
+        //   metadata the crate hash is computed from the encoded bytes instead, and the HIR
+        //   hash is only needed when `-Zmetadata-crate-hash=no` opts back into the legacy
+        //   HIR-based scheme.
         // - instrument_coverage: for putting into coverage data (see
         //   `hash_mir_source`).
         // - metrics_dir: metrics use the strict version hash in the filenames
@@ -1149,7 +1154,9 @@ impl<'tcx> TyCtxt<'tcx> {
         //   of the proof of concept impl for the metrics initiative project goal)
         cfg!(debug_assertions)
             || self.sess.opts.incremental.is_some()
-            || self.needs_metadata()
+            || (self.needs_metadata()
+                && (self.crate_types().contains(&CrateType::ProcMacro)
+                    || !self.sess.opts.unstable_opts.metadata_crate_hash))
             || self.sess.instrument_coverage()
             || self.sess.opts.unstable_opts.metrics_dir.is_some()
     }
@@ -1158,11 +1165,11 @@ impl<'tcx> TyCtxt<'tcx> {
     /// `trait_map` and `children` on top of the node/attr hashes) needs to be computed during
     /// lowering.
     ///
-    /// This is a strict subset of [`Self::needs_hir_hash`]: notably it drops the plain
-    /// `needs_metadata` case. With metadata-based crate hashing (the default) the crate hash is
-    /// built from the encoded metadata plus each owner's cheaper `OwnerInfo::fingerprint` (just the
-    /// node and attr sub-hashes), so the combined hash is never read and computing it is wasted
-    /// work. It is still required for:
+    /// This is a strict subset of [`Self::needs_hir_hash`]: with metadata-based crate hashing
+    /// (the default), the only reader of per-owner hashes outside incremental and debug
+    /// assertions is the proc-macro supplement in the metadata encoder, and it folds each
+    /// owner's cheaper `OwnerInfo::fingerprint` (just the node and attr sub-hashes), so the
+    /// combined hash is never read and computing it is wasted work. It is still required for:
     /// - `-Z metadata-crate-hash=no`, where `crate_hash` falls back to hashing each `OwnerInfo`;
     /// - incremental, where the `lower_to_hir` result is fingerprinted for red/green tracking;
     /// - debug assertions, where every query result is fingerprinted to catch nondeterminism.
