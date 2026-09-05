@@ -7,7 +7,7 @@ use ast::token::IdentIsRaw;
 use rustc_ast::token::NtPatKind::*;
 use rustc_ast::token::TokenKind::*;
 use rustc_ast::token::{self, Delimiter, NonterminalKind, Token, TokenKind};
-use rustc_ast::tokenstream::{self, DelimSpan, TokenStream};
+use rustc_ast::tokenstream::{self, DelimSpan, FlatTokenCursor, TokenStream};
 use rustc_ast::{self as ast, DUMMY_NODE_ID, NodeId, Safety};
 use rustc_ast_pretty::pprust;
 use rustc_attr_ir::diagnostic::Directive;
@@ -119,10 +119,10 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
         fragment
     }
 
-    #[instrument(skip(cx, tts, bindings, matched_rule_bindings))]
-    pub(crate) fn from_tts<'cx>(
+    #[instrument(skip(cx, flat, bindings, matched_rule_bindings))]
+    pub(crate) fn from_flat<'cx>(
         cx: &'cx mut ExtCtxt<'a>,
-        tts: TokenStream,
+        flat: FlatTokenCursor,
         site_span: Span,
         arm_span: Span,
         is_local: bool,
@@ -132,7 +132,7 @@ impl<'a, 'b> ParserAnyMacro<'a, 'b> {
         matched_rule_bindings: &'b [MatcherLoc],
     ) -> Self {
         Self {
-            parser: Parser::new(&cx.sess.psess, tts, None),
+            parser: Parser::new_from_flat(&cx.sess.psess, flat, None),
 
             // Pass along the original expansion site and the name of the macro
             // so we can print a useful error message if the parse of the expanded
@@ -255,7 +255,8 @@ impl MacroRulesMacroExpander {
 
                 let id = cx.current_expansion.id;
                 let tts = transcribe(psess, &named_matches, rhs, *rhs_span, self.transparency, id)
-                    .map_err(|e| e.emit())?;
+                    .map_err(|e| e.emit())?
+                    .to_token_stream();
 
                 if cx.trace_macros() {
                     let msg = format!("to `{}`", pprust::tts_to_string(&tts));
@@ -461,8 +462,8 @@ fn expand_macro<'cx, 'a: 'cx>(
 
             // rhs has holes ( `$id` and `$(...)` that need filled)
             let id = cx.current_expansion.id;
-            let tts = match transcribe(psess, &named_matches, rhs, *rhs_span, transparency, id) {
-                Ok(tts) => tts,
+            let flat = match transcribe(psess, &named_matches, rhs, *rhs_span, transparency, id) {
+                Ok(flat) => flat,
                 Err(err) => {
                     let guar = err.emit();
                     return DummyResult::any(arm_span, guar);
@@ -470,7 +471,7 @@ fn expand_macro<'cx, 'a: 'cx>(
             };
 
             if cx.trace_macros() {
-                let msg = format!("to `{}`", pprust::tts_to_string(&tts));
+                let msg = format!("to `{}`", pprust::tts_to_string(&flat.to_token_stream()));
                 trace_macros_note(&mut cx.expansions, sp, msg);
             }
 
@@ -480,7 +481,7 @@ fn expand_macro<'cx, 'a: 'cx>(
             }
 
             // Let the context choose how to interpret the result. Weird, but useful for X-macros.
-            Box::new(ParserAnyMacro::from_tts(cx, tts, sp, arm_span, is_local, name, rules, lhs))
+            Box::new(ParserAnyMacro::from_flat(cx, flat, sp, arm_span, is_local, name, rules, lhs))
         }
         Err(CanRetry::No(guar)) => {
             debug!("Will not retry matching as an error was emitted already");
@@ -562,7 +563,8 @@ fn expand_macro_attr(
 
             let id = cx.current_expansion.id;
             let tts = transcribe(psess, &named_matches, rhs, *rhs_span, transparency, id)
-                .map_err(|e| e.emit())?;
+                .map_err(|e| e.emit())?
+                .to_token_stream();
 
             if cx.trace_macros() {
                 let msg = format!("to `{}`", pprust::tts_to_string(&tts));
@@ -1868,6 +1870,18 @@ pub(super) fn parser_from_cx(
     mut tts: TokenStream,
     recovery: Recovery,
 ) -> Parser<'_> {
+    // Macro-invocation arguments usually arrive as a lazy view of the flat
+    // token buffer; parse straight from it, unless doc comments require the
+    // desugaring pre-pass (rare). The scan is O(arguments) per invocation,
+    // but so was the tree walk `desugar_doc_comments` did here before; the
+    // flat scan replaces it, not adds to it.
+    if let Some(view) = tts.flat_view()
+        && !view.entries().iter().any(|e| matches!(e.token().kind, token::DocComment(..)))
+    {
+        let cursor = FlatTokenCursor::from_view(view);
+        return Parser::new_from_flat(psess, cursor, rustc_parse::MACRO_ARGUMENTS)
+            .recovery(recovery);
+    }
     tts.desugar_doc_comments();
     Parser::new(psess, tts, rustc_parse::MACRO_ARGUMENTS).recovery(recovery)
 }
