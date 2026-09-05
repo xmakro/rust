@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use rustc_ast::attr::MarkedAttrs;
-use rustc_ast::tokenstream::TokenStream;
+use rustc_ast::tokenstream::{FlatTokenCursor, TokenStream};
 use rustc_ast::visit::{AssocCtxt, Visitor};
 use rustc_ast::{self as ast, AttrVec, Attribute, HasAttrs, Item, NodeId, PatKind, Safety};
 use rustc_attr_ir::{
@@ -277,8 +277,23 @@ impl<'cx> MacroExpanderResult<'cx> {
     ) -> Self {
         // Emit SEMICOLON_IN_EXPRESSIONS_FROM_MACROS here, rather than the NON_LOCAL version.
         let is_local = true;
-        let parser =
-            ParserAnyMacro::from_tts(cx, tts, site_span, arm_span, is_local, macro_ident, &[], &[]);
+
+        // Parse an existing view in place; only tree-backed streams need the
+        // flattening pass.
+        let cursor = match tts.flat_view() {
+            Some(view) => FlatTokenCursor::from_view(view),
+            None => FlatTokenCursor::new(tts),
+        };
+        let parser = ParserAnyMacro::from_flat(
+            cx,
+            cursor,
+            site_span,
+            arm_span,
+            is_local,
+            macro_ident,
+            &[],
+            &[],
+        );
         ExpandResult::Ready(Box::new(parser))
     }
 }
