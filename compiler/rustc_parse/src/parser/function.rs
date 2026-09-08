@@ -321,9 +321,26 @@ impl<'a> Parser<'a> {
         } else {
             &[exp!(Gen), exp!(Const), exp!(Async), exp!(Unsafe), exp!(Safe), exp!(Extern)]
         };
-        self.check_keyword_case(exp!(Fn), case) // Definitely an `fn`.
-            // `$qual fn` or `$qual $qual`:
-            || quals.iter().any(|&exp| self.check_keyword_case(exp, case))
+        if self.check_keyword_case(exp!(Fn), case) {
+            return true;
+        }
+        if case == Case::Sensitive
+            && !self.token.is_non_raw_ident_where(|ident| {
+                matches!(
+                    ident.name,
+                    kw::Gen | kw::Const | kw::Async | kw::Unsafe | kw::Safe | kw::Extern
+                ) || check_pub && ident.name == kw::Pub
+            })
+        {
+            // None of the qualifier checks can succeed. Preserve all their
+            // diagnostic expectations without inspecting the token repeatedly.
+            for exp in quals {
+                self.expected_token_types.insert(exp.token_type);
+            }
+            return false;
+        }
+        // `$qual fn` or `$qual $qual`:
+        quals.iter().any(|&exp| self.check_keyword_case(exp, case))
                 && self.look_ahead(1, |t| {
                     // `$qual fn`, e.g. `const fn` or `async fn`.
                     t.is_keyword_case(kw::Fn, case)
