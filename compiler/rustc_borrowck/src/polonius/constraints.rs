@@ -253,13 +253,7 @@ fn compute_forward_successor(
         return Some(succ);
     }
 
-    // 2. Otherwise, gather the edges due to explicit region liveness, when applicable.
-    if !live_regions.contains(region, next_point) {
-        return None;
-    }
-
-    // Here, `region` could be live at the current point, and is live at the next point: add a
-    // constraint between them, according to variance.
+    // Only look up liveness if this region's variance permits a forward edge.
 
     // Note: there currently are cases related to promoted and const generics, where we don't yet
     // have variance information (possibly about temporary regions created when typeck sanitizes the
@@ -282,7 +276,9 @@ fn compute_forward_successor(
             // to the next point.
             // 2. For invariant cases, loans can flow in both directions, but here as well, we only
             // want the forward path of the bidirectional edge.
-            Some(LocalizedNode { region, point: next_point })
+            live_regions
+                .contains(region, next_point)
+                .then_some(LocalizedNode { region, point: next_point })
         }
     }
 }
@@ -298,10 +294,6 @@ fn compute_backward_successor(
 ) -> Option<LocalizedNode> {
     // Liveness flows into the regions live at the next point. So, in a backwards view, we'll link
     // the region from the current point, if it's live there, to the previous point.
-    if !live_regions.contains(region, current_point) {
-        return None;
-    }
-
     // FIXME: add the missing variance information and remove this fallback bidirectional edge. See
     // the same comment in `compute_forward_successor`.
     let direction =
@@ -318,7 +310,9 @@ fn compute_backward_successor(
             // point to the previous point.
             // 2. For invariant cases, loans can flow in both directions, but here as well, we only
             // want the backward path of the bidirectional edge.
-            Some(LocalizedNode { region, point: previous_point })
+            live_regions
+                .contains(region, current_point)
+                .then_some(LocalizedNode { region, point: previous_point })
         }
     }
 }
