@@ -99,6 +99,11 @@ impl SanitizerSet {
     /// Disable default sanitizers that are incompatible with explicitly requested ones,
     /// matching Clang's `SanitizerArgs` driver logic.
     pub fn combine_with_defaults(self, mut defaults: SanitizerSet) -> SanitizerSet {
+        // A conflict requires a sanitizer on both sides. This is also the
+        // common path for targets without default sanitizers.
+        if self.is_empty() || defaults.is_empty() {
+            return self | defaults;
+        }
         for &(a, b) in Self::MUTUALLY_EXCLUSIVE {
             if defaults.contains(a) && self.contains(b) {
                 defaults -= a;
