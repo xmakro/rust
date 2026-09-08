@@ -1406,6 +1406,14 @@ impl<'a> Parser<'a> {
                 self.token_cursor.bump_to_end();
                 self.bump();
                 debug_assert_eq!(self.token_cursor.depth(), target_depth);
+            } else if let TokenTree::Delimited(span, ..) = &tree
+                && !span.close.is_dummy()
+            {
+                // Capturing needs the token count, but no intermediate parser state.
+                // A dummy close span needs the normal loop's fallback-span propagation.
+                self.num_bump_calls += self.token_cursor.bump_to_end_with_count();
+                self.bump();
+                debug_assert_eq!(self.token_cursor.depth(), target_depth);
             } else {
                 loop {
                     // Advance one token at a time, so `TokenCursor::next_and_bump()`
