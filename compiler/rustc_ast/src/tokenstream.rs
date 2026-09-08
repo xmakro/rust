@@ -15,6 +15,7 @@ use rustc_data_structures::sync;
 use rustc_macros::{Decodable, Encodable, StableHash, Walkable};
 use rustc_serialize::{Decodable, Encodable};
 use rustc_span::{DUMMY_SP, Span, SpanDecoder, SpanEncoder, Symbol, sym};
+use smallvec::SmallVec;
 use thin_vec::ThinVec;
 
 use crate::ast::AttrStyle;
@@ -1003,6 +1004,28 @@ impl TokenCursor {
     #[inline]
     pub fn bump_to_end(&mut self) {
         self.curr.bump_to_end()
+    }
+
+    pub fn bump_to_end_with_count(&mut self) -> u32 {
+        let mut count = 0;
+        let mut pending = SmallVec::<[std::slice::Iter<'_, TokenTree>; 8]>::new();
+        pending.push(self.curr.stream.0[self.curr.next_idx..].iter());
+        while let Some(iter) = pending.last_mut() {
+            match iter.next() {
+                Some(TokenTree::Token(..)) => count += 1,
+                Some(TokenTree::Delimited(_, _, delim, stream)) => {
+                    if !delim.skip() {
+                        count += 2;
+                    }
+                    pending.push(stream.0.iter());
+                }
+                None => {
+                    pending.pop();
+                }
+            }
+        }
+        self.curr.bump_to_end();
+        count
     }
 
     /// Note: the outermost stream has depth of 0.
