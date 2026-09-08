@@ -825,6 +825,11 @@ fn assemble_candidates_from_trait_def<'cx, 'tcx>(
     let mut ambiguous = false;
     let _ = selcx.for_each_item_bound(
         obligation.predicate.self_ty(),
+        |clause, _| {
+            clause.as_projection_clause().is_some_and(|clause| {
+                clause.item_def_id() == obligation.predicate.expect_projection_def_id()
+            })
+        },
         |selcx, clause, _, _| {
             let Some(clause) = clause.as_projection_clause() else {
                 return ControlFlow::Continue(());
