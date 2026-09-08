@@ -1,6 +1,41 @@
 use super::*;
 
 #[test]
+fn test_span_union_encoding_boundaries() {
+    create_default_session_globals_then(|| {
+        let ranges = [
+            (0, 0),
+            (3, 10),
+            (8, 14),
+            (40_000, 40_001),
+            (1, 32_766),
+            (1, 32_767),
+            (1, 32_768),
+            (u32::MAX - 10, u32::MAX),
+        ];
+        for ctxt in [0, 7, 65_534, 65_535, 70_000] {
+            let ctxt = SyntaxContext::from_u32(ctxt);
+            for parent in [None, Some(crate::def_id::CRATE_DEF_ID)] {
+                for (lo_a, hi_a) in ranges {
+                    for (lo_b, hi_b) in ranges {
+                        let a = Span::new(BytePos(lo_a), BytePos(hi_a), ctxt, parent);
+                        let b = Span::new(BytePos(lo_b), BytePos(hi_b), ctxt, parent);
+                        let expected = Span::new(
+                            BytePos(lo_a.min(lo_b)),
+                            BytePos(hi_a.max(hi_b)),
+                            ctxt,
+                            parent,
+                        );
+                        assert_eq!(a.to(b), expected);
+                        assert_eq!(b.to(a), expected);
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[test]
 fn test_lookup_line() {
     let source = "abcdefghijklm\nabcdefghij\n...".to_owned();
     let mut sf = SourceFile::new(
