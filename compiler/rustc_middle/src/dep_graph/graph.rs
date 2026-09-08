@@ -701,6 +701,11 @@ impl DepGraphData {
     }
 
     #[inline]
+    pub fn prev_key_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> PackedFingerprint {
+        self.previous.index_to_node(prev_index).key_fingerprint
+    }
+
+    #[inline]
     pub fn prev_value_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> Fingerprint {
         self.previous.value_fingerprint_for_index(prev_index)
     }
@@ -1087,6 +1092,15 @@ impl DepGraph {
                     // already in memory.
                 }
             }
+        }
+    }
+
+    #[inline]
+    pub fn green_current_index(&self, prev_index: SerializedDepNodeIndex) -> Option<DepNodeIndex> {
+        let data = self.data.as_ref().unwrap();
+        match data.colors.get(prev_index) {
+            DepNodeColor::Green(dep_node_index) => Some(dep_node_index),
+            DepNodeColor::Unknown | DepNodeColor::Red => None,
         }
     }
 

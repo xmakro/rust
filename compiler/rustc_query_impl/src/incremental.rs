@@ -37,8 +37,13 @@ fn encode_query_values_inner<'a, 'tcx, C, V>(
 
     assert!(all_inactive(&query.state));
     query.cache.for_each(&mut |key, value, dep_node| {
-        if query.will_cache_on_disk_for_key(*key) {
-            encoder.encode_query_value::<V>(dep_node, &erase::restore_val::<V>(*value));
+        if query.will_cache_on_disk_for_key(*key) && !encoder.is_carried_query_value(dep_node) {
+            let key_fingerprint = DepNode::construct(tcx, query.dep_kind, key).key_fingerprint;
+            encoder.encode_query_value::<V>(
+                dep_node,
+                key_fingerprint,
+                &erase::restore_val::<V>(*value),
+            );
         }
     });
 }
