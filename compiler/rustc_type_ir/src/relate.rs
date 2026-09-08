@@ -2,6 +2,7 @@ use std::iter;
 
 use derive_where::derive_where;
 use rustc_ast_ir::Mutability;
+use smallvec::SmallVec;
 use tracing::{instrument, trace};
 
 use crate::error::{ExpectedFound, TypeError};
@@ -114,9 +115,9 @@ pub fn relate_args_invariantly<I: Interner, R: TypeRelation<I>>(
     a_arg: I::GenericArgs,
     b_arg: I::GenericArgs,
 ) -> RelateResult<I, I::GenericArgs> {
-    relation.cx().mk_args_from_iter(iter::zip(a_arg.iter(), b_arg.iter()).map(|(a, b)| {
+    relate_args_reusing_unchanged(relation, a_arg, b_arg, |relation, _, a, b| {
         relation.relate_with_variance(ty::Invariant, VarianceDiagInfo::default(), a, b)
-    }))
+    })
 }
 
 pub fn relate_args_with_variances<I: Interner, R: TypeRelation<I>>(
@@ -125,13 +126,47 @@ pub fn relate_args_with_variances<I: Interner, R: TypeRelation<I>>(
     a_args: I::GenericArgs,
     b_args: I::GenericArgs,
 ) -> RelateResult<I, I::GenericArgs> {
-    let cx = relation.cx();
-    let args = iter::zip(a_args.iter(), b_args.iter()).enumerate().map(|(i, (a, b))| {
+    relate_args_reusing_unchanged(relation, a_args, b_args, |relation, i, a, b| {
         let variance = variances.get(i).unwrap();
         relation.relate_with_variance(variance, VarianceDiagInfo::None, a, b)
-    });
-    // FIXME: We can probably try to reuse `a_args` here if it did not change.
-    cx.mk_args_from_iter(args)
+    })
+}
+
+/// Relates two arg lists element wise. Very often every element relates back
+/// to exactly its counterpart in `a_args`; in that case return `a_args`
+/// directly instead of hashing and interning an identical list, matching what
+/// `TypeFoldable` implementations for interned lists do.
+fn relate_args_reusing_unchanged<I: Interner, R: TypeRelation<I>>(
+    relation: &mut R,
+    a_args: I::GenericArgs,
+    b_args: I::GenericArgs,
+    mut relate_one: impl FnMut(
+        &mut R,
+        usize,
+        I::GenericArg,
+        I::GenericArg,
+    ) -> RelateResult<I, I::GenericArg>,
+) -> RelateResult<I, I::GenericArgs> {
+    let mut iter = iter::zip(a_args.iter(), b_args.iter()).enumerate();
+    while let Some((i, (a, b))) = iter.next() {
+        let related = relate_one(relation, i, a, b)?;
+        if related != a {
+            // An element changed: build the new list from the unchanged
+            // prefix of `a_args`, the changed element, and the rest.
+            let mut out = SmallVec::<[I::GenericArg; 8]>::with_capacity(a_args.len());
+            out.extend(a_args.iter().take(i));
+            out.push(related);
+            for (j, (a, b)) in iter {
+                out.push(relate_one(relation, j, a, b)?);
+            }
+            return Ok(relation.cx().mk_args(&out));
+        }
+    }
+    if a_args.len() > b_args.len() {
+        Ok(relation.cx().mk_args_from_iter(a_args.iter().take(b_args.len())))
+    } else {
+        Ok(a_args)
+    }
 }
 
 impl<I: Interner> Relate<I> for ty::FnSig<I> {
