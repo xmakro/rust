@@ -33,6 +33,16 @@ pub fn explicit_outlives_bounds<'tcx>(
 }
 
 impl<'tcx> InferCtxt<'tcx> {
+    pub fn has_pending_region_state(&self) -> bool {
+        let inner = self.inner.borrow();
+        !inner.region_obligations.is_empty()
+            || !inner.region_assumptions.is_empty()
+            || inner
+                .region_constraint_storage
+                .as_ref()
+                .is_none_or(|storage| !storage.data.is_empty())
+    }
+
     /// Process the region constraints and return any errors that
     /// result. After this, no more unification operations should be
     /// done -- or the compiler will panic -- but it is legal to use

@@ -689,16 +689,23 @@ impl<'a, 'tcx> Visitor<'tcx> for TypeChecker<'a, 'tcx> {
                 }
 
                 if !self.tcx().features().unsized_fn_params() {
-                    let trait_ref = ty::TraitRef::new(
-                        tcx,
-                        tcx.require_lang_item(LangItem::Sized, self.last_span),
-                        [place_ty],
-                    );
-                    self.prove_trait_ref(
-                        trait_ref,
-                        location.to_locations(),
-                        ConstraintCategory::SizedBound,
-                    );
+                    let sized = tcx.require_lang_item(LangItem::Sized, self.last_span);
+                    // Apply the type-op's trivial Sized path before interning its
+                    // trait reference and predicate. Preserve the full operation
+                    // when it has region state to collect or fast paths are disabled.
+                    let trivial = !self.infcx.next_trait_solver()
+                        && !self.infcx.disable_trait_solver_fast_paths()
+                        && !self.infcx.in_snapshot()
+                        && !self.infcx.has_pending_region_state()
+                        && place_ty.has_trivial_sizedness(tcx, ty::SizedTraitKind::Sized);
+                    if !trivial {
+                        let trait_ref = ty::TraitRef::new(tcx, sized, [place_ty]);
+                        self.prove_trait_ref(
+                            trait_ref,
+                            location.to_locations(),
+                            ConstraintCategory::SizedBound,
+                        );
+                    }
                 }
             }
             StatementKind::AscribeUserType((place, projection), variance) => {
