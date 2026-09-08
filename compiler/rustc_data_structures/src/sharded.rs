@@ -220,14 +220,14 @@ impl<K: Eq + Hash + Copy> ShardedHashMap<K, ()> {
         let hash = make_hash(value);
         let mut shard = self.lock_shard_by_hash(hash);
 
-        match table_entry(&mut shard, hash, value) {
-            Entry::Occupied(e) => e.get().0,
-            Entry::Vacant(e) => {
-                let v = make();
-                e.insert((v, ()));
-                v
-            }
+        // Most interning calls find an existing value. Avoid preparing an
+        // insertion (which can grow the table) until a lookup actually misses.
+        if let Some(&(interned, ())) = shard.find(hash, |(k, _)| k.borrow() == value) {
+            return interned;
         }
+        let interned = make();
+        shard.insert_unique(hash, (interned, ()), |(k, _)| make_hash(k));
+        interned
     }
 
     #[inline]
@@ -239,14 +239,14 @@ impl<K: Eq + Hash + Copy> ShardedHashMap<K, ()> {
         let hash = make_hash(&value);
         let mut shard = self.lock_shard_by_hash(hash);
 
-        match table_entry(&mut shard, hash, &value) {
-            Entry::Occupied(e) => e.get().0,
-            Entry::Vacant(e) => {
-                let v = make(value);
-                e.insert((v, ()));
-                v
-            }
+        // Most interning calls find an existing value. Avoid preparing an
+        // insertion (which can grow the table) until a lookup actually misses.
+        if let Some(&(interned, ())) = shard.find(hash, |(k, _)| k.borrow() == &value) {
+            return interned;
         }
+        let interned = make(value);
+        shard.insert_unique(hash, (interned, ()), |(k, _)| make_hash(k));
+        interned
     }
 }
 
