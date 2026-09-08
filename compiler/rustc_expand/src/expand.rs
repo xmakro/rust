@@ -571,17 +571,15 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
 
                     let (expanded_fragment, collected_invocations) =
                         self.collect_invocations(fragment, &derive_placeholders);
-                    // We choose to expand any derive invocations associated with this macro
-                    // invocation *before* any macro invocations collected from the output
-                    // fragment.
-                    derive_invocations.extend(collected_invocations);
-
                     progress = true;
                     if expanded_fragments.len() < depth {
                         expanded_fragments.push(Vec::new());
                     }
                     expanded_fragments[depth - 1].push((expn_id, expanded_fragment));
                     expanded_fragments_len += 1;
+                    // Push collected invocations first so derives are popped and expanded
+                    // before them, without combining both lists in an intermediate vector.
+                    invocations.extend(collected_invocations.into_iter().rev());
                     invocations.extend(derive_invocations.into_iter().rev());
                 }
                 ExpandResult::Retry(invoc) => {
