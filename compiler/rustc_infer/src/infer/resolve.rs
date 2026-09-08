@@ -42,7 +42,11 @@ impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for OpportunisticVarResolver<'a, 'tcx> {
             ty
         } else {
             let shallow = self.infcx.shallow_resolve(t);
-            let res = shallow.super_fold_with(self);
+            let res = if !shallow.has_non_region_infer() {
+                shallow
+            } else {
+                shallow.super_fold_with(self)
+            };
             assert!(self.cache.insert(t, res));
             res
         }
@@ -53,7 +57,7 @@ impl<'a, 'tcx> TypeFolder<TyCtxt<'tcx>> for OpportunisticVarResolver<'a, 'tcx> {
             ct // micro-optimize -- if there is nothing in this const that this fold affects...
         } else {
             let ct = self.infcx.shallow_resolve_const(ct);
-            ct.super_fold_with(self)
+            if !ct.has_non_region_infer() { ct } else { ct.super_fold_with(self) }
         }
     }
 
