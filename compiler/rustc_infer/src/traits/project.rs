@@ -190,13 +190,20 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
         match map.get(&key) {
             Some(ProjectionCacheEntry::NormalizedTerm { ty, complete: _ }) => {
                 info!("ProjectionCacheEntry::complete({:?}) - completing {:?}", key, ty);
-                let mut ty = ty.clone();
-                if result.must_apply_considering_regions() {
-                    ty.obligations = PredicateObligations::new();
-                }
+                // `Term` is `Copy`, so this ends the borrow of the existing entry.
+                let value = ty.value;
+                // Avoid cloning the obligations vector when it would be discarded.
+                let obligations = if result.must_apply_considering_regions() {
+                    PredicateObligations::new()
+                } else {
+                    ty.obligations.clone()
+                };
                 map.insert(
                     key,
-                    ProjectionCacheEntry::NormalizedTerm { ty, complete: Some(result) },
+                    ProjectionCacheEntry::NormalizedTerm {
+                        ty: Normalized { value, obligations },
+                        complete: Some(result),
+                    },
                 );
             }
             ref value => {
