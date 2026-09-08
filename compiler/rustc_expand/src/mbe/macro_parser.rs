@@ -722,14 +722,17 @@ impl TtParser {
         ErrorReported(guarantee)
     }
 
-    fn nameize<I: Iterator<Item = NamedMatch>>(
+    fn nameize<I: ExactSizeIterator<Item = NamedMatch>>(
         &self,
         matcher: &[MatcherLoc],
         mut res: I,
     ) -> NamedMatches {
         // Make that each metavar has _exactly one_ binding. If so, insert the binding into the
         // `NamedParseResult`. Otherwise, it's an error.
-        let mut ret_val = FxHashMap::default();
+        if res.len() == 0 {
+            return FxHashMap::default();
+        }
+        let mut ret_val = FxHashMap::with_capacity_and_hasher(res.len(), Default::default());
         for loc in matcher {
             if let &MatcherLoc::MetaVarDecl { bind, .. } = loc
                 && ret_val
