@@ -281,6 +281,36 @@ impl Span {
         }
     }
 
+    /// Returns a `Span` that would enclose both `self` and `end`.
+    ///
+    /// Note that this can also be used to extend the span "backwards":
+    /// `start.to(end)` and `end.to(start)` return the same `Span`.
+    ///
+    /// ```text
+    ///     ____             ___
+    ///     self lorem ipsum end
+    ///     ^^^^^^^^^^^^^^^^^^^^
+    /// ```
+    #[inline]
+    pub fn to(self, end: Span) -> Span {
+        // Inline-context spans have no parent dependency to record.
+        if u32::from(self.len_with_tag_or_marker) <= MAX_LEN
+            && u32::from(end.len_with_tag_or_marker) <= MAX_LEN
+            && self.ctxt_or_parent_or_marker == end.ctxt_or_parent_or_marker
+        {
+            let lo = self.lo_or_index.min(end.lo_or_index);
+            let hi = self
+                .lo_or_index
+                .debug_strict_add(u32::from(self.len_with_tag_or_marker))
+                .max(end.lo_or_index.debug_strict_add(u32::from(end.len_with_tag_or_marker)));
+            let len = hi - lo;
+            if len <= MAX_LEN {
+                return InlineCtxt::span(lo, len as u16, self.ctxt_or_parent_or_marker);
+            }
+        }
+        self.to_general(end)
+    }
+
     #[inline]
     pub fn data(self) -> SpanData {
         let data = self.data_untracked();

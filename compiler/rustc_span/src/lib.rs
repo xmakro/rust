@@ -1173,17 +1173,7 @@ impl Span {
         }
     }
 
-    /// Returns a `Span` that would enclose both `self` and `end`.
-    ///
-    /// Note that this can also be used to extend the span "backwards":
-    /// `start.to(end)` and `end.to(start)` return the same `Span`.
-    ///
-    /// ```text
-    ///     ____             ___
-    ///     self lorem ipsum end
-    ///     ^^^^^^^^^^^^^^^^^^^^
-    /// ```
-    pub fn to(self, end: Span) -> Span {
+    fn to_general(self, end: Span) -> Span {
         match Span::prepare_to_combine(self, end) {
             Ok((from, to, parent)) => {
                 Span::new(cmp::min(from.lo, to.lo), cmp::max(from.hi, to.hi), from.ctxt, parent)
