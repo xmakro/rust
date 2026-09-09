@@ -115,8 +115,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         match def_id.as_local() {
             Some(local_def_id) => self.local_module_map.get(&local_def_id).map(|m| m.to_module()),
             None => {
-                if let module @ Some(..) = self.extern_module_map.borrow().get(&def_id) {
-                    return module.map(|m| m.to_module());
+                if let Some(module) = self.extern_module_map.borrow().get(&def_id) {
+                    return module.map(ExternModule::to_module);
                 }
                 // We need the lock on the extern_module_map for the entire duration of this call.
                 // It is otherwise entirely possible 2 different threads will create and allocate
@@ -135,10 +135,10 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     fn get_extern_module_with_lock(
         &self,
         def_id: DefId,
-        map_lock: &mut RefMut<'_, FxIndexMap<DefId, ExternModule<'ra>>>,
+        map_lock: &mut RefMut<'_, FxIndexMap<DefId, Option<ExternModule<'ra>>>>,
     ) -> Option<ExternModule<'ra>> {
-        if let module @ Some(..) = map_lock.get(&def_id) {
-            return module.copied();
+        if let Some(module) = map_lock.get(&def_id) {
+            return *module;
         }
         // Query `def_kind` is not used because query system overhead is too expensive here.
         let def_kind = self.cstore().def_kind_untracked(def_id);
@@ -164,10 +164,11 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 parent.is_some_and(|module| module.no_implicit_prelude),
                 self.arenas,
             );
-            map_lock.insert(def_id, module);
+            map_lock.insert(def_id, Some(module));
             return Some(module);
         }
 
+        map_lock.insert(def_id, None);
         None
     }
 
