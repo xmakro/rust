@@ -1406,8 +1406,9 @@ pub struct Resolver<'ra, 'tcx> {
     local_modules: Vec<LocalModule<'ra>>,
     /// Eagerly populated map of all local non-block modules.
     local_module_map: FxIndexMap<LocalDefId, LocalModule<'ra>>,
-    /// Lazily populated cache of modules loaded from external crates.
-    extern_module_map: CacheRefCell<FxIndexMap<DefId, ExternModule<'ra>>>,
+    /// Lazily populated cache of modules loaded from external crates. `None` records an
+    /// immutable external definition that is not a module.
+    extern_module_map: CacheRefCell<FxIndexMap<DefId, Option<ExternModule<'ra>>>>,
 
     /// Maps glob imports to the names of items actually imported.
     glob_map: FxIndexMap<LocalDefId, FxIndexSet<Symbol>>,
