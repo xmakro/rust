@@ -1422,7 +1422,6 @@ impl<'tcx> ThirBuildCx<'tcx> {
     }
 
     fn convert_path_expr(&mut self, expr: &'tcx hir::Expr<'tcx>, res: Res) -> ExprKind<'tcx> {
-        let args = self.typeck_results.node_args(expr.hir_id);
         match res {
             // A regular function, constructor function or a constant.
             Res::Def(DefKind::Fn, _)
@@ -1450,6 +1449,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
 
             Res::Def(DefKind::Const, def_id) | Res::Def(DefKind::AssocConst, def_id) => {
                 let user_ty = self.user_args_applied_to_res(expr.hir_id, res);
+                let args = self.typeck_results.node_args(expr.hir_id);
                 ExprKind::NamedConst { def_id, args, user_ty }
             }
 
@@ -1675,8 +1675,8 @@ impl<'tcx> ThirBuildCx<'tcx> {
     }
 
     fn is_upvar(&mut self, var_hir_id: hir::HirId) -> bool {
-        self.tcx
-            .upvars_mentioned(self.body_owner)
+        self.upvars_mentioned
+            .get_or_insert_with(|| self.tcx.upvars_mentioned(self.body_owner))
             .is_some_and(|upvars| upvars.contains_key(&var_hir_id))
     }
 
