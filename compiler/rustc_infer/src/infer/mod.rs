@@ -1247,68 +1247,67 @@ impl<'tcx> InferCtxt<'tcx> {
         }
     }
 
+    #[inline]
     pub fn shallow_resolve(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if let ty::Infer(v) = *ty.kind() {
-            match v {
-                ty::TyVar(v) => {
-                    // Not entirely obvious: if `typ` is a type variable,
-                    // it can be resolved to an int/float variable, which
-                    // can then be recursively resolved, hence the
-                    // recursion. Note though that we prevent type
-                    // variables from unifying to other type variables
-                    // directly (though they may be embedded
-                    // structurally), and we prevent cycles in any case,
-                    // so this recursion should always be of very limited
-                    // depth.
-                    //
-                    // Note: if these two lines are combined into one we get
-                    // dynamic borrow errors on `self.inner`.
-                    let (root_vid, value) =
-                        self.inner.borrow_mut().type_variables().probe_with_root_vid(v);
-                    value.known().map_or_else(
-                        || if root_vid == v { ty } else { Ty::new_var(self.tcx, root_vid) },
-                        |t| self.shallow_resolve(t),
-                    )
-                }
+        if let ty::Infer(v) = *ty.kind() { self.shallow_resolve_infer(ty, v) } else { ty }
+    }
 
-                ty::IntVar(v) => {
-                    let (root, value) =
-                        self.inner.borrow_mut().int_unification_table().inlined_probe_key_value(v);
-                    match value {
-                        ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
-                        ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
-                        ty::IntVarValue::Unknown => {
-                            if root == v {
-                                ty
-                            } else {
-                                Ty::new_int_var(self.tcx, root)
-                            }
-                        }
-                    }
-                }
-
-                ty::FloatVar(v) => {
-                    let (root, value) = self
-                        .inner
-                        .borrow_mut()
-                        .float_unification_table()
-                        .inlined_probe_key_value(v);
-                    match value {
-                        ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
-                        ty::FloatVarValue::Unknown => {
-                            if root == v {
-                                ty
-                            } else {
-                                Ty::new_float_var(self.tcx, root)
-                            }
-                        }
-                    }
-                }
-
-                ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => ty,
+    #[inline(never)]
+    fn shallow_resolve_infer(&self, ty: Ty<'tcx>, v: ty::InferTy) -> Ty<'tcx> {
+        match v {
+            ty::TyVar(v) => {
+                // Not entirely obvious: if `typ` is a type variable,
+                // it can be resolved to an int/float variable, which
+                // can then be recursively resolved, hence the
+                // recursion. Note though that we prevent type
+                // variables from unifying to other type variables
+                // directly (though they may be embedded
+                // structurally), and we prevent cycles in any case,
+                // so this recursion should always be of very limited
+                // depth.
+                //
+                // Note: if these two lines are combined into one we get
+                // dynamic borrow errors on `self.inner`.
+                let (root_vid, value) =
+                    self.inner.borrow_mut().type_variables().probe_with_root_vid(v);
+                value.known().map_or_else(
+                    || if root_vid == v { ty } else { Ty::new_var(self.tcx, root_vid) },
+                    |t| self.shallow_resolve(t),
+                )
             }
-        } else {
-            ty
+
+            ty::IntVar(v) => {
+                let (root, value) =
+                    self.inner.borrow_mut().int_unification_table().inlined_probe_key_value(v);
+                match value {
+                    ty::IntVarValue::IntType(ty) => Ty::new_int(self.tcx, ty),
+                    ty::IntVarValue::UintType(ty) => Ty::new_uint(self.tcx, ty),
+                    ty::IntVarValue::Unknown => {
+                        if root == v {
+                            ty
+                        } else {
+                            Ty::new_int_var(self.tcx, root)
+                        }
+                    }
+                }
+            }
+
+            ty::FloatVar(v) => {
+                let (root, value) =
+                    self.inner.borrow_mut().float_unification_table().inlined_probe_key_value(v);
+                match value {
+                    ty::FloatVarValue::Known(ty) => Ty::new_float(self.tcx, ty),
+                    ty::FloatVarValue::Unknown => {
+                        if root == v {
+                            ty
+                        } else {
+                            Ty::new_float_var(self.tcx, root)
+                        }
+                    }
+                }
+            }
+
+            ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_) => ty,
         }
     }
 
