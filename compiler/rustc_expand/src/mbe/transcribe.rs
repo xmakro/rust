@@ -198,7 +198,7 @@ pub(super) fn transcribe<'a>(
             src_span,
             DelimSpacing::new(Spacing::Alone, Spacing::Alone)
         )],
-        result: Vec::new(),
+        result: Vec::with_capacity(src.tts.len()),
         result_stack: Vec::new(),
     };
 
@@ -283,7 +283,8 @@ pub(super) fn transcribe<'a>(
                 tscx.marker.mark_span(&mut span.open);
                 tscx.marker.mark_span(&mut span.close);
                 tscx.stack.push(Frame::new_delimited(delimited, span, *spacing));
-                tscx.result_stack.push(mem::take(&mut tscx.result));
+                tscx.result_stack
+                    .push(mem::replace(&mut tscx.result, Vec::with_capacity(delimited.tts.len())));
             }
 
             // Nothing much to do here. Just push the token to the result, being careful to
