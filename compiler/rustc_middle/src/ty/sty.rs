@@ -1963,6 +1963,7 @@ impl<'tcx> Ty<'tcx> {
     /// such a bound obviously never can be called, but that doesn't mean it shouldn't typecheck.
     /// This is why this method doesn't return `Option<bool>`.
     #[instrument(skip(tcx), level = "debug")]
+    #[inline]
     pub fn has_trivial_sizedness(self, tcx: TyCtxt<'tcx>, sizedness: SizedTraitKind) -> bool {
         match self.kind() {
             ty::Infer(ty::IntVar(_) | ty::FloatVar(_))
@@ -1994,11 +1995,7 @@ impl<'tcx> Ty<'tcx> {
                 SizedTraitKind::Sized | SizedTraitKind::MetaSized => false,
             },
 
-            ty::Tuple(tys) => tys.last().is_none_or(|ty| ty.has_trivial_sizedness(tcx, sizedness)),
-
-            ty::Adt(def, args) => def.sizedness_constraint(tcx, sizedness).is_none_or(|ty| {
-                ty.instantiate(tcx, args).skip_norm_wip().has_trivial_sizedness(tcx, sizedness)
-            }),
+            ty::Tuple(..) | ty::Adt(..) => self.has_aggregate_sizedness(tcx, sizedness),
 
             ty::Alias(..) | ty::Param(_) | ty::Placeholder(..) | ty::Bound(..) => false,
 
@@ -2007,6 +2004,17 @@ impl<'tcx> Ty<'tcx> {
             ty::Infer(ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)) => {
                 bug!("`has_trivial_sizedness` applied to unexpected type: {:?}", self)
             }
+        }
+    }
+
+    #[inline(never)]
+    fn has_aggregate_sizedness(self, tcx: TyCtxt<'tcx>, sizedness: SizedTraitKind) -> bool {
+        match self.kind() {
+            ty::Tuple(tys) => tys.last().is_none_or(|ty| ty.has_trivial_sizedness(tcx, sizedness)),
+            ty::Adt(def, args) => def.sizedness_constraint(tcx, sizedness).is_none_or(|ty| {
+                ty.instantiate(tcx, args).skip_norm_wip().has_trivial_sizedness(tcx, sizedness)
+            }),
+            _ => unreachable!(),
         }
     }
 
