@@ -52,10 +52,10 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // Take the fast path out - this also improves
             // performance by preventing assemble_candidates_from_impls from
             // matching every impl for this trait.
-            return Ok(SelectionCandidateSet { vec: vec![], ambiguous: true });
+            return Ok(SelectionCandidateSet { vec: Default::default(), ambiguous: true });
         }
 
-        let mut candidates = SelectionCandidateSet { vec: Vec::new(), ambiguous: false };
+        let mut candidates = SelectionCandidateSet { vec: Default::default(), ambiguous: false };
 
         // Negative trait predicates have different rules than positive trait predicates.
         if obligation.polarity() == ty::ClausePolarity::Negative {

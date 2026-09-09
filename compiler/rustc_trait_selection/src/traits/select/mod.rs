@@ -31,6 +31,7 @@ use rustc_middle::ty::{
     Unnormalized, Upcast, elaborate, may_use_unstable_feature,
 };
 use rustc_next_trait_solver::solve::AliasBoundKind;
+use smallvec::SmallVec;
 use tracing::{debug, instrument, trace};
 
 use self::EvaluationResult::*;
@@ -171,7 +172,7 @@ struct TraitObligationStack<'prev, 'tcx> {
 struct SelectionCandidateSet<'tcx> {
     /// A list of candidates that definitely apply to the current
     /// obligation (meaning: types unify).
-    vec: Vec<SelectionCandidate<'tcx>>,
+    vec: SmallVec<[SelectionCandidate<'tcx>; 1]>,
 
     /// If `true`, then there were candidates that might or might
     /// not have applied, but we couldn't tell. This occurs when some
@@ -1407,14 +1408,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
     #[instrument(level = "debug", skip(self, candidates))]
     fn filter_impls(
         &mut self,
-        mut candidates: Vec<SelectionCandidate<'tcx>>,
+        mut candidates: SmallVec<[SelectionCandidate<'tcx>; 1]>,
         obligation: &PolyTraitObligation<'tcx>,
-    ) -> Vec<SelectionCandidate<'tcx>> {
+    ) -> SmallVec<[SelectionCandidate<'tcx>; 1]> {
         trace!("{candidates:#?}");
         let tcx = self.tcx();
 
         candidates.retain(|candidate| {
-            if let &ImplCandidate(def_id) = candidate {
+            if let ImplCandidate(def_id) = *candidate {
                 match (tcx.impl_polarity(def_id), obligation.polarity()) {
                     (ty::ImplPolarity::Positive, ty::ClausePolarity::Positive)
                     | (ty::ImplPolarity::Negative, ty::ClausePolarity::Negative) => true,
