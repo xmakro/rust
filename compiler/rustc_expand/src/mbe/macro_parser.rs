@@ -481,9 +481,9 @@ impl TtParser {
             return Some(Failure);
         }
 
-        // Dump all possible `next_mps` into `cur_mps` for the next iteration. Then
-        // process the next token.
-        self.cur_mps.append(&mut self.next_mps);
+        // `cur_mps` is empty after processing this token. Reuse both buffers
+        // without moving every next position into the current buffer.
+        std::mem::swap(&mut self.cur_mps, &mut self.next_mps);
         parser.to_mut().bump();
 
         None
