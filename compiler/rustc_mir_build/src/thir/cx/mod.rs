@@ -2,6 +2,7 @@
 //! structures into the THIR. The `builder` is generally ignorant of the tcx,
 //! etc., and instead goes through the `Cx` for most of its work.
 
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::steal::Steal;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::attrs::lang_items::LangItem;
@@ -71,6 +72,9 @@ pub(crate) struct ThirBuildCx<'tcx> {
 
     /// The `DefId` of the owner of this body.
     body_owner: DefId,
+
+    /// Initialized on the first variable reference, then reused for this body.
+    upvars_mentioned: Option<Option<&'tcx FxIndexMap<hir::HirId, hir::Upvar>>>,
 }
 
 impl<'tcx> ThirBuildCx<'tcx> {
@@ -109,6 +113,7 @@ impl<'tcx> ThirBuildCx<'tcx> {
             typing_env: ty::TypingEnv::post_typeck_until_borrowck_for_mir_build(tcx, def),
             typeck_results,
             body_owner: def.to_def_id(),
+            upvars_mentioned: None,
             apply_adjustments: !find_attr!(tcx, hir_id, CustomMir(..)),
         }
     }
