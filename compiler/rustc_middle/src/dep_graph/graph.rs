@@ -62,7 +62,38 @@ pub struct DepGraph {
     /// non-incremental mode. Even in non-incremental mode we make sure that
     /// each task has a `DepNodeIndex` that uniquely identifies it. This unique
     /// ID is used for self-profiling.
-    virtual_dep_node_index: Arc<AtomicU32>,
+    virtual_dep_node_index: Arc<VirtualDepNodeIndex>,
+}
+
+// Standard sharing is forbidden: parallel access needs the compiler's FromDyn
+// proof, and its thread-safety mode cannot change after initialization.
+struct VirtualDepNodeIndex {
+    value: AtomicU32,
+    parallel: bool,
+}
+
+impl !Sync for VirtualDepNodeIndex {}
+
+impl VirtualDepNodeIndex {
+    fn new() -> Self {
+        Self {
+            value: AtomicU32::new(0),
+            parallel: rustc_data_structures::sync::is_dyn_thread_safe(),
+        }
+    }
+
+    #[inline]
+    fn next(&self) -> u32 {
+        if self.parallel {
+            self.value.fetch_add(1, Ordering::Relaxed)
+        } else {
+            // No other thread can access this counter, and no calls between
+            // the load and store can reenter it. Preserve fetch_add's wrapping.
+            let index = self.value.load(Ordering::Relaxed);
+            self.value.store(index.wrapping_add(1), Ordering::Relaxed);
+            index
+        }
+    }
 }
 
 rustc_index::newtype_index! {
@@ -219,12 +250,12 @@ impl DepGraph {
                 green_edge_buf: WorkerLocal::default(),
                 read_recorder_pool: Lock::new(Vec::new()),
             })),
-            virtual_dep_node_index: Arc::new(AtomicU32::new(0)),
+            virtual_dep_node_index: Arc::new(VirtualDepNodeIndex::new()),
         }
     }
 
     pub fn new_disabled() -> DepGraph {
-        DepGraph { data: None, virtual_dep_node_index: Arc::new(AtomicU32::new(0)) }
+        DepGraph { data: None, virtual_dep_node_index: Arc::new(VirtualDepNodeIndex::new()) }
     }
 
     #[inline]
@@ -1096,7 +1127,7 @@ impl DepGraph {
 
     pub fn next_virtual_depnode_index(&self) -> DepNodeIndex {
         debug_assert!(self.data.is_none());
-        let index = self.virtual_dep_node_index.fetch_add(1, Ordering::Relaxed);
+        let index = self.virtual_dep_node_index.next();
         DepNodeIndex::from_u32(index)
     }
 }
