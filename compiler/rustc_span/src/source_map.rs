@@ -11,6 +11,7 @@
 
 use std::fs::File;
 use std::io::{self, BorrowedBuf, Read};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{fs, path};
 
 use rustc_data_structures::sync::{IntoDynSyncSend, MappedReadGuard, ReadGuard, RwLock};
@@ -196,6 +197,7 @@ pub struct SourceMapInputs {
 
 pub struct SourceMap {
     files: RwLock<SourceMapFiles>,
+    recent_file_index: AtomicUsize,
     file_loader: IntoDynSyncSend<Box<dyn FileLoader + Sync + Send>>,
 
     // This is used to apply the file path remapping as specified via
@@ -219,6 +221,7 @@ impl std::fmt::Debug for SourceMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let SourceMap {
             files,
+            recent_file_index: _,
             file_loader,
             path_mapping,
             working_dir,
@@ -257,6 +260,7 @@ impl SourceMap {
         debug!(?working_dir);
         SourceMap {
             files: Default::default(),
+            recent_file_index: AtomicUsize::new(usize::MAX),
             working_dir,
             file_loader: IntoDynSyncSend(file_loader),
             path_mapping,
@@ -1086,7 +1090,16 @@ impl SourceMap {
     /// This index is guaranteed to be valid for the lifetime of this `SourceMap`,
     /// since `source_files` is a `MonotonicVec`
     pub fn lookup_source_file_idx(&self, pos: BytePos) -> usize {
-        self.files.borrow().source_files.partition_point(|x| x.start_pos <= pos) - 1
+        let files = self.files.borrow();
+        let recent = self.recent_file_index.load(Ordering::Relaxed);
+        // Files are append-only and their inclusive position ranges never overlap.
+        // The hint carries no synchronization: validate it against the borrowed table.
+        if files.source_files.get(recent).is_some_and(|file| file.contains(pos)) {
+            return recent;
+        }
+        let index = files.source_files.partition_point(|x| x.start_pos <= pos) - 1;
+        self.recent_file_index.store(index, Ordering::Relaxed);
+        index
     }
 
     pub fn count_lines(&self) -> usize {
