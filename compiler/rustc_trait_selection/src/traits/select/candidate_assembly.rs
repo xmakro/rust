@@ -217,8 +217,19 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
             // normalization, so try to deduplicate when possible to avoid
             // unnecessary ambiguity.
             let mut distinct_normalized_bounds = FxHashSet::default();
+            // Sizedness candidates are only lazily elaborated for `MetaSized`
+            // obligations, so check the obligation once instead of per bound.
+            let obligation_is_metasized =
+                self.tcx().is_lang_item(obligation.predicate.def_id(), LangItem::MetaSized);
             let _ = self.for_each_item_bound::<!>(
                 placeholder_trait_predicate.self_ty(),
+                |bound, _| {
+                    bound.as_trait_clause().is_some_and(|bound| {
+                        bound.polarity() == placeholder_trait_predicate.polarity
+                            && (obligation_is_metasized
+                                || bound.def_id() == placeholder_trait_predicate.def_id())
+                    })
+                },
                 |selcx, bound, idx, alias_bound_kind| {
                     let Some(bound) = bound.as_trait_clause() else {
                         return ControlFlow::Continue(());

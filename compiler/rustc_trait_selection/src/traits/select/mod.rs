@@ -1604,6 +1604,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
     pub(super) fn for_each_item_bound<T>(
         &mut self,
         mut self_ty: Ty<'tcx>,
+        mut filter: impl FnMut(ty::Clause<'tcx>, usize) -> bool,
         mut for_each: impl FnMut(
             &mut Self,
             ty::Clause<'tcx>,
@@ -1641,8 +1642,14 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
                 self.tcx().item_self_bounds(def_id)
             };
 
-            for bound in relevant_bounds.instantiate(self.tcx(), alias_ty.args).skip_norm_wip() {
-                for_each(self, bound, idx, alias_bound_kind)?;
+            // Inspect only parameter-independent data in the uninstantiated clause.
+            // Keep the original index even for skipped clauses: selection stores it
+            // and confirmation must retrieve the same bound later.
+            for bound in relevant_bounds.transpose_iter() {
+                if filter(bound.skip_binder(), idx) {
+                    let bound = bound.instantiate(self.tcx(), alias_ty.args).skip_norm_wip();
+                    for_each(self, bound, idx, alias_bound_kind)?;
+                }
                 idx += 1;
             }
 
