@@ -31,6 +31,7 @@ use diagnostics::{ParamKindInEnumDiscriminant, ParamKindInNonTrivialAnonConst};
 use effective_visibilities::EffectiveVisibilitiesVisitor;
 use hygiene::Macros20NormalizedSyntaxContext;
 use imports::{Import, ImportData, ImportKind, NameResolution, PendingDecl};
+use itertools::Itertools;
 use late::{
     ConstantRequiresType, ForwardGenericParamBanReason, HasGenericParams, PathSource,
     PatternSource, UnnecessaryQualification,
@@ -663,6 +664,11 @@ impl<'ra> Resolutions<'ra> {
     }
 }
 
+struct ExternalTraitsByItem {
+    by_item: FxHashMap<(Symbol, Namespace), Vec<usize>>,
+    aliases: Vec<usize>,
+}
+
 /// One node in the tree of modules.
 ///
 /// Note that a "module" in resolve is broader than a `mod` that you declare in Rust code. It may be one of these:
@@ -699,6 +705,8 @@ struct ModuleData<'ra> {
     traits: CmRefCell<
         Option<Box<[(Symbol, Decl<'ra>, Option<Module<'ra>>, bool /* lint ambiguous */)]>>,
     >,
+
+    external_traits_by_item: OnceLock<ExternalTraitsByItem>,
 
     /// Span of the module itself. Used for error reporting.
     span: Span,
@@ -754,6 +762,7 @@ impl<'ra> ModuleData<'ra> {
             glob_importers: CmRefCell::new(Vec::new()),
             globs: CmRefCell::new(Vec::new()),
             traits: CmRefCell::new(None),
+            external_traits_by_item: OnceLock::new(),
             span,
             expansion,
             self_decl,
@@ -2146,6 +2155,42 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
     ) {
         module.ensure_traits(self);
         let traits = module.traits.borrow(self);
+        if !module.is_local()
+            && let Some(assoc_item) = assoc_item
+        {
+            let traits = traits.as_ref().unwrap();
+            // Both the module's trait list and the external trait tables are immutable.
+            // Index positions retain the original candidate order, including aliases.
+            let index = module.external_traits_by_item.get_or_init(|| {
+                let mut by_item: FxHashMap<_, Vec<usize>> = FxHashMap::default();
+                let mut aliases = Vec::new();
+                for (i, &(_, binding, trait_module, _)) in traits.iter().enumerate() {
+                    debug_assert!(matches!(binding.kind, DeclKind::Def(_)));
+                    if let Some(trait_module) = trait_module {
+                        let names: FxHashSet<_> = self
+                            .resolutions(trait_module)
+                            .keys()
+                            .map(|key| (key.ident.name, key.ns))
+                            .collect();
+                        for name in names {
+                            by_item.entry(name).or_default().push(i);
+                        }
+                    } else {
+                        aliases.push(i);
+                    }
+                }
+                ExternalTraitsByItem { by_item, aliases }
+            });
+            for &i in index.by_item.get(&assoc_item).into_flat_iter().merge(index.aliases.iter()) {
+                let (_, binding, _, lint_ambiguous) = traits[i];
+                found_traits.push(TraitCandidate {
+                    def_id: binding.res().def_id(),
+                    import_ids: &[],
+                    lint_ambiguous,
+                });
+            }
+            return;
+        }
         for &(trait_name, trait_binding, trait_module, lint_ambiguous) in
             traits.as_ref().unwrap().iter()
         {
