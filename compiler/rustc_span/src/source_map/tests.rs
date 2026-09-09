@@ -797,3 +797,20 @@ fn read_binary_file_handles_lying_stat() {
     let bin = RealFileLoader.read_binary_file(kernel_max).unwrap();
     assert_eq!(&real[..], &bin[..]);
 }
+
+#[test]
+fn lookup_source_file_hint_matches_search_after_append() {
+    create_default_session_globals_then(|| {
+        let sm = init_source_map();
+        for extra in ["", "aé\nb", "last"] {
+            let end = sm.files().last().unwrap().end_position().0;
+            for pos in (0..=end + 4).chain((0..=end + 4).rev()) {
+                let pos = BytePos(pos);
+                let expected = sm.files().partition_point(|file| file.start_pos <= pos) - 1;
+                assert_eq!(sm.lookup_source_file_idx(pos), expected);
+                assert_eq!(sm.lookup_source_file_idx(pos), expected);
+            }
+            sm.new_source_file(filename(&sm, &format!("extra-{end}.rs")), extra.into());
+        }
+    });
+}
