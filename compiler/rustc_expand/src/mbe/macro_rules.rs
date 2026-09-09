@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{mem, slice};
 
 use ast::token::IdentIsRaw;
@@ -32,7 +32,7 @@ use tracing::{debug, instrument, trace, trace_span};
 
 use super::SequenceRepetition;
 use super::diagnostics::{FailedMacro, failed_to_match_macro};
-use super::macro_parser::{NamedMatches, NamedParseResult};
+use super::macro_parser::{NamedMatches, NamedParseResult, token_name_eq};
 use crate::base::{
     AttrProcMacro, BangProcMacro, DummyResult, ExpandResult, ExtCtxt, MacResult,
     MacroExpanderResult, SyntaxExtension, SyntaxExtensionKind, TTMacroExpander,
@@ -199,7 +199,66 @@ pub struct MacroRulesMacroExpander {
     transparency: Transparency,
     kinds: MacroKinds,
     rules: Vec<MacroRule>,
+    rule_index: OnceLock<Box<RuleIndex>>,
     macro_rules: bool,
+}
+
+/// First-token pruning for larger function-style macros. Lists retain original arm order.
+#[derive(Default, Debug)]
+pub(super) struct RuleIndex {
+    by_first: FxHashMap<TokenKind, Vec<usize>>,
+    fallback: Vec<usize>,
+}
+
+impl RuleIndex {
+    fn token_key(token: &Token) -> Option<TokenKind> {
+        if let Some((ident, raw)) = token.ident() {
+            Some(TokenKind::Ident(ident.name, raw))
+        } else if let Some((ident, raw)) = token.lifetime() {
+            Some(TokenKind::Lifetime(ident.name, raw))
+        } else if matches!(token.kind, OpenInvisible(_) | CloseInvisible(_)) {
+            None
+        } else {
+            Some(token.kind)
+        }
+    }
+
+    fn new(rules: &[MacroRule]) -> Self {
+        let mut index = Self::default();
+        for (i, rule) in rules.iter().enumerate() {
+            let MacroRule::Func { lhs, .. } = rule else { continue };
+            if let Some(MatcherLoc::Token { token }) = lhs.first()
+                && !matches!(token.kind, DocComment(..))
+                && let Some(key) = Self::token_key(token)
+            {
+                index.by_first.entry(key).or_default().push(i);
+            } else {
+                // Metavariables, repetitions, ignored doc comments and delimiters retain
+                // the original matcher, including ambiguity and feature-gating behavior.
+                index.fallback.push(i);
+            }
+        }
+        index
+    }
+
+    fn candidates(&self, token: &Token) -> impl Iterator<Item = usize> {
+        let mut matching = Self::token_key(token)
+            .and_then(|key| self.by_first.get(&key))
+            .map_or(&[][..], Vec::as_slice);
+        let mut fallback = self.fallback.as_slice();
+        std::iter::from_fn(move || {
+            let next = match (matching.first(), fallback.first()) {
+                (Some(a), Some(b)) if a < b => &mut matching,
+                (Some(_), Some(_)) => &mut fallback,
+                (Some(_), None) => &mut matching,
+                (None, Some(_)) => &mut fallback,
+                (None, None) => return None,
+            };
+            let i = next[0];
+            *next = &next[1..];
+            Some(i)
+        })
+    }
 }
 
 impl MacroRulesMacroExpander {
@@ -303,6 +362,9 @@ impl TTMacroExpander for MacroRulesMacroExpander {
             self.transparency,
             input,
             &self.rules,
+            (self.rules.len() >= 8).then(|| {
+                self.rule_index.get_or_init(|| Box::new(RuleIndex::new(&self.rules))).as_ref()
+            }),
             self.on_unmatched_args.as_ref(),
         ))
     }
@@ -362,6 +424,9 @@ fn trace_macros_note(cx_expansions: &mut FxIndexMap<Span, Vec<String>>, sp: Span
 }
 
 pub(super) trait Tracker<'matcher> {
+    /// Diagnostic trackers need every failure callback, even for an immediate mismatch.
+    const TRACK_FAILURES: bool = true;
+
     /// Provide context on the arm that's about to be matched.
     fn prepare(&mut self, which_matcher: WhichMatcher, matcher: &'matcher [MatcherLoc]);
 
@@ -405,6 +470,8 @@ pub(super) trait Tracker<'matcher> {
 pub(super) struct NoopTracker;
 
 impl<'matcher> Tracker<'matcher> for NoopTracker {
+    const TRACK_FAILURES: bool = false;
+
     fn prepare(&mut self, _which_matcher: WhichMatcher, _matcher: &'matcher [MatcherLoc]) {}
 
     fn before_match_loc(&mut self, _parser: &TtParser, _matcher: &'matcher MatcherLoc) {}
@@ -427,7 +494,7 @@ impl<'matcher> Tracker<'matcher> for NoopTracker {
 }
 
 /// Expands the rules based macro defined by `rules` for a given input `arg`.
-#[instrument(skip(cx, transparency, arg, rules, on_unmatched_args))]
+#[instrument(skip(cx, transparency, arg, rules, rule_index, on_unmatched_args))]
 fn expand_macro<'cx, 'a: 'cx>(
     cx: &'cx mut ExtCtxt<'_>,
     sp: Span,
@@ -437,6 +504,7 @@ fn expand_macro<'cx, 'a: 'cx>(
     transparency: Transparency,
     arg: TokenStream,
     rules: &'a [MacroRule],
+    rule_index: Option<&RuleIndex>,
     on_unmatched_args: Option<&Directive>,
 ) -> Box<dyn MacResult + 'cx> {
     let psess = &cx.sess.psess;
@@ -447,7 +515,8 @@ fn expand_macro<'cx, 'a: 'cx>(
     }
 
     // Track nothing for the best performance.
-    let try_success_result = try_match_macro(psess, name, &arg, rules, &mut NoopTracker);
+    let try_success_result =
+        try_match_macro(psess, name, &arg, rules, rule_index, &mut NoopTracker);
 
     match try_success_result {
         Ok((rule_index, rule, named_matches)) => {
@@ -609,6 +678,7 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     name: Ident,
     arg: &TokenStream,
     rules: &'matcher [MacroRule],
+    rule_index: Option<&RuleIndex>,
     track: &mut T,
 ) -> Result<(usize, &'matcher MacroRule, NamedMatches), CanRetry> {
     // We create a base parser that can be used for the "black box" parts.
@@ -633,7 +703,15 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     let parser = parser_from_cx(psess, arg.clone(), T::recovery());
     // Try each arm's matchers.
     let mut tt_parser = TtParser::new();
-    for (i, rule) in rules.iter().enumerate() {
+    let mut all_rules = 0..rules.len();
+    let mut indexed_rules =
+        rule_index.filter(|_| !T::TRACK_FAILURES).map(|index| index.candidates(&parser.token));
+    let rule_indices = std::iter::from_fn(|| match &mut indexed_rules {
+        Some(indices) => indices.next(),
+        None => all_rules.next(),
+    });
+    for i in rule_indices {
+        let rule = &rules[i];
         let MacroRule::Func { lhs, .. } = rule else { continue };
         let _tracing_span = trace_span!("Matching arm", %i);
 
@@ -943,6 +1021,7 @@ pub fn compile_declarative_macro(
         on_unmatched_args,
         transparency,
         rules,
+        rule_index: OnceLock::new(),
         macro_rules,
     };
     mk_syn_ext(SyntaxExtensionKind::MacroRules(Arc::new(exp)))
@@ -1870,4 +1949,64 @@ pub(super) fn parser_from_cx(
 ) -> Parser<'_> {
     tts.desugar_doc_comments();
     Parser::new(psess, tts, rustc_parse::MACRO_ARGUMENTS).recovery(recovery)
+}
+
+#[cfg(test)]
+mod rule_index_tests {
+    use super::*;
+
+    #[test]
+    fn first_token_index_preserves_scalar_filter_order() {
+        rustc_span::create_default_session_globals_then(|| {
+            let span = rustc_span::DUMMY_SP;
+            let x = sym::cfg;
+            let ident = Ident::with_dummy_span(x);
+            let kinds = [
+                Eq,
+                Comma,
+                TokenKind::Ident(x, IdentIsRaw::No),
+                TokenKind::Ident(x, IdentIsRaw::Yes),
+                NtIdent(ident, IdentIsRaw::No),
+                Lifetime(x, IdentIsRaw::No),
+                NtLifetime(ident, IdentIsRaw::No),
+                OpenInvisible(token::InvisibleOrigin::ProcMacro),
+                CloseInvisible(token::InvisibleOrigin::ProcMacro),
+                DocComment(token::CommentKind::Line, ast::AttrStyle::Outer, x),
+                Eof,
+            ];
+            let rules: Vec<_> = (0..55)
+                .map(|i| {
+                    let token = Token::new(kinds[i % kinds.len()], span);
+                    let first = if i % 7 == 0 {
+                        MatcherLoc::Delimited
+                    } else {
+                        MatcherLoc::Token { token }
+                    };
+                    MacroRule::Func {
+                        lhs: vec![first, MatcherLoc::Eof],
+                        lhs_span: span,
+                        rhs: mbe::TokenTree::Token(token),
+                    }
+                })
+                .collect();
+            let index = RuleIndex::new(&rules);
+            for kind in kinds {
+                let token = Token::new(kind, span);
+                let eligible = |i: &usize| match &rules[*i] {
+                    MacroRule::Func { lhs, .. } => match lhs.first() {
+                        Some(MatcherLoc::Token { token: first })
+                            if !matches!(first.kind, DocComment(..)) =>
+                        {
+                            token_name_eq(first, &token)
+                        }
+                        _ => true,
+                    },
+                    _ => false,
+                };
+                let expected: Vec<_> = (0..rules.len()).filter(eligible).collect();
+                let actual: Vec<_> = index.candidates(&token).filter(eligible).collect();
+                assert_eq!(actual, expected, "token={kind:?}");
+            }
+        });
+    }
 }
