@@ -26,7 +26,11 @@ use crate::diagnostics;
 const FILE_MAGIC: &[u8] = b"RSIC";
 
 /// Change this if the header format changes.
-const HEADER_FORMAT_VERSION: u16 = 0;
+const HEADER_FORMAT_VERSION: u16 = 1;
+
+pub(crate) fn file_header_len(sess: &Session) -> usize {
+    FILE_MAGIC.len() + size_of::<u16>() + size_of::<u8>() + rustc_version(sess).len()
+}
 
 pub(crate) fn write_file_header(stream: &mut FileEncoder<'_>, sess: &Session) {
     stream.emit_raw_bytes(FILE_MAGIC);
@@ -50,8 +54,7 @@ where
     // truncate and overwrite it, since it might be a shared hard-link, the
     // underlying data of which we don't want to modify.
     //
-    // We have to ensure we have dropped the memory maps to this file
-    // before performing this removal.
+    // On platforms that cannot unlink a mapped file, drop its mappings first.
     match fs::remove_file(&path_buf) {
         Ok(()) => {
             debug!("save: remove old file");
@@ -121,10 +124,10 @@ pub(crate) fn open_incremental_file(
         }
     })?;
 
-    // SAFETY: This process must not modify nor remove the backing file while the memory map lives.
+    // SAFETY: This process must not modify the backing file while the memory map lives.
     // For the dep-graph and the work product index, it is as soon as the decoding is done.
-    // For the query result cache, the memory map is dropped in save_dep_graph before calling
-    // save_in and trying to remove the backing file.
+    // The query cache can keep its mapping through serialization on Unix, where unlinking
+    // preserves the mapped file's contents. Other platforms drop the mapping before removal.
     //
     // There is no way to prevent another process from modifying this file.
     let mmap = unsafe { Mmap::map(file) }?;
