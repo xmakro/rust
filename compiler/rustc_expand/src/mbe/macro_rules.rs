@@ -32,7 +32,7 @@ use tracing::{debug, instrument, trace, trace_span};
 
 use super::SequenceRepetition;
 use super::diagnostics::{FailedMacro, failed_to_match_macro};
-use super::macro_parser::{NamedMatches, NamedParseResult};
+use super::macro_parser::{NamedMatches, NamedParseResult, token_name_eq};
 use crate::base::{
     AttrProcMacro, BangProcMacro, DummyResult, ExpandResult, ExtCtxt, MacResult,
     MacroExpanderResult, SyntaxExtension, SyntaxExtensionKind, TTMacroExpander,
@@ -362,6 +362,9 @@ fn trace_macros_note(cx_expansions: &mut FxIndexMap<Span, Vec<String>>, sp: Span
 }
 
 pub(super) trait Tracker<'matcher> {
+    /// Diagnostic trackers need every failure callback, even for an immediate mismatch.
+    const TRACK_FAILURES: bool = true;
+
     /// Provide context on the arm that's about to be matched.
     fn prepare(&mut self, which_matcher: WhichMatcher, matcher: &'matcher [MatcherLoc]);
 
@@ -405,6 +408,8 @@ pub(super) trait Tracker<'matcher> {
 pub(super) struct NoopTracker;
 
 impl<'matcher> Tracker<'matcher> for NoopTracker {
+    const TRACK_FAILURES: bool = false;
+
     fn prepare(&mut self, _which_matcher: WhichMatcher, _matcher: &'matcher [MatcherLoc]) {}
 
     fn before_match_loc(&mut self, _parser: &TtParser, _matcher: &'matcher MatcherLoc) {}
@@ -635,6 +640,15 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
     let mut tt_parser = TtParser::new();
     for (i, rule) in rules.iter().enumerate() {
         let MacroRule::Func { lhs, .. } = rule else { continue };
+        if !T::TRACK_FAILURES
+            && let Some(MatcherLoc::Token { token }) = lhs.first()
+            && !matches!(token.kind, DocComment(..))
+            && !token_name_eq(token, &parser.token)
+        {
+            // A literal mismatch cannot parse, gate features, or be ambiguous.
+            // Diagnostic replay still runs the original matcher and callbacks.
+            continue;
+        }
         let _tracing_span = trace_span!("Matching arm", %i);
 
         // Take a snapshot of the state of pre-expansion gating at this point.
