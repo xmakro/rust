@@ -192,6 +192,18 @@ impl DepGraph {
             Fingerprint::ZERO,
         );
         assert_eq!(_green_node_index, DepNodeIndex::SINGLETON_ZERO_DEPS_ANON_NODE);
+        if current.encoder.preserves_previous_indices() {
+            // The zero-dependency singleton has the same value in every session,
+            // even though its anonymous key uses a new session seed. Canonicalize
+            // its old index so copied edges still refer to the current singleton.
+            let previous_zero = SerializedDepNodeIndex::from_u32(0);
+            assert_eq!(prev_graph.index_to_node(previous_zero).kind, DepKind::AnonZeroDeps);
+            assert!(prev_graph.edge_targets_from(previous_zero).next().is_none());
+            assert_eq!(prev_graph.value_fingerprint_for_index(previous_zero), Fingerprint::ZERO);
+            let result = colors
+                .try_set_color(previous_zero, DesiredColor::Green { index: _green_node_index });
+            assert_matches!(result, TrySetColorResult::Success);
+        }
 
         // Create a single always-red node, with no dependencies of its own.
         // Other nodes can use the always-red node as a fake dependency, to
@@ -930,7 +942,11 @@ impl DepGraphData {
                 // Reuse a per-worker buffer for the edges instead of allocating one per call.
                 // The recursion gives it back empty: each `EdgeFrame` pops its edges on drop.
                 let mut edge_buf = self.green_edge_buf.take();
-                let result = self.try_mark_previous_green(tcx, prev_index, None, &mut edge_buf);
+                let result = if self.current.encoder.can_omit_promoted_edges() {
+                    self.try_mark_previous_green::<true>(tcx, prev_index, None, &mut edge_buf)
+                } else {
+                    self.try_mark_previous_green::<false>(tcx, prev_index, None, &mut edge_buf)
+                };
                 debug_assert!(edge_buf.is_empty());
                 self.green_edge_buf.set(edge_buf);
                 result.map(|dep_node_index| (prev_index, dep_node_index))
@@ -940,7 +956,7 @@ impl DepGraphData {
 
     /// Try to mark a dep-node which existed in the previous compilation session as green.
     #[instrument(skip(self, tcx, prev_dep_node_index, frame, edge_buf), level = "debug")]
-    fn try_mark_previous_green<'tcx>(
+    fn try_mark_previous_green<'tcx, const OMIT_EDGES: bool>(
         &self,
         tcx: TyCtxt<'tcx>,
         prev_dep_node_index: SerializedDepNodeIndex,
@@ -959,7 +975,11 @@ impl DepGraphData {
                 // This dependency has been marked as green before, we are still ok and can
                 // continue checking the remaining dependencies.
                 DepNodeColor::Green(parent_index) => {
-                    edges.push(parent_index);
+                    if OMIT_EDGES {
+                        debug_assert_eq!(parent_index.as_u32(), parent_dep_node_index.as_u32());
+                    } else {
+                        edges.push(parent_index);
+                    }
                     continue;
                 }
 
@@ -975,7 +995,7 @@ impl DepGraphData {
 
             // If this dependency isn't eval_always, try to mark it green recursively.
             if !tcx.is_eval_always(parent_dep_node.kind)
-                && let Some(parent_index) = self.try_mark_previous_green(
+                && let Some(parent_index) = self.try_mark_previous_green::<OMIT_EDGES>(
                     tcx,
                     parent_dep_node_index,
                     Some(&frame),
@@ -984,7 +1004,11 @@ impl DepGraphData {
                     edges.buf,
                 )
             {
-                edges.push(parent_index);
+                if OMIT_EDGES {
+                    debug_assert_eq!(parent_index.as_u32(), parent_dep_node_index.as_u32());
+                } else {
+                    edges.push(parent_index);
+                }
                 continue;
             }
 
@@ -995,7 +1019,11 @@ impl DepGraphData {
 
             match self.colors.get(parent_dep_node_index) {
                 DepNodeColor::Green(parent_index) => {
-                    edges.push(parent_index);
+                    if OMIT_EDGES {
+                        debug_assert_eq!(parent_index.as_u32(), parent_dep_node_index.as_u32());
+                    } else {
+                        edges.push(parent_index);
+                    }
                     continue;
                 }
                 DepNodeColor::Red => return None,
