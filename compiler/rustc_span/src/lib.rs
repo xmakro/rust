@@ -201,7 +201,18 @@ pub struct MetavarSpansMap(FreezeLock<UnordMap<Span, (Span, bool)>>);
 
 impl MetavarSpansMap {
     pub fn insert(&self, span: Span, var_span: Span) -> bool {
-        match self.0.write().try_insert(span, (var_span, false)) {
+        Self::insert_into(&mut self.0.write(), span, var_span)
+    }
+
+    /// Insert two delimiter spans, stopping on the first conflicting mapping.
+    pub fn insert_pair(&self, first: Span, second: Span, var_span: Span) -> bool {
+        let mut spans = self.0.write();
+        Self::insert_into(&mut spans, first, var_span)
+            && Self::insert_into(&mut spans, second, var_span)
+    }
+
+    fn insert_into(spans: &mut UnordMap<Span, (Span, bool)>, span: Span, var_span: Span) -> bool {
+        match spans.try_insert(span, (var_span, false)) {
             Ok(_) => true,
             Err(entry) => entry.entry.get().0 == var_span,
         }
