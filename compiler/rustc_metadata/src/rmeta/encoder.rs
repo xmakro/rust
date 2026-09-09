@@ -1866,7 +1866,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 record!(self.tables.promoted_mir[def_id.to_def_id()] <- tcx.promoted_mir(def_id));
             }
 
-            if self.tcx.is_coroutine(def_id.to_def_id())
+            if !encode_opt
+                && self.tcx.is_coroutine(def_id.to_def_id())
                 && let Some(witnesses) = tcx.mir_coroutine_witnesses(def_id)
             {
                 record!(self.tables.mir_coroutine_witnesses[def_id.to_def_id()] <- witnesses);
