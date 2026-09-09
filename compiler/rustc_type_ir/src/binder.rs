@@ -740,6 +740,10 @@ impl<'a, I: Interner> TypeFolder<I> for ArgFolder<'a, I> {
     }
 
     fn fold_const(&mut self, c: I::Const) -> I::Const {
+        if !c.has_param() {
+            return c;
+        }
+
         if let ty::ConstKind::Param(p) = c.kind() {
             self.const_for_param(p, c)
         } else {
