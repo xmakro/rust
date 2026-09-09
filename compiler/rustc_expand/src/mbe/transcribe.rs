@@ -736,8 +736,7 @@ fn maybe_use_metavar_location(
             with_metavar_spans(|mspans| mspans.insert(token.span, metavar_span))
         }
         TokenTree::Delimited(dspan, ..) => with_metavar_spans(|mspans| {
-            mspans.insert(dspan.open, metavar_span)
-                && mspans.insert(dspan.close, metavar_span)
+            mspans.insert_pair(dspan.open, dspan.close, metavar_span)
                 && mspans.insert(dspan.entire(), metavar_span)
         }),
     };
@@ -756,9 +755,7 @@ fn maybe_use_metavar_location(
         TokenTree::Delimited(dspan, dspacing, delimiter, tts) => {
             let open = metavar_span.with_ctxt(dspan.open.ctxt());
             let close = metavar_span.with_ctxt(dspan.close.ctxt());
-            with_metavar_spans(|mspans| {
-                mspans.insert(open, metavar_span) && mspans.insert(close, metavar_span)
-            });
+            with_metavar_spans(|mspans| mspans.insert_pair(open, close, metavar_span));
             let dspan = DelimSpan::from_pair(open, close);
             TokenTree::Delimited(dspan, *dspacing, *delimiter, tts.clone())
         }

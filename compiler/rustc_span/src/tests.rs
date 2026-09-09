@@ -117,3 +117,30 @@ fn test_unnormalized_source_length() {
     assert_eq!(sf.unnormalized_source_len, 19);
     assert_eq!(sf.normalized_source_len.0, 14);
 }
+
+#[test]
+fn metavar_span_pairs_preserve_collisions_and_reads() {
+    crate::create_default_session_globals_then(|| {
+        let span = |lo| crate::Span::with_root_ctxt(crate::BytePos(lo), crate::BytePos(lo + 1));
+        let spans = crate::MetavarSpansMap::default();
+        let first = span(1);
+        let second = span(3);
+        let third = span(5);
+        let var = span(10);
+        let other = span(12);
+        assert!(spans.insert(first, var));
+        // A conflict on the first key must not insert the second key.
+        assert!(!spans.insert_pair(first, second, other));
+        assert_eq!(spans.get(second), None);
+        // A conflict on the second key still inserts the first key.
+        assert!(!spans.insert_pair(second, first, other));
+        assert_eq!(spans.get(second), Some(other));
+        assert!(spans.insert_pair(first, third, var));
+        assert_eq!(spans.get(first), Some(var));
+        let read = spans.freeze_and_get_read_spans();
+        assert_eq!(read.get(&first), Some(&var));
+        assert_eq!(read.get(&second), Some(&other));
+        assert_eq!(read.get(&third), None);
+        assert_eq!(spans.get(third), None);
+    });
+}
