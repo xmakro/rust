@@ -2975,12 +2975,13 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             .chain(
                 self.extern_module_map
                     .borrow()
-                    .iter()
-                    .filter(|(_, module)| {
+                    .values()
+                    .filter_map(|module| *module)
+                    .filter(|module| {
                         let module = module.to_module();
                         current_module.is_ancestor_of(module) && current_module != module
                     })
-                    .flat_map(|(_, module)| module.name()),
+                    .flat_map(|module| module.name()),
             )
             .filter(|c| !c.to_string().is_empty())
             .collect::<Vec<_>>();
