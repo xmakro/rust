@@ -1327,7 +1327,12 @@ impl TaskDeps {
 // array, using one u32 per entry.
 pub(super) struct DepNodeColorMap {
     values: IndexVec<SerializedDepNodeIndex, AtomicU32>,
+    parallel: bool,
 }
+
+// Sharing this map requires the compiler's FromDyn proof. The compiler's
+// thread-safety mode is fixed before construction and cannot subsequently change.
+impl !Sync for DepNodeColorMap {}
 
 // All values below `COMPRESSED_RED` are green.
 const COMPRESSED_RED: u32 = u32::MAX - 1;
@@ -1336,7 +1341,10 @@ const COMPRESSED_UNKNOWN: u32 = u32::MAX;
 impl DepNodeColorMap {
     fn new(size: usize) -> DepNodeColorMap {
         debug_assert!(COMPRESSED_RED > DepNodeIndex::MAX_AS_U32);
-        DepNodeColorMap { values: (0..size).map(|_| AtomicU32::new(COMPRESSED_UNKNOWN)).collect() }
+        DepNodeColorMap {
+            values: (0..size).map(|_| AtomicU32::new(COMPRESSED_UNKNOWN)).collect(),
+            parallel: rustc_data_structures::sync::is_dyn_thread_safe(),
+        }
     }
 
     #[inline]
@@ -1356,15 +1364,25 @@ impl DepNodeColorMap {
         prev_index: SerializedDepNodeIndex,
         color: DesiredColor,
     ) -> TrySetColorResult {
-        match self.values[prev_index].compare_exchange(
-            COMPRESSED_UNKNOWN,
-            match color {
-                DesiredColor::Red => COMPRESSED_RED,
-                DesiredColor::Green { index } => index.as_u32(),
-            },
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
+        let value = &self.values[prev_index];
+        let color = match color {
+            DesiredColor::Red => COMPRESSED_RED,
+            DesiredColor::Green { index } => index.as_u32(),
+        };
+        let result = if self.parallel {
+            value.compare_exchange(COMPRESSED_UNKNOWN, color, Ordering::Relaxed, Ordering::Relaxed)
+        } else {
+            // No other worker can access this map in serial mode. There are
+            // no calls between the load and store that could reenter coloring.
+            let previous = value.load(Ordering::Relaxed);
+            if previous == COMPRESSED_UNKNOWN {
+                value.store(color, Ordering::Relaxed);
+                Ok(previous)
+            } else {
+                Err(previous)
+            }
+        };
+        match result {
             Ok(_) => TrySetColorResult::Success,
             Err(COMPRESSED_RED) => TrySetColorResult::AlreadyRed,
             Err(index) => TrySetColorResult::AlreadyGreen { index: DepNodeIndex::from_u32(index) },
