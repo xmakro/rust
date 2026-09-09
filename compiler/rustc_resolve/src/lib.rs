@@ -683,6 +683,7 @@ struct ModuleData<'ra> {
     /// Mapping between names and their (possibly in-progress) resolutions in this module.
     /// Resolutions in modules from other crates are not populated until accessed.
     lazy_resolutions: Resolutions<'ra>,
+    external_trait_item_names: OnceLock<FxHashSet<(Symbol, Namespace)>>,
     /// Used to disambiguate underscore items (`const _: T = ...`) in the module.
     underscore_disambiguator: CmCell<u32>,
 
@@ -748,6 +749,7 @@ impl<'ra> ModuleData<'ra> {
             parent,
             kind,
             lazy_resolutions,
+            external_trait_item_names: OnceLock::new(),
             underscore_disambiguator: CmCell::new(0),
             unexpanded_invocations: Default::default(),
             no_implicit_prelude,
@@ -2168,10 +2170,23 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         assoc_item: Option<(Symbol, Namespace)>,
     ) -> bool {
         match (trait_module, assoc_item) {
-            (Some(trait_module), Some((name, ns))) => self
-                .resolutions(trait_module)
-                .iter()
-                .any(|(key, _name_resolution)| key.ns == ns && key.ident.name == name),
+            (Some(trait_module), Some((name, ns))) => {
+                if !trait_module.is_local() {
+                    // External tables are immutable after their lazy initialization.
+                    // Preserve this filter's deliberate disregard for syntax context.
+                    let names = trait_module.external_trait_item_names.get_or_init(|| {
+                        self.resolutions(trait_module)
+                            .keys()
+                            .map(|key| (key.ident.name, key.ns))
+                            .collect()
+                    });
+                    names.contains(&(name, ns))
+                } else {
+                    self.resolutions(trait_module)
+                        .iter()
+                        .any(|(key, _)| key.ns == ns && key.ident.name == name)
+                }
+            }
             _ => true,
         }
     }
