@@ -701,6 +701,11 @@ impl DepGraphData {
     }
 
     #[inline]
+    pub fn prev_key_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> PackedFingerprint {
+        self.previous.index_to_node(prev_index).key_fingerprint
+    }
+
+    #[inline]
     pub fn prev_value_fingerprint_of(&self, prev_index: SerializedDepNodeIndex) -> Fingerprint {
         self.previous.value_fingerprint_for_index(prev_index)
     }
@@ -1086,6 +1091,18 @@ impl DepGraph {
                     // as red if the query result was recomputed and thus is
                     // already in memory.
                 }
+            }
+        }
+    }
+
+    pub fn for_each_green_prev_index(
+        &self,
+        f: &mut dyn FnMut(SerializedDepNodeIndex, DepNodeIndex),
+    ) {
+        let data = self.data.as_ref().unwrap();
+        for prev_index in data.colors.values.indices() {
+            if let DepNodeColor::Green(dep_node_index) = data.colors.get(prev_index) {
+                f(prev_index, dep_node_index);
             }
         }
     }
