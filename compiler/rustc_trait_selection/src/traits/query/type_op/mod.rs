@@ -134,6 +134,19 @@ where
         root_def_id: LocalDefId,
         span: Span,
     ) -> Result<TypeOpOutput<'tcx, Self>, ErrorGuaranteed> {
+        if !infcx.next_trait_solver()
+            && !infcx.disable_trait_solver_fast_paths()
+            && !infcx.in_snapshot()
+            && let Some(output) = Q::try_fast_path(infcx.tcx, &self)
+            && !infcx.has_pending_region_state()
+        {
+            return Ok(TypeOpOutput {
+                output: infcx.resolve_vars_if_possible(output),
+                constraints: None,
+                error_info: None,
+            });
+        }
+
         let mut error_info = None;
         let mut region_constraints = QueryRegionConstraints::default();
 
