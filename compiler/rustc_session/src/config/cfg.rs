@@ -21,7 +21,6 @@
 //!  - Add the feature gating in `compiler/rustc_feature/src/builtin_attrs.rs`
 
 use std::hash::Hash;
-use std::iter;
 
 use rustc_abi::Align;
 use rustc_ast::ast;
@@ -444,24 +443,28 @@ impl CheckCfg {
             }
 
             if self.exhaustive_values {
-                // Get all values map at once otherwise it would be costly.
-                // (8 values * 220 targets ~= 1760 times, at the time of writing this comment).
+                let mut values = self
+                    .expecteds
+                    .get_disjoint_mut(VALUES)
+                    .map(|value| value.expect("unable to get all the check-cfg values buckets"));
+                for (values, known) in values.iter_mut().zip(BUILTIN_TARGET_CFG_VALUES) {
+                    values.extend(known.iter().map(|value| Symbol::intern(value)));
+                }
                 let [
-                    Some(values_target_abi),
-                    Some(values_target_arch),
-                    Some(values_target_endian),
-                    Some(values_target_env),
-                    Some(values_target_family),
-                    Some(values_target_object_format),
-                    Some(values_target_os),
-                    Some(values_target_pointer_width),
-                    Some(values_target_vendor),
-                ] = self.expecteds.get_disjoint_mut(VALUES)
-                else {
-                    panic!("unable to get all the check-cfg values buckets");
-                };
+                    values_target_abi,
+                    values_target_arch,
+                    values_target_endian,
+                    values_target_env,
+                    values_target_family,
+                    values_target_object_format,
+                    values_target_os,
+                    values_target_pointer_width,
+                    values_target_vendor,
+                ] = values;
 
-                for target in Target::builtins().chain(iter::once(current_target.clone())) {
+                // Custom targets may contribute additional values.
+                {
+                    let target = current_target;
                     values_target_abi.insert(target.options.cfg_abi.desc_symbol());
                     values_target_arch.insert(target.arch.desc_symbol());
                     values_target_endian.insert(target.options.endian.desc_symbol());
@@ -498,5 +501,205 @@ impl CheckCfg {
 
         ins!(sym::unix, no_values);
         ins!(sym::windows, no_values);
+    }
+}
+
+// The distinct values used by built-in targets, in the same order as VALUES above.
+// Avoid constructing every full target specification on each check-cfg invocation.
+// `builtin_target_cfg_values_match_targets` checks exact equality, including unused
+// enum variants and changes to the set of targets, so diagnostics stay unchanged.
+const BUILTIN_TARGET_CFG_VALUES: [&[&str]; 9] = [
+    &[
+        "",
+        "abi64",
+        "abiv2",
+        "abiv2hf",
+        "eabi",
+        "eabihf",
+        "elfv1",
+        "elfv2",
+        "fortanix",
+        "ilp32",
+        "ilp32e",
+        "llvm",
+        "macabi",
+        "pauthtest",
+        "sim",
+        "softfloat",
+        "spe",
+        "uwp",
+        "v8plus",
+        "vec-extabi",
+        "x32",
+    ], // abi
+    &[
+        "aarch64",
+        "amdgpu",
+        "arm",
+        "arm64ec",
+        "avr",
+        "bpf",
+        "csky",
+        "hexagon",
+        "loongarch32",
+        "loongarch64",
+        "m68k",
+        "mips",
+        "mips32r6",
+        "mips64",
+        "mips64r6",
+        "msp430",
+        "nvptx64",
+        "powerpc",
+        "powerpc64",
+        "riscv32",
+        "riscv64",
+        "s390x",
+        "sparc",
+        "sparc64",
+        "wasm32",
+        "wasm64",
+        "x86",
+        "x86_64",
+        "xtensa",
+    ], // arch
+    &["big", "little"], // target-endian
+    &[
+        "",
+        "gnu",
+        "macabi",
+        "mlibc",
+        "msvc",
+        "musl",
+        "newlib",
+        "nto70",
+        "nto71",
+        "nto71_iosock",
+        "ohos",
+        "p1",
+        "p2",
+        "p3",
+        "relibc",
+        "sgx",
+        "sim",
+        "uclibc",
+        "v5",
+    ], // env
+    &["unix", "wasm", "windows"], // target-family
+    &["coff", "elf", "mach-o", "wasm", "xcoff"], // binary-format
+    &[
+        "aix",
+        "amdhsa",
+        "android",
+        "cuda",
+        "cygwin",
+        "dragonfly",
+        "emscripten",
+        "espidf",
+        "freebsd",
+        "fuchsia",
+        "haiku",
+        "helenos",
+        "hermit",
+        "horizon",
+        "hurd",
+        "illumos",
+        "ios",
+        "l4re",
+        "linux",
+        "lynxos178",
+        "macos",
+        "managarm",
+        "motor",
+        "netbsd",
+        "none",
+        "nto",
+        "nuttx",
+        "openbsd",
+        "ps3",
+        "psp",
+        "psx",
+        "qnx",
+        "qurt",
+        "redox",
+        "rtems",
+        "solaris",
+        "solid_asp3",
+        "teeos",
+        "trusty",
+        "tvos",
+        "uefi",
+        "unknown",
+        "vexos",
+        "visionos",
+        "vita",
+        "vxworks",
+        "wasi",
+        "watchos",
+        "windows",
+        "xous",
+        "zkvm",
+    ], // os
+    &["16", "32", "64"], // target-pointer-width
+    &[
+        "amd",
+        "apple",
+        "espressif",
+        "fortanix",
+        "ibm",
+        "kmc",
+        "mti",
+        "nintendo",
+        "nvidia",
+        "openwrt",
+        "pc",
+        "risc0",
+        "sony",
+        "sun",
+        "unikraft",
+        "unknown",
+        "uwp",
+        "vex",
+        "win7",
+        "wrs",
+    ], // vendor
+];
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn builtin_target_cfg_values_match_targets() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut actual: [BTreeSet<String>; 9] = std::array::from_fn(|_| BTreeSet::new());
+            for target in Target::builtins() {
+                let values = [
+                    vec![target.options.cfg_abi.desc_symbol().to_string()],
+                    vec![target.arch.desc_symbol().to_string()],
+                    vec![target.options.endian.desc_symbol().to_string()],
+                    vec![target.options.env.desc_symbol().to_string()],
+                    target.options.families.iter().map(|family| family.to_string()).collect(),
+                    vec![target.options.binary_format.desc_symbol().to_string()],
+                    vec![target.options.os.desc_symbol().to_string()],
+                    vec![target.pointer_width.to_string()],
+                    vec![target.vendor_symbol().to_string()],
+                ];
+                for (actual, values) in actual.iter_mut().zip(values) {
+                    actual.extend(values);
+                }
+            }
+            for (index, (actual, expected)) in
+                actual.iter().zip(BUILTIN_TARGET_CFG_VALUES).enumerate()
+            {
+                assert_eq!(
+                    actual.iter().map(String::as_str).collect::<Vec<_>>(),
+                    expected,
+                    "update BUILTIN_TARGET_CFG_VALUES entry {index} to match the built-in targets"
+                );
+            }
+        });
     }
 }
