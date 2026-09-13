@@ -393,7 +393,7 @@ impl NamedMatch {
 }
 
 /// Performs a token equality check, ignoring syntax context (that is, an unhygienic comparison)
-fn token_name_eq(t1: &Token, t2: &Token) -> bool {
+pub(super) fn token_name_eq(t1: &Token, t2: &Token) -> bool {
     if let (Some((ident1, is_raw1)), Some((ident2, is_raw2))) = (t1.ident(), t2.ident()) {
         ident1.name == ident2.name && is_raw1 == is_raw2
     } else if let (Some((ident1, is_raw1)), Some((ident2, is_raw2))) =
