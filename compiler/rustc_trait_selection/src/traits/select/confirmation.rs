@@ -153,6 +153,7 @@ impl<'cx, 'tcx> SelectionContext<'cx, 'tcx> {
         let candidate_predicate = self
             .for_each_item_bound(
                 placeholder_self_ty,
+                |_, clause_idx| clause_idx == idx,
                 |_, clause, clause_idx, _| {
                     if clause_idx == idx {
                         ControlFlow::Break(clause)
